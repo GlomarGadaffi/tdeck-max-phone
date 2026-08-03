@@ -2,6 +2,7 @@
 
 [![Development Status](https://img.shields.io/badge/status-ACTIVE%20DEVELOPMENT-orange.svg)](#-project-status--caveats)
 [![Hardware Verification](https://img.shields.io/badge/hardware-UNTESTED%20%2F%20AWAITING%20VERIFICATION-yellow.svg)](#-project-status--caveats)
+[![Validation Plan](https://img.shields.io/badge/validation-LEVELS%200--5-blue.svg)](docs/VALIDATION_PLAN.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Target Board](https://img.shields.io/badge/board-LilyGO%20T--Deck%20MAX-purple.svg)](https://github.com/Xinyuan-LilyGO/T-Deck-MAX)
 [![Off-Grid Comms](https://img.shields.io/badge/comms-OFF--GRID%20%2F%20MESH-green.svg)](#-key-features--keywords)
@@ -19,8 +20,21 @@ Synthesizes the **drawbridge** 3CX Route Point API & Anchored Media engine, the 
 > **THIS FIRMWARE IS IN ACTIVE DEVELOPMENT AND IS CURRENTLY UNTESTED ON PHYSICAL HARDWARE.**
 > 
 > * **Software Scaffolding Complete**: The driver layer (XL9555, ES8311, TCA8418, E-Paper), 3CX Route Point API client (`TelephonyAnchorLogic`), and full-duplex RTP engine (`tincan_uac`) have been written according to official LilyGO schematics and proven `drawbridge`/`pocket-dial` architecture.
-> * **Awaiting Hardware Verification**: Bench testing with physical LilyGO T-Deck MAX hardware, 4G LTE SIM cards, and live 3CX server instances is currently underway.
+> * **Validation Roadmap (Levels 0–5)**: Hardware bring-up follows a structured 6-stage validation protocol documented in [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md).
 > * **Community Contributions Welcome**: Off-grid comms enthusiasts, mesh developers, ham radio operators, and firmware hackers are warmly invited to test, contribute, and open issues!
+
+---
+
+## 📋 Validation Plan (Levels 0 – 5)
+
+See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for full details:
+
+* **Level 0**: Firmware Build & Host Logic Unit Tests (`TelephonyAnchorLogic`)
+* **Level 1**: Low-Level Bus & Power Management Bring-Up (I2C Scan, SPI, XL9555 Registers)
+* **Level 2**: Audio Codec & Peripheral Hardware Validation (ES8311 I2S Loopback, Keypad, E-Paper)
+* **Level 3**: Local PBX & Handset Loopback Calling (`pocket-dial` + `tincan` @ `127.0.0.1`, `777` Echo Test)
+* **Level 4**: A7682E Cellular PPP Data & 3CX Route Point API Integration (OAuth, WSS, Chunked Audio)
+* **Level 5**: LoRa Mesh Radio Bridging, Thermal & Battery Field Testing (30-min call stress test)
 
 ---
 
@@ -99,7 +113,7 @@ The **XL9555 (I2C address `0x20`)** manages resource switching on the T-Deck MAX
      +---------------------+                   +---------------------+
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/HARDWARE_CAVEATS.md](docs/HARDWARE_CAVEATS.md) for technical deep-dives.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/HARDWARE_CAVEATS.md](docs/HARDWARE_CAVEATS.md), and [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for technical deep-dives.
 
 ---
 

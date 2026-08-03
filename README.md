@@ -4,11 +4,12 @@
 [![Hardware Verification](https://img.shields.io/badge/hardware-UNTESTED%20%2F%20AWAITING%20VERIFICATION-yellow.svg)](#-project-status--caveats)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Target Board](https://img.shields.io/badge/board-LilyGO%20T--Deck%20MAX-purple.svg)](https://github.com/Xinyuan-LilyGO/T-Deck-MAX)
+[![Off-Grid Comms](https://img.shields.io/badge/comms-OFF--GRID%20%2F%20MESH-green.svg)](#-key-features--keywords)
 [![Framework](https://img.shields.io/badge/framework-ESP--IDF%20v5.1%2B%20%2F%20v6.0-red.svg)](https://docs.espressif.com/projects/esp-idf/)
 
-A Media-Anchored SIP Handset and 3CX Cellular Gateway firmware tailored for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 Keyboard + ES8311 Audio Codec + A7682E 4G LTE + SX1262 LoRa).
+A Media-Anchored SIP Handset, Off-Grid Voice Mesh Bridge, and 3CX Cellular Gateway firmware tailored for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 Keyboard + ES8311 Audio Codec + A7682E 4G LTE + SX1262 LoRa).
 
-Synthesizes the **drawbridge** 3CX Route Point API & Anchored Media engine, the **pocket-dial** self-contained SIP PBX, and the **tincan** full-duplex G.711 RTP audio pipeline into a standalone handheld device.
+Synthesizes the **drawbridge** 3CX Route Point API & Anchored Media engine, the **pocket-dial** self-contained SIP PBX, and the **tincan** full-duplex G.711 RTP audio pipeline into a standalone handheld device for tactical, cellular, and off-grid radio communications.
 
 ---
 
@@ -19,19 +20,19 @@ Synthesizes the **drawbridge** 3CX Route Point API & Anchored Media engine, the 
 > 
 > * **Software Scaffolding Complete**: The driver layer (XL9555, ES8311, TCA8418, E-Paper), 3CX Route Point API client (`TelephonyAnchorLogic`), and full-duplex RTP engine (`tincan_uac`) have been written according to official LilyGO schematics and proven `drawbridge`/`pocket-dial` architecture.
 > * **Awaiting Hardware Verification**: Bench testing with physical LilyGO T-Deck MAX hardware, 4G LTE SIM cards, and live 3CX server instances is currently underway.
-> * **Community Contributions Welcome**: Pull requests, issue reports, hardware trace verifications, and test logs are actively encouraged!
+> * **Community Contributions Welcome**: Off-grid comms enthusiasts, mesh developers, ham radio operators, and firmware hackers are warmly invited to test, contribute, and open issues!
 
 ---
 
 ## 🏷️ Key Features & Keywords
 
+* **Off-Grid Comms & LoRa Mesh Voice Bridge**: Integrates the Semtech SX1262 LoRa radio to bridge off-grid mesh voice frames to standard IP SIP endpoints and cellular networks.
 * **Standalone 3CX SBC & Mobile Extension**: Registers to 3CX via the **Telephony Route Point API** (`/connect/token` OAuth2, `wss://<host>/callcontrol/ws` control plane, chunked `/stream` audio).
 * **Full-Duplex VoIP Handset**: Continuous 8 kHz PCM16 G.711 $\mu$-law/A-law audio sampling over ES8311 codec I2S lines.
 * **Cellular Data Gateway (4G LTE)**: Uses the onboard **A7682E modem** via PPP over UART for remote WAN connectivity to 3CX servers over cellular networks.
 * **XL9555 Hardware Multiplexing**: Software-controlled audio output switching (`IO12` toggles ES8311 vs A7682E audio), speaker power amplifier enable (`IO06`), and LoRa antenna selection (`IO04`).
 * **Front-Lit E-Paper UI**: Low-power 3.1" E-Paper display (GDEQ031T10) with controllable front-lighting (`GPIO41`) for night visibility.
 * **Physical QWERTY Keypad**: Full DTMF dialing, star-code input (`*60` DND, `777` Echo Test), and text entry via TCA8418 I2C keyboard controller.
-* **Off-Grid Radio Voice Bridging**: Built-in hooks for Semtech SX1262 LoRa mesh voice transport.
 
 ---
 
@@ -121,14 +122,9 @@ idf.py -p <COM_PORT> flash monitor
 
 ---
 
-## 🤝 Contributing & Topic Tags
+## 🤝 Contributing & Community Tags
 
-We welcome pull requests! Areas currently open for testing & refinement:
-- Hardware validation of ES8311 I2S DMA buffers on physical T-Deck MAX boards.
-- A7682E PPP netif dialing scripts.
-- E-Paper partial refresh driver optimization.
-
-`#esp32s3` `#3cx` `#voip` `#sip-phone` `#lilygo-tdeck-max` `#lora` `#cellular-gateway` `#embedded-cpp` `#esp-idf`
+`#off-grid` `#mesh-networking` `#meshtastic` `#lora-mesh` `#tactical-comms` `#offgrid-comms` `#voice-over-lora` `#push-to-talk` `#esp32s3` `#3cx` `#voip` `#sip-phone` `#lilygo-tdeck-max` `#lora` `#cellular-gateway` `#esp-idf`
 
 ---
 

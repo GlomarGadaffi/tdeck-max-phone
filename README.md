@@ -1,32 +1,41 @@
 # tdeck-max-phone
 
-A Media-Anchored SIP Phone and 3CX Cellular Gateway firmware tailored for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 Keyboard + ES8311 Audio + A7682E 4G LTE + SX1262 LoRa).
+[![Development Status](https://img.shields.io/badge/status-ACTIVE%20DEVELOPMENT-orange.svg)](#-project-status--caveats)
+[![Hardware Verification](https://img.shields.io/badge/hardware-UNTESTED%20%2F%20AWAITING%20VERIFICATION-yellow.svg)](#-project-status--caveats)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Target Board](https://img.shields.io/badge/board-LilyGO%20T--Deck%20MAX-purple.svg)](https://github.com/Xinyuan-LilyGO/T-Deck-MAX)
+[![Framework](https://img.shields.io/badge/framework-ESP--IDF%20v5.1%2B%20%2F%20v6.0-red.svg)](https://docs.espressif.com/projects/esp-idf/)
 
-Built on the architecture of **drawbridge** (commercial 3CX Route Point & SSH TUI engine) and **pocket-dial** (SIP PBX engine), combined with **tincan** full-duplex handset audio.
+A Media-Anchored SIP Handset and 3CX Cellular Gateway firmware tailored for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 Keyboard + ES8311 Audio Codec + A7682E 4G LTE + SX1262 LoRa).
 
----
-
-## Architecture Lineage & Heritage (drawbridge + pocket-dial + tincan)
-
-This project synthesizes three core open-source / embedded voice projects:
-
-1. **drawbridge (`src/SIP/TelephonyAnchorClient.cpp` & `TelephonyAnchorLogic.hpp`)**:
-   - Production 3CX / Telephony Route Point API client (`/connect/token` OAuth, `wss://<host>/callcontrol/ws` control plane, `/participants/{id}/stream` HTTP audio).
-   - Multi-call concurrent `CallSlot` pool with warm TLS session handles for fast ECDHE resumption.
-   - Non-blocking FreeRTOS WebSocket worker queue to prevent WS task stalls.
-   - `littlessh` ANSI Sysop Terminal TUI (`Tui.cpp`) configuration surface.
-
-2. **pocket-dial (`src/SIP/RequestsHandler.cpp` & `MediaBridge.cpp`)**:
-   - Self-contained SIP PBX registrar, call state machines, and `MediaBridge` RTP shuttling.
-   - Call Park orbits (`700`-`709`), paging zones (`980`-`989`), BLF/presence, ring groups, call forwarding, and star-codes.
-   - Zero-heap allocation in packet hot path.
-
-3. **tincan (`main/audio_io.c` & `g711.c`)**:
-   - Embedded G.711 $\mu$-law/A-law audio encoding/decoding and RTP packetization for ESP32-S3.
+Synthesizes the **drawbridge** 3CX Route Point API & Anchored Media engine, the **pocket-dial** self-contained SIP PBX, and the **tincan** full-duplex G.711 RTP audio pipeline into a standalone handheld device.
 
 ---
 
-## Hardware Pinmap (LilyGO T-Deck MAX)
+> [!WARNING]
+> ### ⚠️ PROJECT STATUS & HARDWARE CAVEATS
+> 
+> **THIS FIRMWARE IS IN ACTIVE DEVELOPMENT AND IS CURRENTLY UNTESTED ON PHYSICAL HARDWARE.**
+> 
+> * **Software Scaffolding Complete**: The driver layer (XL9555, ES8311, TCA8418, E-Paper), 3CX Route Point API client (`TelephonyAnchorLogic`), and full-duplex RTP engine (`tincan_uac`) have been written according to official LilyGO schematics and proven `drawbridge`/`pocket-dial` architecture.
+> * **Awaiting Hardware Verification**: Bench testing with physical LilyGO T-Deck MAX hardware, 4G LTE SIM cards, and live 3CX server instances is currently underway.
+> * **Community Contributions Welcome**: Pull requests, issue reports, hardware trace verifications, and test logs are actively encouraged!
+
+---
+
+## 🏷️ Key Features & Keywords
+
+* **Standalone 3CX SBC & Mobile Extension**: Registers to 3CX via the **Telephony Route Point API** (`/connect/token` OAuth2, `wss://<host>/callcontrol/ws` control plane, chunked `/stream` audio).
+* **Full-Duplex VoIP Handset**: Continuous 8 kHz PCM16 G.711 $\mu$-law/A-law audio sampling over ES8311 codec I2S lines.
+* **Cellular Data Gateway (4G LTE)**: Uses the onboard **A7682E modem** via PPP over UART for remote WAN connectivity to 3CX servers over cellular networks.
+* **XL9555 Hardware Multiplexing**: Software-controlled audio output switching (`IO12` toggles ES8311 vs A7682E audio), speaker power amplifier enable (`IO06`), and LoRa antenna selection (`IO04`).
+* **Front-Lit E-Paper UI**: Low-power 3.1" E-Paper display (GDEQ031T10) with controllable front-lighting (`GPIO41`) for night visibility.
+* **Physical QWERTY Keypad**: Full DTMF dialing, star-code input (`*60` DND, `777` Echo Test), and text entry via TCA8418 I2C keyboard controller.
+* **Off-Grid Radio Voice Bridging**: Built-in hooks for Semtech SX1262 LoRa mesh voice transport.
+
+---
+
+## 📌 Hardware Pinmap (LilyGO T-Deck MAX)
 
 | Component | Signal | GPIO / Expander Pin | Description |
 | :--- | :--- | :--- | :--- |
@@ -45,38 +54,55 @@ This project synthesizes three core open-source / embedded voice projects:
 
 ---
 
-## XL9555 Hardware Multiplexing Rules
+## 🎛️ XL9555 Hardware Multiplexing Rules
 
-The **XL9555 (I2C `0x20`)** controls resource switching on the T-Deck MAX:
-- **Audio Output Selection (`IO12`)**:
-  - Set **`IO12` to LOW (`0`)**: Routes audio to **ES8311 Codec** (Local mic/speaker).
-  - Set **`IO12` to HIGH (`1`)**: Routes audio to **A7682E 4G Cellular Module**.
-- **Speaker Amplifier (`IO06`)**: Set **`IO06` to HIGH (`1`)** to enable speaker power amp.
-- **LoRa Antenna Switch (`IO04`)**: Set **`IO04` to HIGH (`1`)** for internal antenna, **LOW (`0`)** for external.
-- **DRV2605 Haptic Motor (`P0_5`)**: Set **`P0_5` to HIGH (`1`)** to enable haptic feedback.
-- **Modem Power (`P1_0`)**: Set **`P1_0` to HIGH (`1`)** to power the A7682E LTE modem.
-
----
-
-## 3CX Integration Protocol (from `drawbridge`)
-
-```
-T-Deck MAX (ESP32-S3)                          3CX Server / Softswitch
-       |                                                 |
-       |----- POST /connect/token (OAuth Client ID/Secret) ->|
-       |<---- 200 OK (JWT Access Token & Expiration) ------|
-       |                                                 |
-       |----- WSS /callcontrol/ws (Bearer Token Header) --->|
-       |<---- 101 Switching Protocols -------------------|
-       |<---- JSON Event: Upset (Dialing/Connected) ------|
-       |                                                 |
-       |----- POST /callcontrol/{dn}/participants/stream ->|
-       |<---- 200 OK Chunked Audio Stream (PCM16 8kHz) ---|
-```
+The **XL9555 (I2C address `0x20`)** manages resource switching on the T-Deck MAX:
+- **Audio Output Select (`IO12`)**:
+  - `IO12 = 0` (`LOW`): Routes speaker audio to **ES8311 Local Codec** (Handset mode).
+  - `IO12 = 1` (`HIGH`): Routes speaker audio to **A7682E 4G Module** (Cellular pass-through).
+- **Speaker Amplifier (`IO06`)**: Set `IO06 = 1` (`HIGH`) to enable the speaker power amplifier.
+- **LoRa Antenna Switch (`IO04`)**: Set `IO04 = 1` (`HIGH`) for internal antenna, `0` (`LOW`) for external SMA.
+- **4G Modem Power (`P1_0`)**: Set `P1_0 = 1` (`HIGH`) to power the A7682E modem.
+- **Haptic Motor (`P0_5`)**: Set `P0_5 = 1` (`HIGH`) to enable DRV2605 haptics.
 
 ---
 
-## Building and Flashing
+## 🏗️ System Architecture
+
+```
+                      +---------------------------------------+
+                      |         LilyGO T-Deck MAX             |
+                      |   ESP32-S3 (16MB Flash, 8MB PSRAM)   |
+                      +-------------------+-------------------+
+                                          |
+                 +------------------------+------------------------+
+                 |                                                 |
+      +----------v----------+                           +----------v----------+
+      |      Core 0         |                           |      Core 1         |
+      |   pocket-dial       |                           |      tincan         |
+      |  (SIP PBX & Engine) |                           | (Full-Duplex Handset|
+      +----------+----------+                           +----------+----------+
+                 |                                                 |
+                 +-------------------+  +--------------------------+
+                                     |  |
+                           +---------v--v----------+
+                           |  TDeckMaxAudioAnchor  |
+                           |   (3CX Route Point)   |
+                           +---------+-------------+
+                                     |
+                +--------------------+--------------------+
+                |                                         |
+     +----------v----------+                   +----------v----------+
+     |   ES8311 Codec      |                   |    A7682E 4G LTE    |
+     |  (XL9555 IO12=LOW)  |                   | (XL9555 IO12=HIGH)  |
+     +---------------------+                   +---------------------+
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/HARDWARE_CAVEATS.md](docs/HARDWARE_CAVEATS.md) for technical deep-dives.
+
+---
+
+## ⚡ Quick Start: Building & Flashing
 
 ### Prerequisites
 - ESP-IDF v5.1 or later (up to v6.0)
@@ -95,6 +121,17 @@ idf.py -p <COM_PORT> flash monitor
 
 ---
 
-## License
+## 🤝 Contributing & Topic Tags
+
+We welcome pull requests! Areas currently open for testing & refinement:
+- Hardware validation of ES8311 I2S DMA buffers on physical T-Deck MAX boards.
+- A7682E PPP netif dialing scripts.
+- E-Paper partial refresh driver optimization.
+
+`#esp32s3` `#3cx` `#voip` `#sip-phone` `#lilygo-tdeck-max` `#lora` `#cellular-gateway` `#embedded-cpp` `#esp-idf`
+
+---
+
+## 📄 License
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.

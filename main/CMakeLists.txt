@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "src/app_main.cpp"
+        "src/xl9555.c"
+        "src/es8311_audio.c"
+        "src/tca8418_keypad.cpp"
+        "src/epaper_display.cpp"
+        "src/TDeckMaxAudioAnchor.cpp"
+        "src/tincan_uac.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        driver
+        nvs_flash
+        esp_event
+        lwip
+)

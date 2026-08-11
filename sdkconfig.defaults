@@ -35,3 +35,7 @@ CONFIG_NVS_ENCRYPTION=n
 
 # Compiler Optimization
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# C++ exceptions -- the vendored pocket-dial SIP parser (components/sip_core,
+# ported from tincan) uses them.
+CONFIG_COMPILER_CXX_EXCEPTIONS=y

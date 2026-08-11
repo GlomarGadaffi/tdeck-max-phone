@@ -1,0 +1,33 @@
+MIT License
+
+This project ("tdeck-max-phone") combines original work with a vendored SIP
+message parser ported from the sibling "tincan" project. Both are licensed
+under the MIT License below.
+
+Copyright (c) 2026 GlomarGadaffi
+    tdeck-max-phone — LilyGO T-Deck MAX SIP phone firmware: hardware
+    drivers, SIP user-agent client/server (tincan_uac, ported from tincan's
+    sip_uac with inbound-call support added), G.711 codec and RTP (ported
+    verbatim from tincan), Wi-Fi, and application code.
+
+Copyright (c) 2022 BarGabriel / GlomarGadaffi
+    components/sip_core — vendored from the "pocket-dial" project via
+    tincan, used here as a SIP message/SDP parser and serializer.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.

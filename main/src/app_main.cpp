@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  tdeck-max-phone  —  app_main.cpp
-//  Media-Anchored SIP Phone Firmware for LilyGO T-Deck MAX
+//  SIP Phone Firmware for LilyGO T-Deck MAX, registered as a LAN extension
+//  to a drawbridge PBX instance (which owns all 3CX integration).
 // ─────────────────────────────────────────────────────────────────────────────
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,7 +16,6 @@
 #include "es8311_audio.h"
 #include "tca8418_keypad.h"
 #include "epaper_display.h"
-#include "TDeckMaxAudioAnchor.hpp"
 #include "tincan_uac.hpp"
 
 static const char *TAG = "APP_MAIN";
@@ -36,7 +36,7 @@ static void i2c_master_init(void)
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "==================================================");
-    ESP_LOGI(TAG, "  LilyGO T-Deck MAX Media-Anchored SIP Phone      ");
+    ESP_LOGI(TAG, "  LilyGO T-Deck MAX SIP Phone (via drawbridge PBX) ");
     ESP_LOGI(TAG, "==================================================");
 
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -46,7 +46,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(xl9555_init());
 
     // 2. Initialize ES8311 Audio Codec (8000 Hz for G.711 SIP)
-    ESP_ERROR_CHECK(audio_hardware_init(8000));
+    ESP_ERROR_CHECK(audio_hardware_init(POC_SAMPLE_RATE_HZ));
 
     // 3. Initialize TCA8418 QWERTY Keypad
     ESP_ERROR_CHECK(tca8418_init());
@@ -58,22 +58,58 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(wifi_sta_connect(POC_WIFI_SSID, POC_WIFI_PASS));
     ESP_LOGI(TAG, "Wi-Fi up, local IP %s", wifi_local_ip());
 
-    // 6. Bring up Media Anchor & Handset UAC
-    TDeckMaxAudioAnchor anchor;
-    anchor.init("http://127.0.0.1", "tdeck_max", "secret", "100");
-    anchor.start();
-
+    // 6. Bring up the SIP UAC and register as a LAN extension.
     TincanUac uac;
-    uac.init("127.0.0.1", 5060, 4000, "127.0.0.1", 5060, "100", "102");
-    uac.startMediaLoop();
+    if (!uac.init(wifi_local_ip(), POC_SIP_LOCAL_PORT, POC_RTP_LOCAL_PORT,
+                  POC_SIP_SERVER_IP, POC_SIP_SERVER_PORT, POC_SIP_EXT_SELF)) {
+        ESP_LOGE(TAG, "UAC init failed");
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    bool registered = uac.registerExt();
+    epaper_render_call_status(POC_SIP_EXT_SELF, registered ? "Idle" : "Register failed", false);
 
-    // 7. Update E-Paper Screen with Initial State
-    epaper_render_call_status("Ext 100", "Registered (Idle)", false);
+    // NOTE: this loop auto-answers any inbound call and never dials out --
+    // it exists to prove the SIP/RTP/G.711/audio-hardware path works
+    // end-to-end. Keypad-driven dial/answer/hangup and full e-paper call
+    // state UI are WS5 scope (#11), building on this loop.
+    ESP_LOGI(TAG, "System operational (registered=%d). Waiting for calls...", registered);
 
-    ESP_LOGI(TAG, "System operational. Press Keypad or Trackball PTT to dial.");
+    int16_t pcm[POC_FRAME_SAMPLES];
+    bool wasInCall = false;
 
-    // Main event pump loop
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        uac.poll();
+
+        if (uac.hasIncomingCall() && !uac.inCall()) {
+            ESP_LOGI(TAG, "auto-answering call from %s", uac.incomingCallerId().c_str());
+            uac.answer();
+        }
+
+        if (uac.inCall()) {
+            if (!wasInCall) {
+                audio_hardware_set_amp(true);
+                epaper_render_call_status(uac.incomingCallerId().c_str(), "In Call", true);
+                wasInCall = true;
+            }
+            size_t got = audio_hardware_read_mic(pcm, POC_FRAME_SAMPLES);
+            if (got > 0) uac.sendAudioFrame(pcm, got);
+
+            size_t rxSamples = uac.recvAudioFrame(pcm, POC_FRAME_SAMPLES);
+            if (rxSamples > 0) {
+                audio_hardware_write_spk(pcm, rxSamples);
+            } else {
+                int16_t silence[POC_FRAME_SAMPLES] = {0};
+                audio_hardware_write_spk(silence, POC_FRAME_SAMPLES);
+            }
+        } else if (wasInCall) {
+            audio_hardware_set_amp(false);
+            wasInCall = false;
+        }
+
+        if (uac.callEnded()) {
+            epaper_render_call_status(POC_SIP_EXT_SELF, "Idle", false);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20)); // ~one G.711 frame period
     }
 }

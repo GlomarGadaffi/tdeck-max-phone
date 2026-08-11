@@ -7,6 +7,10 @@ else()
     set(DRIVER_REQUIRES driver)
 endif()
 
+# TDeckMaxAudioAnchor.cpp (a stub direct-3CX client) is intentionally left
+# out of SRCS: this PoC's architecture routes 3CX entirely through a
+# drawbridge PBX instance, so this device never talks to 3CX directly. Kept
+# in the tree as reference, not deleted, per #10.
 idf_component_register(
     SRCS
         "src/app_main.cpp"
@@ -15,8 +19,8 @@ idf_component_register(
         "src/es8311_audio.c"
         "src/tca8418_keypad.cpp"
         "src/epaper_display.cpp"
-        "src/TDeckMaxAudioAnchor.cpp"
         "src/tincan_uac.cpp"
+        "src/g711.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -26,5 +30,7 @@ idf_component_register(
         esp_wifi
         esp_netif
         esp_timer
+        esp_hw_support
         lwip
+        sip_core
 )

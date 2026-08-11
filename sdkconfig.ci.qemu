@@ -1,0 +1,19 @@
+# QEMU-only sdkconfig fragment -- NOT for real hardware.
+#
+# QEMU's octal-PSRAM emulation always reports a fixed 32MB chip regardless
+# of sdkconfig.defaults' CONFIG_SPIRAM_SIZE_8MB (which is itself dead: no
+# SPIRAM_SIZE_* Kconfig symbol exists in IDF v6's esp_psram component --
+# PSRAM size is auto-detected from the chip at boot). Mapping ~31MB of
+# emulated PSRAM exhausts the ESP32-S3's external vaddr window and crashes
+# nvs_flash_init()'s partition mmap before app code ever runs. Disable
+# PSRAM entirely for QEMU boot-testing; real hardware still uses its own
+# 8MB octal PSRAM via sdkconfig.defaults untouched.
+#
+# Usage: idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.qemu" qemu
+CONFIG_SPIRAM=n
+
+# QEMU also has no peripheral models for the XL9555/ES8311/TCA8418/GDEQ031T10
+# hardware on this board -- real I2C/SPI transactions to them just time out
+# and abort the boot. Skip them (see main/Kconfig.projbuild) so the
+# non-hardware logic (Wi-Fi, SIP UAC, app orchestration) is still testable.
+CONFIG_TDECK_MAX_SIM_MODE=y

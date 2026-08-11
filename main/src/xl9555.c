@@ -20,6 +20,10 @@ static uint8_t s_p1_out = 0x00;
 
 static esp_err_t write_reg(uint8_t reg, uint8_t val)
 {
+#if CONFIG_TDECK_MAX_SIM_MODE
+    ESP_LOGD(TAG, "[sim] write_reg(0x%02x, 0x%02x) skipped", reg, val);
+    return ESP_OK;
+#else
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (XL9555_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -29,6 +33,7 @@ static esp_err_t write_reg(uint8_t reg, uint8_t val)
     esp_err_t ret = i2c_master_cmd_begin(BOARD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     return ret;
+#endif
 }
 
 esp_err_t xl9555_init(void)

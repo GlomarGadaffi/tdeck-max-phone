@@ -1,0 +1,16 @@
+menu "T-Deck MAX Phone"
+
+    config TDECK_MAX_SIM_MODE
+        bool "Simulation mode (skip real I2C/SPI transactions)"
+        default n
+        help
+            QEMU has no peripheral models for this board's XL9555 I/O
+            expander, ES8311 codec, TCA8418 keypad, or GDEQ031T10 e-paper
+            display -- real I2C/SPI transactions to them just time out.
+            Enable this only for QEMU/host boot-testing of the non-hardware
+            logic (Wi-Fi, SIP UAC, app orchestration): hardware init calls
+            log and return ESP_OK without touching the bus. Never enable
+            for a real hardware build -- the device would boot silently
+            "successful" while nothing is actually initialized.
+
+endmenu

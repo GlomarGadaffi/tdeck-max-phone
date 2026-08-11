@@ -8,6 +8,8 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "driver/i2c.h"
+#include <cctype>
+#include <string>
 
 #include "board_tdeck_max.h"
 #include "poc_config.h"
@@ -19,6 +21,13 @@
 #include "tincan_uac.hpp"
 
 static const char *TAG = "APP_MAIN";
+
+// Keypad-driven call state, layered on top of TincanUac's own SIP state
+// (uac.hasIncomingCall()/inCall()/callEnded()). Idle/Dialing/Ringing-out
+// are UI-only distinctions -- TincanUac tracks its own Calling/Ringing/
+// InCall internally and this just decides what the keypad and e-paper do
+// in response.
+enum class UiState { Idle, Dialing, Incoming, InCall };
 
 static void i2c_master_init(void)
 {
@@ -33,6 +42,21 @@ static void i2c_master_init(void)
     ESP_ERROR_CHECK(i2c_driver_install(BOARD_I2C_PORT, conf.mode, 0, 0, 0));
 }
 
+static void run_call_audio_pump(TincanUac &uac)
+{
+    int16_t pcm[POC_FRAME_SAMPLES];
+    size_t got = audio_hardware_read_mic(pcm, POC_FRAME_SAMPLES);
+    if (got > 0) uac.sendAudioFrame(pcm, got);
+
+    size_t rxSamples = uac.recvAudioFrame(pcm, POC_FRAME_SAMPLES);
+    if (rxSamples > 0) {
+        audio_hardware_write_spk(pcm, rxSamples);
+    } else {
+        int16_t silence[POC_FRAME_SAMPLES] = {0};
+        audio_hardware_write_spk(silence, POC_FRAME_SAMPLES);
+    }
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "==================================================");
@@ -45,7 +69,11 @@ extern "C" void app_main(void)
     i2c_master_init();
     ESP_ERROR_CHECK(xl9555_init());
 
-    // 2. Initialize ES8311 Audio Codec (8000 Hz for G.711 SIP)
+    // 2. Initialize ES8311 Audio Codec (8000 Hz for G.711 SIP). The I2S
+    // driver runs full-duplex (simultaneous mic read + speaker write) out
+    // of the box -- confirmed via QEMU boot log: "the rx channel on I2S0
+    // is switched from master to slave for full-duplex mode" -- so this
+    // phone doesn't need tincan's half-duplex PTT compromise.
     ESP_ERROR_CHECK(audio_hardware_init(POC_SAMPLE_RATE_HZ));
 
     // 3. Initialize TCA8418 QWERTY Keypad
@@ -66,48 +94,93 @@ extern "C" void app_main(void)
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
     bool registered = uac.registerExt();
+    UiState ui = UiState::Idle;
+    std::string dialBuffer;
     epaper_render_call_status(POC_SIP_EXT_SELF, registered ? "Idle" : "Register failed", false);
+    ESP_LOGI(TAG, "System operational (registered=%d).", registered);
 
-    // NOTE: this loop auto-answers any inbound call and never dials out --
-    // it exists to prove the SIP/RTP/G.711/audio-hardware path works
-    // end-to-end. Keypad-driven dial/answer/hangup and full e-paper call
-    // state UI are WS5 scope (#11), building on this loop.
-    ESP_LOGI(TAG, "System operational (registered=%d). Waiting for calls...", registered);
-
-    int16_t pcm[POC_FRAME_SAMPLES];
-    bool wasInCall = false;
-
+    // NOTE: the real T-Deck MAX keypad is a 4x10 QWERTY matrix, not a
+    // numeric keypad -- only '0', DEL, and ENT are mapped today (see #8).
+    // Digits 1-9 live behind an ALT/SYM shift layer this PoC doesn't have
+    // a confirmed mapping for yet, so dialing out is currently limited to
+    // whatever's reachable with '0' alone. Answering/rejecting/hanging up
+    // an inbound call (which is what actually proves the 3CX path works)
+    // needs no digit entry and is fully wired below. Tracked as a known
+    // limitation for #13's bench-test doc.
     for (;;) {
         uac.poll();
+        char key = tca8418_get_key();
 
-        if (uac.hasIncomingCall() && !uac.inCall()) {
-            ESP_LOGI(TAG, "auto-answering call from %s", uac.incomingCallerId().c_str());
-            uac.answer();
+        // An inbound offer can arrive in any UI state except while already
+        // on a call (TincanUac itself sends 486 Busy for that case) or
+        // while we're mid-dial-out (placeCall() blocks and won't return
+        // control here until it resolves -- a known single-call-setup-at-
+        // a-time limitation of this single-threaded loop).
+        if (uac.hasIncomingCall() && ui != UiState::InCall && ui != UiState::Incoming) {
+            ui = UiState::Incoming;
+            ESP_LOGI(TAG, "incoming call from %s", uac.incomingCallerId().c_str());
+            epaper_render_call_status(uac.incomingCallerId().c_str(), "Incoming Call", false);
         }
 
-        if (uac.inCall()) {
-            if (!wasInCall) {
-                audio_hardware_set_amp(true);
+        switch (ui) {
+        case UiState::Idle:
+            if (key == '\r' || std::isdigit((unsigned char)key)) {
+                dialBuffer.clear();
+                if (std::isdigit((unsigned char)key)) dialBuffer += key;
+                ui = UiState::Dialing;
+                epaper_render_call_status(dialBuffer.c_str(), "Dialing", false);
+            }
+            break;
+
+        case UiState::Dialing:
+            if (key == '\b') {
+                if (!dialBuffer.empty()) dialBuffer.pop_back();
+                else ui = UiState::Idle;
+                epaper_render_call_status(dialBuffer.c_str(), ui == UiState::Idle ? "Idle" : "Dialing", false);
+            } else if (std::isdigit((unsigned char)key)) {
+                dialBuffer += key;
+                epaper_render_call_status(dialBuffer.c_str(), "Dialing", false);
+            } else if (key == '\r' && !dialBuffer.empty()) {
+                epaper_render_call_status(dialBuffer.c_str(), "Calling...", false);
+                ESP_LOGI(TAG, "dialing %s", dialBuffer.c_str());
+                if (uac.placeCall(dialBuffer)) {
+                    ui = UiState::InCall;
+                    epaper_render_call_status(dialBuffer.c_str(), "In Call", true);
+                    audio_hardware_set_amp(true);
+                } else {
+                    ui = UiState::Idle;
+                    epaper_render_call_status(dialBuffer.c_str(), "Call Failed", false);
+                }
+                dialBuffer.clear();
+            }
+            break;
+
+        case UiState::Incoming:
+            if (key == '\r') {
+                uac.answer();
+                ui = UiState::InCall;
                 epaper_render_call_status(uac.incomingCallerId().c_str(), "In Call", true);
-                wasInCall = true;
+                audio_hardware_set_amp(true);
+            } else if (key == '\b') {
+                uac.reject();
+                ui = UiState::Idle;
+                epaper_render_call_status(POC_SIP_EXT_SELF, "Idle", false);
+            } else if (!uac.hasIncomingCall()) {
+                // Caller gave up (CANCEL) before we answered/rejected.
+                ui = UiState::Idle;
+                epaper_render_call_status(POC_SIP_EXT_SELF, "Idle", false);
             }
-            size_t got = audio_hardware_read_mic(pcm, POC_FRAME_SAMPLES);
-            if (got > 0) uac.sendAudioFrame(pcm, got);
+            break;
 
-            size_t rxSamples = uac.recvAudioFrame(pcm, POC_FRAME_SAMPLES);
-            if (rxSamples > 0) {
-                audio_hardware_write_spk(pcm, rxSamples);
-            } else {
-                int16_t silence[POC_FRAME_SAMPLES] = {0};
-                audio_hardware_write_spk(silence, POC_FRAME_SAMPLES);
+        case UiState::InCall:
+            run_call_audio_pump(uac);
+            if (key == '\b' || key == '\r') uac.hangup();
+            if (uac.callEnded()) {
+                ui = UiState::Idle;
+                audio_hardware_set_amp(false);
+                epaper_render_call_status(POC_SIP_EXT_SELF, "Idle", false);
             }
-        } else if (wasInCall) {
-            audio_hardware_set_amp(false);
-            wasInCall = false;
-        }
-
-        if (uac.callEnded()) {
-            epaper_render_call_status(POC_SIP_EXT_SELF, "Idle", false);
+            break;
         }
 
         vTaskDelay(pdMS_TO_TICKS(20)); // ~one G.711 frame period

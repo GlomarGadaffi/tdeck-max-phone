@@ -1,56 +1,52 @@
 # tdeck-max-phone
 
-[![Development Status](https://img.shields.io/badge/status-ACTIVE%20DEVELOPMENT-orange.svg)](#-project-status--caveats)
-[![Hardware Verification](https://img.shields.io/badge/hardware-UNTESTED%20%2F%20AWAITING%20VERIFICATION-yellow.svg)](#-project-status--caveats)
-[![Validation Plan](https://img.shields.io/badge/validation-LEVELS%200--5-blue.svg)](docs/VALIDATION_PLAN.md)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Development Status](https://img.shields.io/badge/status-ACTIVE%20DEVELOPMENT-orange.svg)](#project-status--caveats)
+[![Hardware Verification](https://img.shields.io/badge/hardware-UNTESTED%20%2F%20AWAITING%20VERIFICATION-yellow.svg)](#project-status--caveats)
+[![Bench Test](https://img.shields.io/badge/bench--test-see%20docs-blue.svg)](docs/BENCH_TEST.md)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Target Board](https://img.shields.io/badge/board-LilyGO%20T--Deck%20MAX-purple.svg)](https://github.com/Xinyuan-LilyGO/T-Deck-MAX)
-[![Off-Grid Comms](https://img.shields.io/badge/comms-OFF--GRID%20%2F%20MESH-green.svg)](#-key-features--keywords)
-[![Framework](https://img.shields.io/badge/framework-ESP--IDF%20v5.1%2B%20%2F%20v6.0-red.svg)](https://docs.espressif.com/projects/esp-idf/)
+[![Framework](https://img.shields.io/badge/framework-ESP--IDF%20v6.0-red.svg)](https://docs.espressif.com/projects/esp-idf/)
 
-A Media-Anchored SIP Handset, Off-Grid Voice Mesh Bridge, and 3CX Cellular Gateway firmware tailored for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 Keyboard + ES8311 Audio Codec + A7682E 4G LTE + SX1262 LoRa).
+A SIP phone proof-of-concept for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 keyboard + ES8311 audio codec). It registers as a plain SIP extension to a [drawbridge](https://github.com/GlomarGadaffi/drawbridge) PBX instance on the LAN, which owns all 3CX Call Control API integration -- this device never talks to 3CX directly, has no OAuth/HTTPS client of its own, and needs no 3CX credentials.
 
-Synthesizes the **drawbridge** 3CX Route Point API & Anchored Media engine, the **pocket-dial** self-contained SIP PBX, and the **tincan** full-duplex G.711 RTP audio pipeline into a standalone handheld device for tactical, cellular, and off-grid radio communications.
+Dialing `9<number>` from the keypad routes a call out through drawbridge's 3CX anchor; an incoming 3CX call rings this device (and any other registered extension) automatically.
 
 ---
 
 > [!WARNING]
-> ### ⚠️ PROJECT STATUS & HARDWARE CAVEATS
-> 
-> **THIS FIRMWARE IS IN ACTIVE DEVELOPMENT AND IS CURRENTLY UNTESTED ON PHYSICAL HARDWARE.**
-> 
-> * **Software Scaffolding Complete**: The driver layer (XL9555, ES8311, TCA8418, E-Paper), 3CX Route Point API client (`TelephonyAnchorLogic`), and full-duplex RTP engine (`tincan_uac`) have been written according to official LilyGO schematics and proven `drawbridge`/`pocket-dial` architecture.
-> * **Validation Roadmap (Levels 0–5)**: Hardware bring-up follows a structured 6-stage validation protocol documented in [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md).
-> * **Community Contributions Welcome**: Off-grid comms enthusiasts, mesh developers, ham radio operators, and firmware hackers are warmly invited to test, contribute, and open issues!
+> ### Project Status & Caveats
+>
+> **UNTESTED ON PHYSICAL HARDWARE.** Everything that can be verified without a board has been -- native ESP-IDF v6.0.1 + QEMU-xtensa (no WSL, no CI minutes) confirms the firmware builds clean and boots correctly through hardware init, Wi-Fi driver bring-up, and PHY init before hitting the one thing QEMU genuinely can't emulate: real 802.11 association. Everything past that point (actual SIP registration, actual calls) needs real hardware or a reachable network. See [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
+>
+> **Known limitations** (tracked as GitHub issues, not silently omitted):
+> - The real T-Deck MAX keypad is a 4x10 QWERTY matrix, not a numeric keypad. Only `0`, DEL, and ENT are mapped today -- digits 1-9 sit behind an unconfirmed ALT/SYM shift layer, so dialing an arbitrary number from the keypad doesn't fully work yet. Answering/rejecting/hanging up needs no digit entry and works today.
+> - `TincanUac::placeCall()` blocks while dialing out (bounded, ~120s worst case); a genuinely new inbound call arriving during that window gets no SIP response until it resolves.
+> - E-paper UI renders digits and a simple active/idle pictogram only -- no full alphabet font, no partial refresh (every render is a full-screen flash, which is normal/expected for this panel type, just visible).
+> - LoRa, GPS, 4G/cellular, touch, IMU, and battery-gauge hardware exist on the board and have pin definitions in `board_tdeck_max.h`, but none of it is wired into this firmware. This PoC is Wi-Fi only.
 
 ---
 
-## 📋 Validation Plan (Levels 0 – 5)
+## Architecture
 
-See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for full details:
+```
+tdeck-max-phone                      drawbridge PBX                    3CX
++----------------+   SIP (LAN)   +----------------------+   OAuth2/WSS/REST   +--------+
+| tincan_uac.cpp |<------------->| RequestsHandler +     |<------------------->| 3CX PBX|
+| ES8311 codec   |   RTP (G.711) | TelephonyAnchorClient |   Call Control API  +--------+
+| TCA8418 keypad |               +----------------------+
+| GDEQ031T10 e-paper|
++----------------+
+```
 
-* **Level 0**: Firmware Build & Host Logic Unit Tests (`TelephonyAnchorLogic`)
-* **Level 1**: Low-Level Bus & Power Management Bring-Up (I2C Scan, SPI, XL9555 Registers)
-* **Level 2**: Audio Codec & Peripheral Hardware Validation (ES8311 I2S Loopback, Keypad, E-Paper)
-* **Level 3**: Local PBX & Handset Loopback Calling (`pocket-dial` + `tincan` @ `127.0.0.1`, `777` Echo Test)
-* **Level 4**: A7682E Cellular PPP Data & 3CX Route Point API Integration (OAuth, WSS, Chunked Audio)
-* **Level 5**: LoRa Mesh Radio Bridging, Thermal & Battery Field Testing (30-min call stress test)
+- **Outbound**: dial `9<number>` -> plain SIP INVITE to drawbridge -> drawbridge strips the `9` and calls out through its 3CX anchor.
+- **Inbound**: drawbridge RING-ALLs every registered extension on an incoming 3CX call (first answer wins) -- no per-extension config needed on drawbridge's side.
+- **Media**: full-duplex 8kHz G.711 µ-law (PCMU) over the ES8311 codec's I2S bus, confirmed to run mic+speaker simultaneously without a half-duplex compromise.
 
----
-
-## 🏷️ Key Features & Keywords
-
-* **Off-Grid Comms & LoRa Mesh Voice Bridge**: Integrates the Semtech SX1262 LoRa radio to bridge off-grid mesh voice frames to standard IP SIP endpoints and cellular networks.
-* **Standalone 3CX SBC & Mobile Extension**: Registers to 3CX via the **Telephony Route Point API** (`/connect/token` OAuth2, `wss://<host>/callcontrol/ws` control plane, chunked `/stream` audio).
-* **Full-Duplex VoIP Handset**: Continuous 8 kHz PCM16 G.711 $\mu$-law/A-law audio sampling over ES8311 codec I2S lines.
-* **Cellular Data Gateway (4G LTE)**: Uses the onboard **A7682E modem** via PPP over UART for remote WAN connectivity to 3CX servers over cellular networks.
-* **XL9555 Hardware Multiplexing**: Software-controlled audio output switching (`IO12` toggles ES8311 vs A7682E audio), speaker power amplifier enable (`IO06`), and LoRa antenna selection (`IO04`).
-* **Front-Lit E-Paper UI**: Low-power 3.1" E-Paper display (GDEQ031T10) with controllable front-lighting (`GPIO41`) for night visibility.
-* **Physical QWERTY Keypad**: Full DTMF dialing, star-code input (`*60` DND, `777` Echo Test), and text entry via TCA8418 I2C keyboard controller.
+Full design, including what was corrected from an earlier (never-built) on-device-PBX/direct-3CX plan: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
-## 📌 Hardware Pinmap (LilyGO T-Deck MAX)
+## Hardware Pinmap (LilyGO T-Deck MAX)
 
 | Component | Signal | GPIO / Expander Pin | Description |
 | :--- | :--- | :--- | :--- |
@@ -58,90 +54,62 @@ See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for full details:
 | **System SPI Bus** | SCK / MOSI / MISO | **IO36** / **IO33** / **IO47** | Shared bus for E-Paper, LoRa, SD Card |
 | **ES8311 Audio** | MCLK / SCLK / ASDOUT / LRCK / DSDIN | **IO38** / **IO39** / **IO40** / **IO18** / **IO17** | I2S audio bus for speaker & microphone |
 | **3.1" E-Paper** | CS / DC / RST / BUSY / Backlight | **IO34** / **IO35** / **IO09** / **IO37** / **GPIO41** | Front-lit E-Paper display (GDEQ031T10) |
-| **Touch** | INT / RST | **IO12** / **XL9555_0_7** | CST328 / CST3530 capacitive touch panel |
+| **Touch** *(unused)* | INT / RST | **IO12** / **XL9555_0_7** | CST328 / CST3530 capacitive touch panel |
 | **TCA8418 Keyboard** | INT / LED / RST | **IO15** / **IO42** / **XL9555_1_1** | QWERTY keyboard matrix & keypress interrupt |
-| **DRV2605 Motor** | EN | **XL9555_0_5** | Precision haptic vibration motor |
-| **A7682E (4G LTE)** | RXD / TXD / RI / ITR / PWR | **IO10** / **IO11** / **IO07** / **IO08** / **XL9555_1_0** | Cellular modem UART & power control |
-| **Semtech SX1262** | CS / BUSY / RST / INT | **IO03** / **IO06** / **IO04** / **IO05** | LoRa RF transceiver |
-| **SD Card** | CS | **IO48** | MicroSD card slot |
-| **u-blox GPS** | RXD / TXD / PPS | **IO02** / **IO16** / **IO01** | GNSS positioning module |
-| **BHI260AP Gyro** | INT | **IO21** | 6-axis IMU |
+| **DRV2605 Motor** *(unused)* | EN | **XL9555_0_5** | Precision haptic vibration motor |
+| **A7682E (4G LTE)** *(unused)* | RXD / TXD / RI / ITR / PWR | **IO10** / **IO11** / **IO07** / **IO08** / **XL9555_1_0** | Cellular modem UART & power control |
+| **Semtech SX1262** *(unused)* | CS / BUSY / RST / INT | **IO03** / **IO06** / **IO04** / **IO05** | LoRa RF transceiver |
+| **SD Card** *(unused)* | CS | **IO48** | MicroSD card slot |
+| **u-blox GPS** *(unused)* | RXD / TXD / PPS | **IO02** / **IO16** / **IO01** | GNSS positioning module |
+| **BHI260AP Gyro** *(unused)* | INT | **IO21** | 6-axis IMU |
+
+*(unused)* = present on the board, defined in `board_tdeck_max.h`, not wired into this firmware.
 
 ---
 
-## 🎛️ XL9555 Hardware Multiplexing Rules
+## XL9555 I/O Expander
 
-The **XL9555 (I2C address `0x20`)** manages resource switching on the T-Deck MAX:
-- **Audio Output Select (`IO12`)**:
-  - `IO12 = 0` (`LOW`): Routes speaker audio to **ES8311 Local Codec** (Handset mode).
-  - `IO12 = 1` (`HIGH`): Routes speaker audio to **A7682E 4G Module** (Cellular pass-through).
-- **Speaker Amplifier (`IO06`)**: Set `IO06 = 1` (`HIGH`) to enable the speaker power amplifier.
-- **LoRa Antenna Switch (`IO04`)**: Set `IO04 = 1` (`HIGH`) for internal antenna, `0` (`LOW`) for external SMA.
-- **4G Modem Power (`P1_0`)**: Set `P1_0 = 1` (`HIGH`) to power the A7682E modem.
-- **Haptic Motor (`P0_5`)**: Set `P0_5 = 1` (`HIGH`) to enable DRV2605 haptics.
+The **XL9555 (I2C address `0x20`)** gates power/reset/routing for several peripherals -- see `main/src/xl9555.c` for the driver and `main/include/board_tdeck_max.h` for the bit assignments actually used by this firmware (speaker amp enable, touch reset, 4G power, keyboard reset, audio route select, antenna switch). The audio-route and 4G-power bits exist in hardware and the driver, but nothing in this firmware currently drives cellular audio through them -- Wi-Fi/drawbridge is the only signaling and media path today.
 
 ---
 
-## 🏗️ System Architecture
-
-```
-                      +---------------------------------------+
-                      |         LilyGO T-Deck MAX             |
-                      |   ESP32-S3 (16MB Flash, 8MB PSRAM)   |
-                      +-------------------+-------------------+
-                                          |
-                 +------------------------+------------------------+
-                 |                                                 |
-      +----------v----------+                           +----------v----------+
-      |      Core 0         |                           |      Core 1         |
-      |   pocket-dial       |                           |      tincan         |
-      |  (SIP PBX & Engine) |                           | (Full-Duplex Handset|
-      +----------+----------+                           +----------+----------+
-                 |                                                 |
-                 +-------------------+  +--------------------------+
-                                     |  |
-                           +---------v--v----------+
-                           |  TDeckMaxAudioAnchor  |
-                           |   (3CX Route Point)   |
-                           +---------+-------------+
-                                     |
-                +--------------------+--------------------+
-                |                                         |
-     +----------v----------+                   +----------v----------+
-     |   ES8311 Codec      |                   |    A7682E 4G LTE    |
-     |  (XL9555 IO12=LOW)  |                   | (XL9555 IO12=HIGH)  |
-     +---------------------+                   +---------------------+
-```
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/HARDWARE_CAVEATS.md](docs/HARDWARE_CAVEATS.md), and [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for technical deep-dives.
-
----
-
-## ⚡ Quick Start: Building & Flashing
+## Building & Testing
 
 ### Prerequisites
-- ESP-IDF v5.1 or later (up to v6.0)
+- ESP-IDF v6.0 (native install, no WSL required -- see below for the QEMU boot-testing setup)
+- A real Wi-Fi network and a [drawbridge](https://github.com/GlomarGadaffi/drawbridge) instance reachable on it, for anything past boot (see `main/include/poc_config.h`)
 
-### Setup & Build
+### Build & flash (real hardware)
 ```bash
-# Set ESP-IDF target to ESP32-S3
 idf.py set-target esp32s3
-
-# Build firmware
 idf.py build
-
-# Flash & open serial monitor
 idf.py -p <COM_PORT> flash monitor
 ```
 
+### Build & boot-test without hardware (QEMU)
+No I2C/SPI peripheral models exist for this board's chips under QEMU, so a
+sim-mode Kconfig flag skips those transactions (`main/Kconfig.projbuild`,
+`CONFIG_TDECK_MAX_SIM_MODE`) -- everything else (Wi-Fi driver bring-up, the
+SIP/RTP/G.711 stack, app orchestration) still runs for real:
+```bash
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.qemu" set-target esp32s3
+idf.py build
+idf.py qemu
+```
+
+Full bench-test procedure (what needs real hardware and why): [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
+
 ---
 
-## 🤝 Contributing & Community Tags
+## Docs
 
-`#off-grid` `#mesh-networking` `#meshtastic` `#lora-mesh` `#tactical-comms` `#offgrid-comms` `#voice-over-lora` `#push-to-talk` `#esp32s3` `#3cx` `#voip` `#sip-phone` `#lilygo-tdeck-max` `#lora` `#cellular-gateway` `#esp-idf`
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) -- system design
+- [docs/BENCH_TEST.md](docs/BENCH_TEST.md) -- SIP-phone PoC verification procedure
+- [docs/HARDWARE_CAVEATS.md](docs/HARDWARE_CAVEATS.md) -- shared bus topology, pin states, pending bench items
+- [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) -- broader hardware bring-up plan (partly aspirational, see its own note)
 
 ---
 
-## 📄 License
+## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE) -- this project combines original work with a vendored SIP parser (`components/sip_core`, ported via the sibling `tincan` project from `pocket-dial`, also MIT).

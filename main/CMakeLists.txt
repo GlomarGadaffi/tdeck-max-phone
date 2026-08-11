@@ -1,3 +1,12 @@
+# IDF v6.0 split the `driver` umbrella into esp_driver_* components; v5.x still
+# ships gpio/i2s/spi bundled in `driver`. `driver` itself still provides the
+# legacy driver/i2c.h wrapper on both, so it stays in REQUIRES either way.
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    set(DRIVER_REQUIRES driver esp_driver_gpio esp_driver_i2s esp_driver_spi)
+else()
+    set(DRIVER_REQUIRES driver)
+endif()
+
 idf_component_register(
     SRCS
         "src/app_main.cpp"
@@ -10,7 +19,7 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
     REQUIRES
-        driver
+        ${DRIVER_REQUIRES}
         nvs_flash
         esp_event
         lwip

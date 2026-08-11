@@ -9,6 +9,8 @@
 #include "driver/i2c.h"
 
 #include "board_tdeck_max.h"
+#include "poc_config.h"
+#include "net_wifi.h"
 #include "xl9555.h"
 #include "es8311_audio.h"
 #include "tca8418_keypad.h"
@@ -52,7 +54,11 @@ extern "C" void app_main(void)
     // 4. Initialize 3.1" Front-Lit E-Paper Display
     ESP_ERROR_CHECK(epaper_display_init());
 
-    // 5. Bring up Media Anchor & Handset UAC
+    // 5. Connect to Wi-Fi (blocks until a DHCP lease is obtained)
+    ESP_ERROR_CHECK(wifi_sta_connect(POC_WIFI_SSID, POC_WIFI_PASS));
+    ESP_LOGI(TAG, "Wi-Fi up, local IP %s", wifi_local_ip());
+
+    // 6. Bring up Media Anchor & Handset UAC
     TDeckMaxAudioAnchor anchor;
     anchor.init("http://127.0.0.1", "tdeck_max", "secret", "100");
     anchor.start();
@@ -61,7 +67,7 @@ extern "C" void app_main(void)
     uac.init("127.0.0.1", 5060, 4000, "127.0.0.1", 5060, "100", "102");
     uac.startMediaLoop();
 
-    // 6. Update E-Paper Screen with Initial State
+    // 7. Update E-Paper Screen with Initial State
     epaper_render_call_status("Ext 100", "Registered (Idle)", false);
 
     ESP_LOGI(TAG, "System operational. Press Keypad or Trackball PTT to dial.");

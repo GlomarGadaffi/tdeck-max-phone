@@ -1,0 +1,35 @@
+#pragma once
+// ─────────────────────────────────────────────────────────────────────────
+//  PoC configuration — EDIT THESE before flashing.
+//  (Kept as #defines for spike simplicity, matching tincan's poc_config.h.)
+//
+//  Topology: this device registers as a plain SIP extension to a drawbridge
+//  PBX instance on the LAN. Drawbridge owns all 3CX Call Control API
+//  integration (OAuth2/WS/REST) — this device never talks to 3CX directly.
+//  Outbound: dialing 9<number> from the keypad routes out through 3CX.
+//  Inbound: drawbridge RING-ALLs registered extensions on an incoming 3CX
+//  call; this device just needs to be registered to receive it.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Wi-Fi STA credentials.
+#define POC_WIFI_SSID        "CHANGE_ME"
+#define POC_WIFI_PASS        "CHANGE_ME"
+
+// drawbridge SIP server (registrar/PBX) running on the LAN.
+#define POC_SIP_SERVER_IP    "CHANGE_ME"
+#define POC_SIP_SERVER_PORT  5060
+
+// Our identity. drawbridge's registrar is open by default (self-registering,
+// no pre-created extensions needed) — pick any free extension number.
+#define POC_SIP_EXT_SELF     "1002"
+#define POC_SIP_REG_EXPIRES  3600
+
+// Local ports.
+#define POC_SIP_LOCAL_PORT   5060
+#define POC_RTP_LOCAL_PORT   4000             // even port; RTCP would be +1
+
+// Audio: G.711 µ-law (PCMU, payload type 0), 8 kHz mono, 20 ms frames —
+// drawbridge does not transcode, so this must match what it expects.
+#define POC_SAMPLE_RATE_HZ   8000
+#define POC_FRAME_SAMPLES    160              // 8000 Hz * 0.020 s
+#define POC_RTP_PAYLOAD_PCMU 0

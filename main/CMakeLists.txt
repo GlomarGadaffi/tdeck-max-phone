@@ -10,6 +10,7 @@ endif()
 idf_component_register(
     SRCS
         "src/app_main.cpp"
+        "src/net_wifi.c"
         "src/xl9555.c"
         "src/es8311_audio.c"
         "src/tca8418_keypad.cpp"
@@ -22,5 +23,7 @@ idf_component_register(
         ${DRIVER_REQUIRES}
         nvs_flash
         esp_event
+        esp_wifi
+        esp_netif
         lwip
 )

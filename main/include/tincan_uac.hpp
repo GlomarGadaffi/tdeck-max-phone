@@ -42,6 +42,15 @@ public:
     // server and wait for it to be answered. Dial "9<number>" to route out
     // through drawbridge's 3CX anchor; any other extension dials another
     // LAN extension directly. Call registerExt() first.
+    //
+    // Known limitation: because this blocks and drains _sipSock inline
+    // (matching tincan's original design), a genuinely new inbound INVITE
+    // that arrives while we're mid-dial-out gets no SIP response at all --
+    // not even a 486 -- until placeCall() returns and poll() resumes. The
+    // caller's UAC will eventually time out waiting. Fixing this needs a
+    // non-blocking dial-out state machine, which is a larger change than
+    // this PoC's scope; see the bench-test doc for how this shows up in
+    // practice.
     bool placeCall(const std::string &calleeExt);
 
     // True once poll() has seen an unsolicited INVITE and no call is

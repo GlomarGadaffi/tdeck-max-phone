@@ -25,5 +25,6 @@ idf_component_register(
         esp_event
         esp_wifi
         esp_netif
+        esp_timer
         lwip
 )

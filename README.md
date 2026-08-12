@@ -9,38 +9,47 @@
 
 A SIP phone proof-of-concept for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 keyboard + ES8311 audio codec). It registers as a plain SIP extension to a [drawbridge](https://github.com/GlomarGadaffi/drawbridge) PBX instance on the LAN, which owns all 3CX Call Control API integration -- this device never talks to 3CX directly, has no OAuth/HTTPS client of its own, and needs no 3CX credentials.
 
-Dialing `9<number>` from the keypad routes a call out through drawbridge's 3CX anchor; an incoming 3CX call rings this device (and any other registered extension) automatically.
+Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incoming 3CX call rings this device (and any other registered extension) automatically. Note that keypad digit entry is not fully mapped yet ([#17](../../issues/17)), so outbound dialing currently needs a hardcoded number -- inbound and answer/hangup do not.
 
 ---
 
 > [!WARNING]
 > ### Project Status & Caveats
 >
-> **UNTESTED ON PHYSICAL HARDWARE.** Everything that can be verified without a board has been -- native ESP-IDF v6.0.1 + QEMU-xtensa (no WSL, no CI minutes) confirms the firmware builds clean and boots correctly through hardware init, Wi-Fi driver bring-up, and PHY init before hitting the one thing QEMU genuinely can't emulate: real 802.11 association. Everything past that point (actual SIP registration, actual calls) needs real hardware or a reachable network. See [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
+> **UNTESTED ON PHYSICAL HARDWARE.** No call has ever been placed or received by this firmware on a real board.
+>
+> What *has* been verified without hardware, and exactly how far it goes:
+> - **Host unit tests** (`ctest`, no board, no ESP-IDF) assert on generated SIP wire bytes -- this is what proves response formatting is correct, and it caught a real defect that compiled perfectly. See [Building & Testing](#building--testing).
+> - **QEMU-xtensa** (native ESP-IDF v6.0.1, no WSL, no CI minutes) verifies the firmware builds clean and boots through peripheral init, the I2C scan, the e-paper task, and into Wi-Fi driver bring-up.
+>
+> **QEMU's ceiling is earlier than it looks.** Emulated time reaches ~754 ms at `phy_init`'s full-calibration fallback and then **stops advancing entirely** -- the emulator wedges there. It does not merely fail to associate. Measured by compiling the Wi-Fi timeout down to 2 s and waiting 200 s of wall clock: emulated time never moved and the timeout never fired. So **nothing downstream of Wi-Fi is reachable in QEMU at any timeout value** -- no registration, no SIP, no RTP, not even the Wi-Fi failure path. See [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
 >
 > **Known limitations** (tracked as GitHub issues, not silently omitted):
-> - The real T-Deck MAX keypad is a 4x10 QWERTY matrix, not a numeric keypad. Only `0`, DEL, and ENT are mapped today -- digits 1-9 sit behind an unconfirmed ALT/SYM shift layer, so dialing an arbitrary number from the keypad doesn't fully work yet. Answering/rejecting/hanging up needs no digit entry and works today.
-> - `TincanUac::placeCall()` blocks while dialing out (bounded, ~120s worst case); a genuinely new inbound call arriving during that window gets no SIP response until it resolves.
-> - E-paper UI renders digits and a simple active/idle pictogram only -- no full alphabet font, no partial refresh (every render is a full-screen flash, which is normal/expected for this panel type, just visible).
-> - LoRa, GPS, 4G/cellular, touch, IMU, and battery-gauge hardware exist on the board and have pin definitions in `board_tdeck_max.h`, but none of it is wired into this firmware. This PoC is Wi-Fi only.
+> - Only `0`, DEL, and ENT are mapped on the 4x10 QWERTY matrix -- digits 1-9 sit behind an unconfirmed ALT/SYM shift layer, so dialing an arbitrary number doesn't work yet. The row/column decode itself is inherited from LilyGO's example and also unverified. Build with `CONFIG_TDECK_MAX_KEYPAD_DEBUG=y` to derive the real map on the bench ([#17](../../issues/17)). Answering/rejecting/hanging up needs no digit entry.
+> - I2S mono mode defaults to the **left** slot; if the ES8311 mic lands on the right, the mic reads silence even with the codec correctly configured ([#27](../../issues/27)). Untested either way -- check it first if audio is one-directional.
+> - `TincanUac::placeCall()` blocks while dialing out (bounded, ~120 s worst case); a genuinely new inbound call arriving in that window gets no SIP response until it resolves ([#18](../../issues/18)).
+> - No jitter buffer, no RTP sequence/reordering handling, and no packet-loss concealment -- one datagram in, one frame out. Fine on a clean LAN, will audibly suffer on a lossy or bursty link.
+> - E-paper renders digits and a simple active/idle pictogram only -- no alphabet font, no partial refresh, so every update is a full-screen flash ([#16](../../issues/16)). That flash is normal for this panel type, just visible.
+> - LoRa, GPS, 4G/cellular, touch, IMU, and battery-gauge hardware exist on the board and have pin definitions in `board_tdeck_max.h`, but none of it is driven by this firmware (beyond parking the LoRa/SD chip-selects high so they can't corrupt the shared SPI bus). This PoC is Wi-Fi only.
 
 ---
 
 ## Architecture
 
 ```
-tdeck-max-phone                      drawbridge PBX                    3CX
-+----------------+   SIP (LAN)   +----------------------+   OAuth2/WSS/REST   +--------+
-| tincan_uac.cpp |<------------->| RequestsHandler +     |<------------------->| 3CX PBX|
-| ES8311 codec   |   RTP (G.711) | TelephonyAnchorClient |   Call Control API  +--------+
-| TCA8418 keypad |               +----------------------+
-| GDEQ031T10 e-paper|
-+----------------+
+   tdeck-max-phone                    drawbridge PBX                      3CX
++---------------------+           +-----------------------+          +----------+
+| tincan_uac.cpp      |  SIP/LAN  | RequestsHandler       |  OAuth2  |          |
+| ES8311 codec        |<--------->|         +             |<-------->| 3CX PBX  |
+| TCA8418 keypad      | RTP G.711 | TelephonyAnchorClient |  WSS/REST|          |
+| GDEQ031T10 e-paper  |           +-----------------------+          +----------+
++---------------------+
+   no 3CX credentials                owns all 3CX integration
 ```
 
 - **Outbound**: dial `9<number>` -> plain SIP INVITE to drawbridge -> drawbridge strips the `9` and calls out through its 3CX anchor.
 - **Inbound**: drawbridge RING-ALLs every registered extension on an incoming 3CX call (first answer wins) -- no per-extension config needed on drawbridge's side.
-- **Media**: full-duplex 8kHz G.711 µ-law (PCMU) over the ES8311 codec's I2S bus, confirmed to run mic+speaker simultaneously without a half-duplex compromise.
+- **Media**: 8 kHz G.711 µ-law (PCMU, 20 ms frames) over the ES8311's I2S bus, pumped by a dedicated task paced solely by the blocking I2S read. The driver reports switching to full-duplex mode at init, so no half-duplex push-to-talk compromise is needed (unlike the sibling `tincan` project) -- though simultaneous mic+speaker has not been confirmed with actual audio on hardware, and [#27](../../issues/27) is an open risk to the mic path specifically.
 
 Full design, including what was corrected from an earlier (never-built) on-device-PBX/direct-3CX plan: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -63,7 +72,7 @@ Full design, including what was corrected from an earlier (never-built) on-devic
 | **u-blox GPS** *(unused)* | RXD / TXD / PPS | **IO02** / **IO16** / **IO01** | GNSS positioning module |
 | **BHI260AP Gyro** *(unused)* | INT | **IO21** | 6-axis IMU |
 
-*(unused)* = present on the board, defined in `board_tdeck_max.h`, not wired into this firmware.
+*(unused)* = present on the board and defined in `board_tdeck_max.h`, but not driven by this firmware. Exception: the LoRa and SD chip-selects **are** driven HIGH at init, because they share SPI2 with the e-paper and an undriven CS can float low and corrupt its traffic.
 
 ---
 
@@ -76,8 +85,24 @@ The **XL9555 (I2C address `0x20`)** gates power/reset/routing for several periph
 ## Building & Testing
 
 ### Prerequisites
-- ESP-IDF v6.0 (native install, no WSL required -- see below for the QEMU boot-testing setup)
+- ESP-IDF v6.0 (native install, no WSL required) for firmware
+- Any C++17 compiler + CMake for the host tests -- no ESP-IDF, no board
 - A real Wi-Fi network and a [drawbridge](https://github.com/GlomarGadaffi/drawbridge) instance reachable on it, for anything past boot (see `main/include/poc_config.h`)
+
+### Host unit tests (fastest loop -- no board, no ESP-IDF)
+`components/sip_core` is portable by construction, so the SIP layer's
+generated bytes can be asserted on directly. Run this before blaming the PBX
+for anything:
+```bash
+cmake -B build-host -S test
+cmake --build build-host
+ctest --test-dir build-host --output-on-failure
+```
+`test/sip_wire_test.cpp` parses a realistic inbound INVITE with the real
+parser and checks the exact response bytes -- no doubled header field names,
+exactly one of each required header, response re-parses cleanly, BYE Call-ID
+matching works. This is what caught the malformed-response bug that compiled
+perfectly and would only ever have surfaced as "drawbridge ignores us".
 
 ### Build & flash (real hardware)
 ```bash
@@ -85,17 +110,24 @@ idf.py set-target esp32s3
 idf.py build
 idf.py -p <COM_PORT> flash monitor
 ```
+Boot prints an `init OK :` / `init FAIL :` line per peripheral followed by an
+I2C bus scan naming each expected device PRESENT/absent. A failing peripheral
+logs and continues rather than panic-rebooting, so the log reports every
+failure at once -- read this before anything else. (`CONFIG_TDECK_MAX_HALT_ON_INIT_FAIL=y`
+restores fail-fast.)
 
 ### Build & boot-test without hardware (QEMU)
-No I2C/SPI peripheral models exist for this board's chips under QEMU, so a
-sim-mode Kconfig flag skips those transactions (`main/Kconfig.projbuild`,
-`CONFIG_TDECK_MAX_SIM_MODE`) -- everything else (Wi-Fi driver bring-up, the
-SIP/RTP/G.711 stack, app orchestration) still runs for real:
+QEMU has no peripheral models for this board's chips, so a sim-mode Kconfig
+flag (`main/Kconfig.projbuild`, `CONFIG_TDECK_MAX_SIM_MODE`) skips the I2C/SPI
+transactions that would otherwise time out:
 ```bash
 idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.qemu" set-target esp32s3
 idf.py build
 idf.py qemu
 ```
+This exercises build correctness, boot, peripheral init ordering, and the
+bring-up logging path. It does **not** reach Wi-Fi, SIP, or RTP -- see the
+QEMU ceiling note in Project Status above.
 
 Full bench-test procedure (what needs real hardware and why): [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
 

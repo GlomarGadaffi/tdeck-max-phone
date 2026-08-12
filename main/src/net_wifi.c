@@ -11,7 +11,13 @@
 static const char *TAG = "net_wifi";
 
 #define WIFI_GOT_IP_BIT BIT0
+// Overridable so the timeout path itself can be exercised quickly (QEMU
+// emulates RF calibration ~100x slower than realtime, so waiting out the
+// real 30s would take about an hour of wall clock):
+//   idf.py -DWIFI_CONNECT_TIMEOUT_MS=3000 build
+#ifndef WIFI_CONNECT_TIMEOUT_MS
 #define WIFI_CONNECT_TIMEOUT_MS 30000
+#endif
 static EventGroupHandle_t s_wifi_evt;
 static char s_ip[16] = "0.0.0.0";
 

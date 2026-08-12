@@ -118,6 +118,20 @@ static void epd_write_byte(uint8_t val, bool is_data)
 static inline void epd_write_cmd(uint8_t cmd) { epd_write_byte(cmd, false); }
 static inline void epd_write_data(uint8_t data) { epd_write_byte(data, true); }
 
+// Push a whole framebuffer as ONE transaction rather than 9,600 single-byte
+// ones. The naive per-byte loop costs a driver round-trip per byte (~300 ms
+// of pure overhead per refresh, twice per screen); this is a single DMA
+// burst. D/C is a level held across the payload, so it only needs setting
+// once.
+static void epd_write_data_bulk(const uint8_t *buf, size_t len)
+{
+    gpio_set_level(BOARD_EPD_DC, 1); // data
+    spi_transaction_t t = {};
+    t.length = len * 8;
+    t.tx_buffer = buf;
+    spi_device_transmit(s_spi, &t);
+}
+
 // Bounded version of the vendor reference's lcd_chkstatus(): BUSY reads
 // HIGH when the panel is idle/ready. Returns false on timeout instead of
 // hanging forever.
@@ -170,10 +184,10 @@ static void epd_full_refresh(const uint8_t *new_fb)
     if (!epd_panel_init()) return;
 
     epd_write_cmd(EPD_CMD_OLD_DATA);
-    for (int i = 0; i < EPD_BUF_SIZE; i++) epd_write_data(s_old_fb[i]);
+    epd_write_data_bulk(s_old_fb, EPD_BUF_SIZE);
 
     epd_write_cmd(EPD_CMD_NEW_DATA);
-    for (int i = 0; i < EPD_BUF_SIZE; i++) epd_write_data(new_fb[i]);
+    epd_write_data_bulk(new_fb, EPD_BUF_SIZE);
     memcpy(s_old_fb, new_fb, EPD_BUF_SIZE);
 
     epd_write_cmd(EPD_CMD_REFRESH);
@@ -199,6 +213,19 @@ esp_err_t epaper_display_init(void)
     gpio_set_level(BOARD_EPD_CS, 1);
     gpio_set_level(BOARD_EPD_BACKLIGHT, 1); // Turn front-light on by default
 
+    // SPI2 is shared with the LoRa radio and the SD card. Park their CS
+    // lines HIGH (deselected) before any transaction, or an undriven CS can
+    // float low and corrupt e-paper traffic. Called out as a bench
+    // verification item in docs/HARDWARE_CAVEATS.md; doing it in code costs
+    // nothing and removes the failure mode.
+    gpio_config_t cs_conf = {};
+    cs_conf.intr_type = GPIO_INTR_DISABLE;
+    cs_conf.mode = GPIO_MODE_OUTPUT;
+    cs_conf.pin_bit_mask = (1ULL << BOARD_LORA_CS) | (1ULL << BOARD_SD_CS);
+    gpio_config(&cs_conf);
+    gpio_set_level(BOARD_LORA_CS, 1);
+    gpio_set_level(BOARD_SD_CS, 1);
+
     // Configure Busy Pin as Input
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << BOARD_EPD_BUSY);
@@ -213,7 +240,12 @@ esp_err_t epaper_display_init(void)
     spi_bus_config_t bus_cfg = {};
     bus_cfg.sclk_io_num = BOARD_SPI_SCK;
     bus_cfg.mosi_io_num = BOARD_SPI_MOSI;
-    bus_cfg.miso_io_num = -1; // e-paper is write-only
+    // MISO is wired even though the e-paper never drives it: this is the
+    // SHARED SPI2 bus (e-paper CS 34, LoRa CS 3, SD CS 48). Whoever
+    // initializes the bus first fixes its pin set for everyone, so leaving
+    // MISO at -1 here would silently make the SX1262 and the SD card
+    // unusable the moment either is added.
+    bus_cfg.miso_io_num = BOARD_SPI_MISO;
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = EPD_BUF_SIZE;

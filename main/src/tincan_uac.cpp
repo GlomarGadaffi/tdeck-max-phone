@@ -51,6 +51,21 @@ static std::string ipFromConnection(std::string_view conn)
 
 static std::string randBranch() { return "z9hG4bK" + IDGen::GenerateID(10); }
 
+// SipMessage's getters (getVia/getFrom/getTo/getCallID/getCSeq) return the
+// RAW header line including the field name ("Call-ID: 9f8e...@host"), not
+// just the value. Strips the "Field-Name: " prefix to get the bare value,
+// needed anywhere we're reusing a captured value to build a fresh request
+// (as opposed to echoing a captured line verbatim in a UAS response, where
+// the prefix is wanted).
+static std::string headerValue(std::string_view line)
+{
+    size_t p = line.find(':');
+    if (p == std::string_view::npos) return std::string(line);
+    p++;
+    while (p < line.size() && line[p] == ' ') p++;
+    return std::string(line.substr(p));
+}
+
 // ── ctor/dtor ────────────────────────────────────────────────────────────--
 TincanUac::TincanUac() {}
 TincanUac::~TincanUac()
@@ -181,7 +196,7 @@ std::string TincanUac::buildInvite(const std::string &calleeExt) const
         "Max-Forwards: 70\r\n"
         "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>\r\n"
-        "Call-ID: %s@%s\r\n"
+        "Call-ID: %s\r\n"
         "CSeq: 1 INVITE\r\n"
         "Contact: <sip:%s@%s:%d;transport=UDP>\r\n"
         "Content-Type: application/sdp\r\n"
@@ -191,7 +206,7 @@ std::string TincanUac::buildInvite(const std::string &calleeExt) const
         _localIp.c_str(), _localSipPort, randBranch().c_str(),
         _selfExt.c_str(), _serverIp.c_str(), _fromTag.c_str(),
         calleeExt.c_str(), _serverIp.c_str(),
-        _callId.c_str(), _localIp.c_str(),
+        _callId.c_str(),
         _selfExt.c_str(), _localIp.c_str(), _localSipPort,
         sdpLen, sdp);
     return std::string(msg);
@@ -206,14 +221,14 @@ std::string TincanUac::buildAck() const
         "Max-Forwards: 70\r\n"
         "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>;tag=%s\r\n"
-        "Call-ID: %s@%s\r\n"
+        "Call-ID: %s\r\n"
         "CSeq: 1 ACK\r\n"
         "Content-Length: 0\r\n\r\n",
         _peerExt.c_str(), _serverIp.c_str(), _serverPort,
         _localIp.c_str(), _localSipPort, randBranch().c_str(),
         _selfExt.c_str(), _serverIp.c_str(), _fromTag.c_str(),
         _peerExt.c_str(), _serverIp.c_str(), _remoteTag.c_str(),
-        _callId.c_str(), _localIp.c_str());
+        _callId.c_str());
     return std::string(msg);
 }
 
@@ -226,14 +241,14 @@ std::string TincanUac::buildBye() const
         "Max-Forwards: 70\r\n"
         "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>;tag=%s\r\n"
-        "Call-ID: %s@%s\r\n"
+        "Call-ID: %s\r\n"
         "CSeq: 2 BYE\r\n"
         "Content-Length: 0\r\n\r\n",
         _peerExt.c_str(), _serverIp.c_str(), _serverPort,
         _localIp.c_str(), _localSipPort, randBranch().c_str(),
         _selfExt.c_str(), _serverIp.c_str(), _fromTag.c_str(),
         _peerExt.c_str(), _serverIp.c_str(), _remoteTag.c_str(),
-        _callId.c_str(), _localIp.c_str());
+        _callId.c_str());
     return std::string(msg);
 }
 
@@ -246,14 +261,14 @@ std::string TincanUac::buildCancel() const
         "Max-Forwards: 70\r\n"
         "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>\r\n"
-        "Call-ID: %s@%s\r\n"
+        "Call-ID: %s\r\n"
         "CSeq: 1 CANCEL\r\n"
         "Content-Length: 0\r\n\r\n",
         _peerExt.c_str(), _serverIp.c_str(), _serverPort,
         _localIp.c_str(), _localSipPort, randBranch().c_str(),
         _selfExt.c_str(), _serverIp.c_str(), _fromTag.c_str(),
         _peerExt.c_str(), _serverIp.c_str(),
-        _callId.c_str(), _localIp.c_str());
+        _callId.c_str());
     return std::string(msg);
 }
 
@@ -277,15 +292,26 @@ std::string TincanUac::buildInviteResponse(int code, const char *reason, bool wi
             _localRtpPort, POC_RTP_PAYLOAD_PCMU, POC_RTP_PAYLOAD_PCMU);
     }
 
+    // SipMessage's getVia()/getFrom()/getTo()/getCallID()/getCSeq() return
+    // the RAW header line INCLUDING the field name (e.g. getVia() ->
+    // "Via: SIP/2.0/UDP ..."), not just the value -- confirmed by reading
+    // SipMessage.cpp's parse loop, which stores the whole matched line
+    // (`_via = line;` etc). _inVia/_inFrom/_inTo/_inCallId/_inCseqInvite
+    // were captured straight from those getters in handleInboundInvite(),
+    // so they already carry their own field names. No "Via: "/"From: "/
+    // etc. literal prefix belongs in these format strings, or the field
+    // name doubles on the wire (a real bug this had until caught in
+    // review: drawbridge/any real UAC discards a response with
+    // "Via: Via: ...").
     char msg[1280];
     if (withSdp) {
         std::snprintf(msg, sizeof(msg),
             "SIP/2.0 %d %s\r\n"
-            "Via: %s\r\n"
-            "From: %s\r\n"
-            "To: %s;tag=%s\r\n"
-            "Call-ID: %s\r\n"
-            "CSeq: %s\r\n"
+            "%s\r\n"
+            "%s\r\n"
+            "%s;tag=%s\r\n"
+            "%s\r\n"
+            "%s\r\n"
             "Contact: <sip:%s@%s:%d;transport=UDP>\r\n"
             "Content-Type: application/sdp\r\n"
             "Content-Length: %d\r\n"
@@ -297,11 +323,11 @@ std::string TincanUac::buildInviteResponse(int code, const char *reason, bool wi
     } else {
         std::snprintf(msg, sizeof(msg),
             "SIP/2.0 %d %s\r\n"
-            "Via: %s\r\n"
-            "From: %s\r\n"
-            "To: %s;tag=%s\r\n"
-            "Call-ID: %s\r\n"
-            "CSeq: %s\r\n"
+            "%s\r\n"
+            "%s\r\n"
+            "%s;tag=%s\r\n"
+            "%s\r\n"
+            "%s\r\n"
             "Content-Length: 0\r\n\r\n",
             code, reason, _inVia.c_str(), _inFrom.c_str(), _inTo.c_str(), _ourToTag.c_str(),
             _inCallId.c_str(), _inCseqInvite.c_str());
@@ -312,6 +338,8 @@ std::string TincanUac::buildInviteResponse(int code, const char *reason, bool wi
 // Generic 200 OK for an in-dialog request we didn't originate (BYE/CANCEL),
 // echoing its own Via/From/To/Call-ID/CSeq verbatim -- those already carry
 // both parties' tags since it's in-dialog, so no tag needs adding here.
+// Same "getters already include the field name" caveat as
+// buildInviteResponse() above applies to via/from/to/callId/cseq here.
 std::string TincanUac::buildGenericResponse(const std::string &via, const std::string &from,
                                              const std::string &to, const std::string &callId,
                                              const std::string &cseq, int code, const char *reason) const
@@ -319,11 +347,11 @@ std::string TincanUac::buildGenericResponse(const std::string &via, const std::s
     char msg[768];
     std::snprintf(msg, sizeof(msg),
         "SIP/2.0 %d %s\r\n"
-        "Via: %s\r\n"
-        "From: %s\r\n"
-        "To: %s\r\n"
-        "Call-ID: %s\r\n"
-        "CSeq: %s\r\n"
+        "%s\r\n"
+        "%s\r\n"
+        "%s\r\n"
+        "%s\r\n"
+        "%s\r\n"
         "Content-Length: 0\r\n\r\n",
         code, reason, via.c_str(), from.c_str(), to.c_str(), callId.c_str(), cseq.c_str());
     return std::string(msg);
@@ -363,7 +391,11 @@ bool TincanUac::placeCall(const std::string &calleeExt)
 
     resetDialog();
     _peerExt = calleeExt;
-    _callId = IDGen::GenerateID(16);
+    // _callId holds the bare Call-ID VALUE ("id@host"), not a raw header
+    // line -- consistent with what answer() stores for inbound-established
+    // calls (see its own comment) so BYE-matching and rebuilding in-dialog
+    // requests both work the same way regardless of call direction.
+    _callId = IDGen::GenerateID(16) + "@" + _localIp;
     _fromTag = IDGen::GenerateID(8);
     _state = State::Calling;
 
@@ -477,7 +509,9 @@ void TincanUac::handleInboundBye(const std::string &raw)
                                        std::string(msg->getTo()), std::string(msg->getCallID()),
                                        std::string(msg->getCSeq()), 200, "OK"));
 
-    if (_state == State::InCall && std::string(msg->getCallID()) == _callId) {
+    // getCallID() returns the raw header line ("Call-ID: id@host"); _callId
+    // holds just the bare value, so strip the prefix before comparing.
+    if (_state == State::InCall && headerValue(msg->getCallID()) == _callId) {
         ESP_LOGI(TAG, "<- BYE (peer hung up)");
         resetDialog();
         _state = State::Idle;
@@ -533,8 +567,12 @@ bool TincanUac::answer()
 
     // Adopt the inbound dialog as the active one, in the same fields
     // placeCall() uses, so buildBye()/buildAck() work uniformly regardless
-    // of call direction.
-    _callId = _inCallId;
+    // of call direction. _inCallId is the raw header line ("Call-ID:
+    // id@host") captured for echoing verbatim in the INVITE response above
+    // -- strip the prefix here so _callId consistently holds just the bare
+    // value, matching what placeCall() stores and what buildBye()/
+    // handleInboundBye()'s matching now expect regardless of call direction.
+    _callId = headerValue(_inCallId);
     _fromTag = _ourToTag;
     _remoteTag = extractParam(_inFrom, ";tag=");
 

@@ -1,3 +1,7 @@
+# Local credentials -- Wi-Fi PSK and LAN topology. Never commit.
+# poc_config.h reads this via __has_include; the tracked .example stays.
+main/include/poc_secrets.h
+
 build/
 build-host/
 sdkconfig

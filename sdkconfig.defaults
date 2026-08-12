@@ -36,6 +36,18 @@ CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_NUMBER_OF_CORES=2
 
+# Main task stack. The default (3584) is NOT enough for the SIP layer and
+# overflows the moment registerExt() runs: it holds char rbuf[2048] live
+# across its receive loop, and the builders/parser add char msg[1280] plus
+# SipMessage frames on top. Confirmed on hardware as
+# "***ERROR*** A stack overflow in task main has been detected." right
+# after the first REGISTER, boot-looping the device.
+#
+# 8192 matches what the sibling tincan project already sets for the same
+# code -- the buffers were ported from there, this setting was not.
+# The audio and e-paper tasks size their own stacks in app_main.cpp.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
 # LWIP Socket & Networking
 CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_LWIP_SO_RCVTIMEO=y

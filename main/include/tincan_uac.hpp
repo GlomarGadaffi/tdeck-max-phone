@@ -121,6 +121,7 @@ private:
     void handleInboundBye(const std::string &raw);
     void handleInboundCancel(const std::string &raw);
     void handleInboundAck(const std::string &raw);
+    void handleInboundOptions(const std::string &raw);
     void tickOkRetransmit();
 
     // RFC 3261 requires a UAS to keep retransmitting its 2xx to an INVITE

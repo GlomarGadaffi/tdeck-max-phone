@@ -610,7 +610,28 @@ void TincanUac::poll()
     else if (raw.rfind("BYE ", 0) == 0) handleInboundBye(raw);
     else if (raw.rfind("CANCEL ", 0) == 0) handleInboundCancel(raw);
     else if (raw.rfind("ACK ", 0) == 0) handleInboundAck(raw);
+    else if (raw.rfind("OPTIONS ", 0) == 0) handleInboundOptions(raw);
     // Any other in-dialog chatter: nothing else to do for this PoC.
+}
+
+// OPTIONS is drawbridge's liveness probe, NOT optional chatter. Its registrar
+// prunes any binding whose client hasn't answered one within 15 s
+// ("Pruning client due to missed OPTIONS keepalive pings" in
+// RequestsHandler::sweepExpired), regardless of the Expires we negotiated.
+// Ignoring it made us register successfully and then silently disappear from
+// the registrar ~15 s later -- the phone looks fine and simply never rings.
+void TincanUac::handleInboundOptions(const std::string &raw)
+{
+    sockaddr_in dummy{};
+    SipMessageFactory factory;
+    auto parsed = factory.createMessage(raw, dummy);
+    if (!parsed.has_value()) return;
+    auto msg = parsed.value();
+
+    sendToServer(buildGenericResponse(std::string(msg->getVia()), std::string(msg->getFrom()),
+                                       std::string(msg->getTo()), std::string(msg->getCallID()),
+                                       std::string(msg->getCSeq()), 200, "OK"));
+    ESP_LOGD(TAG, "<- OPTIONS, replied 200 (keepalive)");
 }
 
 // The ACK completing an inbound INVITE we answered. Stops 2xx retransmit.

@@ -37,10 +37,11 @@ static const char s_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
     {0,   0,   0,   0,   0,   0,   '0', ' ', 0,   0  },
 };
 // Digits 1-9 and *,# aren't on this QWERTY matrix at all on real hardware
-// (it's a chat-style keyboard, not a numeric keypad) -- number entry uses
-// the top QWERTY row digits via a shift/ALT layer in the full driver this
-// stubs toward. For the PoC's dial/answer/hangup flow this reduced map is
-// sufficient; extending to full digit entry is UI-layer scope (see #9).
+// (it's a chat-style keyboard, not a numeric keypad) -- number entry needs
+// the top QWERTY row via an ALT/SYM shift layer whose mapping isn't
+// confirmed. For the PoC's answer/reject/hangup flow this reduced map is
+// sufficient; deriving the full map is #17 (build with
+// CONFIG_TDECK_MAX_KEYPAD_DEBUG=y to dump raw key_num per press).
 
 static esp_err_t read_reg(uint8_t reg, uint8_t *val)
 {

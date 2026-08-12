@@ -13,4 +13,28 @@ menu "T-Deck MAX Phone"
             for a real hardware build -- the device would boot silently
             "successful" while nothing is actually initialized.
 
+    config TDECK_MAX_KEYPAD_DEBUG
+        bool "Log raw TCA8418 key events"
+        default n
+        help
+            Log the raw event byte, decoded key_num, and resulting row/col
+            for every keypress. The row/col decode and keymap are inherited
+            from LilyGO's example and not yet verified on hardware; enable
+            this during bench bring-up to derive the real map empirically,
+            then turn it back off (it logs on every keypress).
+
+    config TDECK_MAX_HALT_ON_INIT_FAIL
+        bool "Abort boot if a peripheral fails to initialize"
+        default n
+        help
+            When disabled (the default), a peripheral that fails to come up
+            is logged and boot continues, so the serial log reports every
+            failure and the I2C scan still runs. When enabled, the first
+            failure aborts.
+
+            Default is off deliberately: fail-fast during bring-up gives a
+            panic-reboot loop with no UI and no indication of WHICH device
+            NAKed, which is the least debuggable outcome on a board with
+            six devices sharing one I2C bus.
+
 endmenu

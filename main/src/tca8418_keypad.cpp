@@ -81,6 +81,29 @@ static esp_err_t write_reg(uint8_t reg, uint8_t val)
 #endif
 }
 
+// Consume exactly one FIFO entry and return its raw event byte (0 if the
+// FIFO is empty or I2C failed). Kept separate from tca8418_get_key() so the
+// startup drain can empty the FIFO regardless of whether each key maps to a
+// printable character.
+static uint8_t read_raw_event(void)
+{
+#if CONFIG_TDECK_MAX_SIM_MODE
+    return 0;
+#else
+    uint8_t event_count = 0;
+    if (read_reg(TCA8418_REG_KEY_LCK_EC, &event_count) != ESP_OK) return 0;
+    if ((event_count & TCA8418_KEY_LCK_EC_MASK) == 0) return 0;
+
+    uint8_t raw = 0;
+    if (read_reg(TCA8418_REG_KEY_EVENT_A, &raw) != ESP_OK) return 0;
+
+    // Clear the key-event interrupt flag now that we've consumed an entry;
+    // this is also what releases the INT pin once the FIFO drains.
+    write_reg(TCA8418_REG_INT_STAT, TCA8418_INT_STAT_K_INT);
+    return raw;
+#endif
+}
+
 esp_err_t tca8418_init(void)
 {
     ESP_LOGI(TAG, "Initializing TCA8418 keypad controller...");
@@ -120,11 +143,29 @@ esp_err_t tca8418_init(void)
     ret = write_reg(TCA8418_REG_CFG, TCA8418_CFG_AI | TCA8418_CFG_KE_IEN);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "Failed to configure CFG register"); return ret; }
 
-    // Drain any stale events left in the FIFO from before reset settled.
-    while (tca8418_get_key() != 0) {}
+    // Drain stale events left in the FIFO from before reset settled. Uses
+    // the RAW reader, not tca8418_get_key(): most keys in s_keymap map to
+    // NUL, and a drain loop keyed on get_key()'s return value stops at the
+    // first such key, leaving the FIFO partly full.
+    int drained = 0;
+    while (read_raw_event() != 0 && ++drained < 32) {}
+    if (drained) ESP_LOGI(TAG, "drained %d stale key event(s)", drained);
 
     ESP_LOGI(TAG, "TCA8418 keypad initialized successfully");
     return ESP_OK;
+}
+
+bool tca8418_key_pending(void)
+{
+#if CONFIG_TDECK_MAX_SIM_MODE
+    return false;
+#else
+    // INT is active-low and stays asserted while events are queued, so this
+    // is a single GPIO read standing in for 2-3 I2C transactions. Without
+    // it we'd hammer the shared I2C bus every tick -- including mid-call,
+    // contending with the ES8311.
+    return gpio_get_level(BOARD_KEYBOARD_INT) == 0;
+#endif
 }
 
 char tca8418_get_key(void)
@@ -132,22 +173,26 @@ char tca8418_get_key(void)
 #if CONFIG_TDECK_MAX_SIM_MODE
     return 0; // no real FIFO to poll under QEMU
 #else
-    uint8_t event_count = 0;
-    if (read_reg(TCA8418_REG_KEY_LCK_EC, &event_count) != ESP_OK) return 0;
-    if ((event_count & TCA8418_KEY_LCK_EC_MASK) == 0) return 0;
-
-    uint8_t raw = 0;
-    if (read_reg(TCA8418_REG_KEY_EVENT_A, &raw) != ESP_OK || raw == 0) return 0;
-
-    // Clear the key-event interrupt flag now that we've consumed an entry.
-    write_reg(TCA8418_REG_INT_STAT, TCA8418_INT_STAT_K_INT);
+    uint8_t raw = read_raw_event();
+    if (raw == 0) return 0;
 
     bool pressed = (raw & 0x80) != 0;
     int key_num = (raw & 0x7F) - 1; // datasheet: 1-based, 0x80 = press bit
     if (key_num < 0 || key_num >= KEYPAD_ROWS * KEYPAD_COLS) return 0;
 
+    // NOTE: this row/col decode is inherited from LilyGO's example and is
+    // NOT yet verified against physical hardware -- in particular the
+    // column reversal. Build with CONFIG_TDECK_MAX_KEYPAD_DEBUG=y to log
+    // raw key_num per press and derive the real map empirically (#17).
     int row = key_num / KEYPAD_COLS;
     int col = (KEYPAD_COLS - 1) - (key_num % KEYPAD_COLS);
+
+#if CONFIG_TDECK_MAX_KEYPAD_DEBUG
+    ESP_LOGI(TAG, "raw=0x%02x key_num=%d %s -> row=%d col=%d mapped='%c'(0x%02x)",
+             raw, key_num, pressed ? "PRESS" : "RELEASE", row, col,
+             s_keymap[row][col] ? s_keymap[row][col] : '.',
+             (unsigned)s_keymap[row][col]);
+#endif
 
     if (!pressed) return 0; // only report presses, matching this function's existing contract
     return s_keymap[row][col];

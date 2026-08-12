@@ -11,6 +11,7 @@
 static const char *TAG = "net_wifi";
 
 #define WIFI_GOT_IP_BIT BIT0
+#define WIFI_CONNECT_TIMEOUT_MS 30000
 static EventGroupHandle_t s_wifi_evt;
 static char s_ip[16] = "0.0.0.0";
 
@@ -52,8 +53,25 @@ esp_err_t wifi_sta_connect(const char *ssid, const char *pass)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "connecting to \"%s\" ...", ssid);
-    xEventGroupWaitBits(s_wifi_evt, WIFI_GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    // Bounded, not portMAX_DELAY: a typo'd SSID or wrong PSK otherwise
+    // hangs here forever with no further output, which during bring-up is
+    // indistinguishable from a crash. The driver keeps retrying in the
+    // background either way (see WIFI_EVENT_STA_DISCONNECTED above), so a
+    // timeout costs nothing but lets the caller report the failure.
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt, WIFI_GOT_IP_BIT, pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    if (!(bits & WIFI_GOT_IP_BIT)) {
+        ESP_LOGE(TAG, "no IP after %d s -- check SSID/password/AP reachability",
+                 WIFI_CONNECT_TIMEOUT_MS / 1000);
+        return ESP_ERR_TIMEOUT;
+    }
     return ESP_OK;
+}
+
+bool wifi_is_connected(void)
+{
+    if (!s_wifi_evt) return false;
+    return (xEventGroupGetBits(s_wifi_evt) & WIFI_GOT_IP_BIT) != 0;
 }
 
 const char *wifi_local_ip(void) { return s_ip; }

@@ -8,11 +8,23 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
-# PSRAM settings (8MB Octal PSRAM)
+# PSRAM settings (8MB QUAD PSRAM -- NOT Octal).
+#
+# This was previously CONFIG_SPIRAM_MODE_OCT=y, which is wrong for this
+# board: LilyGO's own board definition for the T-Deck MAX
+# (github.com/Xinyuan-LilyGO/T-Deck-MAX boards/T-Deck-Pro.json) specifies
+# "memory_type": "qio_qspi" and names the board "... 8M QSPI PSRAM" --
+# Quad, not Octal. On the ESP32-S3, octal PSRAM/flash consumes GPIO 33-37
+# for the extra data lines, which this board's pinmap uses for real
+# peripherals (MOSI 33, EPD_CS 34, EPD_DC 35, SCK 36, EPD_BUSY 37) --
+# running in octal mode would have stolen those pins out from under the
+# e-paper/LoRa/SD SPI bus and I2S MCLK (38), with a maximally confusing
+# failure mode (everything on that bus dying at once). Caught in review
+# before first flash, not found by QEMU (sdkconfig.ci.qemu disables
+# PSRAM entirely, so it never exercised this).
 CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_TYPE_AUTO=y
-CONFIG_SPIRAM_SIZE_8MB=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 

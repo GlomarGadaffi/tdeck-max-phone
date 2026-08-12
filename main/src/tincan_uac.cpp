@@ -7,6 +7,7 @@
 #include <lwip/inet.h>
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 
 #include <cstdio>
 #include <cstring>
@@ -124,8 +125,29 @@ bool TincanUac::openRtpSocket()
     return true;
 }
 
+// Publish the negotiated RTP endpoint for the audio task. Order matters:
+// fill the POD fields FIRST, then arm the flag with release ordering, so a
+// media task that sees the flag set is guaranteed to see a complete
+// endpoint (see the field comments in tincan_uac.hpp).
+void TincanUac::publishMediaTarget()
+{
+    _mediaIpBe = (uint32_t)inet_addr(_remoteRtpIp.c_str());
+    _mediaPortBe = htons((uint16_t)_remoteRtpPort);
+    _mediaActive.store(true, std::memory_order_release);
+}
+
+// Disarm before the control path is allowed to disturb the endpoint or the
+// std::string fields it came from.
+void TincanUac::retireMediaTarget()
+{
+    _mediaActive.store(false, std::memory_order_release);
+}
+
 void TincanUac::resetDialog()
 {
+    retireMediaTarget();
+    _awaitingAck = false;
+    _pendingOk.clear();
     _callId.clear();
     _fromTag.clear();
     _remoteTag.clear();
@@ -377,11 +399,37 @@ bool TincanUac::registerExt()
         auto parsed = factory.createMessage(std::string(rbuf, n), src);
         if (!parsed.has_value()) continue;
         int code = statusCode(parsed.value()->getType());
-        if (code == 200) { ESP_LOGI(TAG, "registered as %s", _selfExt.c_str()); return true; }
+        if (code == 200) {
+            ESP_LOGI(TAG, "registered as %s", _selfExt.c_str());
+            // Refresh at half the advertised lifetime -- standard practice,
+            // leaves a full Expires/2 of slack to retry before the binding
+            // actually lapses.
+            _nextRegisterUs = esp_timer_get_time() +
+                              (int64_t)(POC_SIP_REG_EXPIRES / 2) * 1000000LL;
+            return true;
+        }
         if (code >= 400) { ESP_LOGE(TAG, "REGISTER rejected (%d)", code); return false; }
     }
     ESP_LOGW(TAG, "no REGISTER response from %s:%d", _serverIp.c_str(), _serverPort);
     return false;
+}
+
+bool TincanUac::maintainRegistration()
+{
+    if (_nextRegisterUs == 0) return false;                 // never registered yet
+    if (esp_timer_get_time() < _nextRegisterUs) return false; // not due
+    // Don't stall an active call's signalling to re-register; the binding
+    // has Expires/2 of slack, so deferring past the call is safe.
+    if (_state != State::Idle) return false;
+
+    ESP_LOGI(TAG, "refreshing registration for %s", _selfExt.c_str());
+    if (registerExt()) return false;   // success reschedules _nextRegisterUs
+
+    // Failed: retry in 60s rather than hammering, and report it so the UI
+    // can show the phone is no longer reachable.
+    _nextRegisterUs = esp_timer_get_time() + 60LL * 1000000LL;
+    ESP_LOGW(TAG, "registration refresh failed; retrying in 60s");
+    return true;
 }
 
 // ── outbound INVITE (via server) ────────────────────────────────────────--
@@ -434,6 +482,7 @@ bool TincanUac::placeCall(const std::string &calleeExt)
             _rtpSeq = (uint16_t)esp_random();
             _rtpTs = esp_random();
             _rtpSsrc = esp_random();
+            publishMediaTarget();   // arm the audio task (see hpp field notes)
             _state = State::InCall;
             ESP_LOGI(TAG, "200 OK -> ACK; media to %s:%d", _remoteRtpIp.c_str(), _remoteRtpPort);
             return _remoteRtpPort > 0 && !_remoteRtpIp.empty();
@@ -542,6 +591,10 @@ void TincanUac::handleInboundCancel(const std::string &raw)
 
 void TincanUac::poll()
 {
+    // Time-based work first: must run even on ticks with no inbound packet
+    // (the whole point is that the ACK never arrived).
+    tickOkRetransmit();
+
     char rbuf[2048];
     sockaddr_in src{};
     socklen_t sl = sizeof(src);
@@ -556,14 +609,66 @@ void TincanUac::poll()
     if (raw.rfind("INVITE ", 0) == 0) handleInboundInvite(raw);
     else if (raw.rfind("BYE ", 0) == 0) handleInboundBye(raw);
     else if (raw.rfind("CANCEL ", 0) == 0) handleInboundCancel(raw);
-    // ACK and any other in-dialog chatter: nothing else to do for this PoC.
+    else if (raw.rfind("ACK ", 0) == 0) handleInboundAck(raw);
+    // Any other in-dialog chatter: nothing else to do for this PoC.
+}
+
+// The ACK completing an inbound INVITE we answered. Stops 2xx retransmit.
+void TincanUac::handleInboundAck(const std::string &raw)
+{
+    if (!_awaitingAck) return;
+    sockaddr_in dummy{};
+    SipMessageFactory factory;
+    auto parsed = factory.createMessage(raw, dummy);
+    if (!parsed.has_value()) return;
+    if (headerValue(parsed.value()->getCallID()) != _callId) return;
+
+    _awaitingAck = false;
+    _pendingOk.clear();
+    ESP_LOGI(TAG, "<- ACK (call fully established)");
+}
+
+// Retransmit the 200 OK until ACKed, per RFC 3261 -- interval starts at T1
+// (500ms), doubles, ceiling T2 (4s), give up at 64*T1 (32s).
+void TincanUac::tickOkRetransmit()
+{
+    if (!_awaitingAck) return;
+    int64_t now = esp_timer_get_time();
+
+    if (now >= _ackGiveUpUs) {
+        // Caller never ACKed. Per RFC 3261 the UAS must terminate the
+        // dialog with a BYE rather than sit in a half-open call.
+        ESP_LOGW(TAG, "no ACK after 32s -- tearing down the call");
+        _awaitingAck = false;
+        _pendingOk.clear();
+        if (_state == State::InCall) {
+            sendToServer(buildBye());
+            resetDialog();
+            _state = State::Idle;
+            _callEndedPending = true;
+        }
+        return;
+    }
+
+    if (now < _nextOkRetransmitUs) return;
+    ESP_LOGW(TAG, "no ACK yet -- retransmitting 200 OK");
+    sendToServer(_pendingOk);
+    _okRetransmitMs = (_okRetransmitMs * 2 > 4000) ? 4000 : _okRetransmitMs * 2;
+    _nextOkRetransmitUs = now + (int64_t)_okRetransmitMs * 1000LL;
 }
 
 bool TincanUac::answer()
 {
     if (_state != State::Ringing) { ESP_LOGW(TAG, "answer() with no ringing call"); return false; }
 
-    sendToServer(buildInviteResponse(200, "OK", true));
+    // Hold the exact bytes for retransmit -- RFC 3261 puts responsibility
+    // for getting a 2xx through on the UAS, not the transaction layer.
+    _pendingOk = buildInviteResponse(200, "OK", true);
+    sendToServer(_pendingOk);
+    _awaitingAck = true;
+    _okRetransmitMs = 500;                                        // T1
+    _nextOkRetransmitUs = esp_timer_get_time() + 500LL * 1000LL;
+    _ackGiveUpUs = esp_timer_get_time() + 32LL * 1000000LL;       // 64*T1
 
     // Adopt the inbound dialog as the active one, in the same fields
     // placeCall() uses, so buildBye()/buildAck() work uniformly regardless
@@ -579,6 +684,7 @@ bool TincanUac::answer()
     _rtpSeq = (uint16_t)esp_random();
     _rtpTs = esp_random();
     _rtpSsrc = esp_random();
+    publishMediaTarget();   // arm the audio task (see hpp field notes)
     _state = State::InCall;
     ESP_LOGI(TAG, "answered; media to %s:%d", _remoteRtpIp.c_str(), _remoteRtpPort);
     return true;
@@ -621,9 +727,13 @@ void TincanUac::hangup()
 }
 
 // ── media ────────────────────────────────────────────────────────────────--
+// Both media functions run on the dedicated audio task, NOT the main loop.
+// They deliberately read only _mediaActive/_mediaIpBe/_mediaPortBe (POD,
+// published with release ordering) and the RTP counters they alone own --
+// never _state or _remoteRtpIp, which the control path mutates.
 void TincanUac::sendAudioFrame(const int16_t *pcm, size_t samples)
 {
-    if (_state != State::InCall || samples == 0) return;
+    if (!_mediaActive.load(std::memory_order_acquire) || samples == 0) return;
     uint8_t pkt[RTP_HEADER_LEN + POC_FRAME_SAMPLES];
     if (samples > POC_FRAME_SAMPLES) samples = POC_FRAME_SAMPLES;
 
@@ -634,14 +744,14 @@ void TincanUac::sendAudioFrame(const int16_t *pcm, size_t samples)
 
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
-    dst.sin_addr.s_addr = inet_addr(_remoteRtpIp.c_str());
-    dst.sin_port = htons(_remoteRtpPort);
+    dst.sin_addr.s_addr = _mediaIpBe;
+    dst.sin_port = _mediaPortBe;
     sendto(_rtpSock, pkt, RTP_HEADER_LEN + samples, 0, (const sockaddr *)&dst, sizeof(dst));
 }
 
 size_t TincanUac::recvAudioFrame(int16_t *pcm, size_t maxSamples)
 {
-    if (_state != State::InCall) return 0;
+    if (!_mediaActive.load(std::memory_order_acquire)) return 0;
     uint8_t rx[RTP_HEADER_LEN + POC_FRAME_SAMPLES * 2];
     int n = recvfrom(_rtpSock, rx, sizeof(rx), MSG_DONTWAIT, nullptr, nullptr);
     if (n <= (int)RTP_HEADER_LEN) return 0;
@@ -650,4 +760,19 @@ size_t TincanUac::recvAudioFrame(int16_t *pcm, size_t maxSamples)
     if (plen > maxSamples) plen = maxSamples;
     g711_ulaw_decode_buf(rx + RTP_HEADER_LEN, pcm, plen);
     return plen;
+}
+
+// Drop any RTP the far end sent before we started pumping (or while the
+// speaker was starved). Without this the socket backlog is played out as a
+// burst of stale audio and every subsequent frame inherits that latency --
+// the "one-way delay climbs for the whole call" symptom.
+void TincanUac::flushRtpBacklog()
+{
+    if (_rtpSock < 0) return;
+    uint8_t scratch[RTP_HEADER_LEN + POC_FRAME_SAMPLES * 2];
+    int dropped = 0;
+    while (recvfrom(_rtpSock, scratch, sizeof(scratch), MSG_DONTWAIT, nullptr, nullptr) > 0) {
+        if (++dropped > 200) break;   // bounded; never spin on a flooding peer
+    }
+    if (dropped > 0) ESP_LOGD(TAG, "flushed %d stale RTP packet(s)", dropped);
 }

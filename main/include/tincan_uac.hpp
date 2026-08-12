@@ -2,6 +2,7 @@
 #define TINCAN_UAC_HPP
 
 #include <string>
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 
@@ -32,6 +33,14 @@ public:
     // true on 200 OK. drawbridge's registrar is open by default -- no
     // pre-created extension or credentials are needed.
     bool registerExt();
+
+    // Refresh the registration before POC_SIP_REG_EXPIRES elapses. Call
+    // every loop tick; it no-ops until the refresh deadline (Expires/2)
+    // passes, then re-REGISTERs. Without this the binding lapses and the
+    // phone silently stops receiving calls after an hour with no visible
+    // symptom. Returns true if a refresh was attempted AND failed, so the
+    // caller can surface it on the UI.
+    bool maintainRegistration();
 
     // Non-blocking: drain pending SIP messages and advance internal call
     // state (detects an inbound INVITE, matches ACK/BYE/CANCEL to the
@@ -76,9 +85,19 @@ public:
     void hangup();
 
     // Media -- only meaningful while inCall(). Both are non-blocking and
-    // safe to call every loop tick regardless of state (no-ops otherwise).
+    // safe to call every tick regardless of state (no-ops otherwise).
+    //
+    // THREADING: these two (plus flushRtpBacklog) are the only members safe
+    // to call from a task other than the one driving poll()/placeCall()/
+    // answer()/hangup(). They touch only the POD media endpoint and the RTP
+    // counters they exclusively own. Do not call anything else from the
+    // audio task.
     void sendAudioFrame(const int16_t *pcm, size_t samples);
     size_t recvAudioFrame(int16_t *pcm, size_t maxSamples);
+
+    // Discard queued inbound RTP. Call when starting to pump a new call, so
+    // a pre-answer backlog isn't played out as latency that never recovers.
+    void flushRtpBacklog();
 
 private:
     enum class State { Idle, Calling, Ringing, InCall, Ending };
@@ -101,6 +120,19 @@ private:
     void handleInboundInvite(const std::string &raw);
     void handleInboundBye(const std::string &raw);
     void handleInboundCancel(const std::string &raw);
+    void handleInboundAck(const std::string &raw);
+    void tickOkRetransmit();
+
+    // RFC 3261 requires a UAS to keep retransmitting its 2xx to an INVITE
+    // until the ACK arrives -- the 2xx is NOT protected by the transaction
+    // layer. Without this a single dropped 200 OK leaves us believing we're
+    // in a call while the caller keeps ringing. Retransmit starts at T1 and
+    // doubles to a T2 ceiling, giving up after 64*T1.
+    std::string _pendingOk;
+    bool _awaitingAck = false;
+    int64_t _nextOkRetransmitUs = 0;
+    int _okRetransmitMs = 0;
+    int64_t _ackGiveUpUs = 0;
 
     std::string _localIp, _serverIp, _selfExt, _peerExt;
     int _localSipPort = 0, _localRtpPort = 0, _serverPort = 0;
@@ -110,6 +142,10 @@ private:
 
     State _state = State::Idle;
     bool _callEndedPending = false;
+
+    // Deadline (esp_timer microseconds) for the next REGISTER refresh; 0
+    // until the first successful registration. See maintainRegistration().
+    int64_t _nextRegisterUs = 0;
 
     // Outbound-dialog fields (mirrors tincan's SipUac).
     std::string _callId, _fromTag, _remoteTag;
@@ -121,6 +157,23 @@ private:
 
     std::string _remoteRtpIp;
     int _remoteRtpPort = 0;
+
+    // Media endpoint published for the audio task, kept separate from the
+    // std::string fields above on purpose. sendAudioFrame()/recvAudioFrame()
+    // run on a different task than poll()/answer()/hangup(), so they must
+    // never touch _remoteRtpIp (a std::string the control path reassigns --
+    // a torn read there is a crash, not a glitch). These are POD in network
+    // byte order, published with release/acquire ordering around
+    // _mediaActive: the control path fills them BEFORE setting the flag and
+    // clears the flag BEFORE disturbing them, so the media path only ever
+    // reads a fully-written endpoint. Also avoids a per-frame inet_addr()
+    // and string copy at 50 Hz.
+    std::atomic<bool> _mediaActive{false};
+    uint32_t _mediaIpBe = 0;
+    uint16_t _mediaPortBe = 0;
+
+    void publishMediaTarget();   // fill POD fields, then arm _mediaActive
+    void retireMediaTarget();    // disarm _mediaActive
 
     uint16_t _rtpSeq = 0;
     uint32_t _rtpTs = 0;

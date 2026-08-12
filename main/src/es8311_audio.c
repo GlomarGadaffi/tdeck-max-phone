@@ -50,12 +50,12 @@ static i2s_chan_handle_t rx_chan = NULL;
 #define ES8311_GPIO_REG44        0x44
 #define ES8311_GP_REG45          0x45
 
+// Defined only for real-hardware builds: in sim mode the sole caller
+// (es8311_codec_init) is compiled out too, so defining these would just
+// produce -Wunused-function noise.
+#if !CONFIG_TDECK_MAX_SIM_MODE
 static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val)
 {
-#if CONFIG_TDECK_MAX_SIM_MODE
-    ESP_LOGD(TAG, "[sim] es8311_write_reg(0x%02x, 0x%02x) skipped", reg, val);
-    return ESP_OK;
-#else
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (BOARD_ES8311_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -65,16 +65,10 @@ static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val)
     esp_err_t ret = i2c_master_cmd_begin(BOARD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     return ret;
-#endif
 }
 
 static esp_err_t es8311_read_reg(uint8_t reg, uint8_t *val)
 {
-#if CONFIG_TDECK_MAX_SIM_MODE
-    ESP_LOGD(TAG, "[sim] es8311_read_reg(0x%02x) skipped", reg);
-    *val = 0;
-    return ESP_OK;
-#else
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (BOARD_ES8311_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -86,10 +80,8 @@ static esp_err_t es8311_read_reg(uint8_t reg, uint8_t *val)
     esp_err_t ret = i2c_master_cmd_begin(BOARD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     return ret;
-#endif
 }
 
-#if !CONFIG_TDECK_MAX_SIM_MODE
 // Clock coefficients for MCLK=2.048MHz / 8kHz sample rate, from the vendor
 // driver's coeff_div[] table -- exact match, not interpolated. 2.048MHz is
 // what BOARD_I2S_MCLK actually outputs here: I2S_STD_CLK_DEFAULT_CONFIG()

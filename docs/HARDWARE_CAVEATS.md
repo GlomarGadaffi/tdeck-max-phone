@@ -4,6 +4,18 @@
 > **Status: UNTESTED / AWAITING HARDWARE VERIFICATION**
 > This document outlines the physical hardware design choices, shared bus constraints, and pending bench-test verification items for `tdeck-max-phone`.
 
+> **Note (2026-08):** several items below are now handled in firmware rather
+> than being purely manual bench checks, and two assume the cellular/3CX-direct
+> architecture that was superseded (see `ARCHITECTURE.md`'s correction note and
+> closed issues #4/#5). Per-item status is annotated inline.
+>
+> **PSRAM:** `sdkconfig.defaults` previously set octal mode, which on the
+> ESP32-S3 consumes GPIO 33-38 -- every one of which this board uses for
+> MOSI/EPD_CS/EPD_DC/SCK/EPD_BUSY. Corrected to quad before first flash
+> (#21), matching LilyGO's own board definition (`"memory_type": "qio_qspi"`).
+> If anything on the SPI bus misbehaves, verify `CONFIG_SPIRAM_MODE_QUAD=y`
+> before debugging further.
+
 ---
 
 ## 1. Shared Bus Topology & Constraints
@@ -47,11 +59,27 @@ The **XL9555 (I2C `0x20`)** must be initialized early in `app_main.cpp` before a
    - Pulse P0_7 LOW -> HIGH (Reset Touch Panel)
 ```
 
+**How `xl9555_init()` actually differs from the above, verified against the code:**
+
+- **Touch reset is not pulsed.** P0_7 is simply set HIGH (reset released). A real LOW→HIGH pulse only happens in `xl9555_reset_touch()`, which nothing calls -- the touch panel is unused by this firmware.
+- **Keypad reset is pulsed**, but from `tca8418_init()` via `xl9555_reset_keyboard()`, not from `xl9555_init()` itself.
+- **P1_0 is asserted, powering the A7682E 4G modem on every boot** -- even though this firmware is Wi-Fi only and never talks to the modem. On a battery-powered device that is continuous drain for no benefit. Deliberately left as-is rather than changed blind, because the power-sequencing consequences on real hardware are unverified; worth measuring during bring-up and probably worth turning off once confirmed safe (#29).
+- **The speaker amp (P0_6) comes up enabled.** `app_main()` now explicitly disables it after audio init, since nothing should be playing at boot and an idle-but-powered amp both draws current and can hiss/click on DMA underrun. It is re-enabled per call.
+
 ---
 
 ## 3. Pending Hardware Bench Tests
 
 - [ ] **I2S Audio Quality**: Verify ES8311 codec 8 kHz mono sampling over `IO38` (MCLK), `IO39` (BCLK), `IO18` (LRCK), `IO40` (Mic DIN), `IO17` (Spk DOUT).
+      *Two known traps here: the codec had no register init at all until #20, and mono mode defaults to the LEFT slot (#27) which silently kills the mic if the ADC lands on the right. See `BENCH_TEST.md` → "If the mic is silent".*
 - [ ] **Acoustic Echo & Feedback**: Measure speakerphone feedback in full-duplex mode on physical hardware; tune software AEC / noise suppression.
-- [ ] **A7682E 4G PPP Connection**: Test `esp_modem` PPP dialing scripts (`ATD*99#`) to verify LTE data throughput for 3CX WebSocket and RTP media streams.
-- [ ] **Battery & Thermal Management**: Monitor battery drain on SY6970 / BQ27220 during continuous 30-minute 3CX VoIP calls.
+      *No AEC or noise suppression exists in this firmware -- this is a measurement task, not a tuning task, until something is written.*
+- [ ] ~~**A7682E 4G PPP Connection**~~ -- **superseded** (#5). No cellular/PPP code exists; 3CX integration lives in drawbridge and this device is Wi-Fi only.
+- [ ] ~~**Battery & Thermal during 30-minute 3CX VoIP calls**~~ -- the *cellular* framing is superseded (#5); a 30-minute call endurance/thermal test over Wi-Fi remains valid and is tracked in #6.
+
+## 4. Now handled in firmware (previously manual bench items)
+
+- **I2C device presence** -- boot runs a scan of 0x08-0x77 naming each expected device PRESENT/absent. No separate `WireScan` sketch needed (#26, #2).
+- **Peripheral init failures** -- log-and-continue rather than `ESP_ERROR_CHECK`, so one NAK no longer panic-reboots without saying which device failed. `CONFIG_TDECK_MAX_HALT_ON_INIT_FAIL=y` restores fail-fast.
+- **Shared-SPI CS parking** -- LoRa (`IO3`) and SD (`IO48`) chip-selects are now driven HIGH at init alongside EPD CS, so an undriven CS can't float low and corrupt e-paper traffic. Still worth confirming with a meter, but no longer purely dependent on it.
+- **SPI MISO** -- the bus is initialized with `BOARD_SPI_MISO` wired even though the e-paper never drives it, because whoever initializes SPI2 first fixes its pin set for the SX1262 and SD card too.

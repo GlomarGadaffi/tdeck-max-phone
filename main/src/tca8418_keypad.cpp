@@ -43,13 +43,13 @@ static const char s_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
 // sufficient; deriving the full map is #17 (build with
 // CONFIG_TDECK_MAX_KEYPAD_DEBUG=y to dump raw key_num per press).
 
+// Read path is defined only for real-hardware builds -- its only caller
+// (read_raw_event) short-circuits in sim mode, so defining it there would
+// just produce -Wunused-function noise. write_reg stays unconditional
+// because tca8418_init() calls it on both paths.
+#if !CONFIG_TDECK_MAX_SIM_MODE
 static esp_err_t read_reg(uint8_t reg, uint8_t *val)
 {
-#if CONFIG_TDECK_MAX_SIM_MODE
-    ESP_LOGD(TAG, "[sim] read_reg(0x%02x) skipped", reg);
-    *val = 0;
-    return ESP_OK;
-#else
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (BOARD_KEYBOARD_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -61,8 +61,8 @@ static esp_err_t read_reg(uint8_t reg, uint8_t *val)
     esp_err_t ret = i2c_master_cmd_begin(BOARD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     return ret;
-#endif
 }
+#endif // !CONFIG_TDECK_MAX_SIM_MODE
 
 static esp_err_t write_reg(uint8_t reg, uint8_t val)
 {

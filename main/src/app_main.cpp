@@ -223,6 +223,18 @@ extern "C" void app_main(void)
     //    hide the state of the other five.
     try_init("XL9555 expander", xl9555_init());
     try_init("ES8311 codec", audio_hardware_init(POC_SAMPLE_RATE_HZ));
+
+    // xl9555_init() brings the speaker amp up enabled. Nothing should be
+    // playing at boot, and an idle-but-powered amp both draws current and
+    // can hiss/click on DMA underrun -- the sibling tincan project turns
+    // it off for exactly this reason. It's re-enabled per call.
+    audio_hardware_set_amp(false);
+
+    // xl9555_init() also asserts P1_0, which powers the A7682E 4G modem.
+    // This firmware never uses the modem (Wi-Fi only), so that is pure
+    // battery drain -- left as-is deliberately rather than changed blind,
+    // since the power-sequencing side effects on real hardware are
+    // unverified. See docs/HARDWARE_CAVEATS.md.
     try_init("TCA8418 keypad", tca8418_init());
     try_init("GDEQ031T10 e-paper", epaper_display_init());
 

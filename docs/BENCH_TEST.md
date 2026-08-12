@@ -9,9 +9,9 @@ the full design and `poc_config.h` for the constants referenced below.
 
 ## What's verifiable without hardware (already done, see repo history)
 
-No hardware-in-the-loop CI exists in this repo. Everything that doesn't
-need real I2C/SPI peripherals or real 802.11 RF was verified locally via a
-native ESP-IDF v6.0.1 + QEMU-xtensa setup (no WSL needed on Windows):
+No hardware-in-the-loop CI exists in this repo. Two things substitute for
+it, and they cover different ground: **host unit tests** for wire format,
+and **QEMU** for build/boot. Neither reaches the network.
 
 ```
 idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.qemu" set-target esp32s3
@@ -19,12 +19,16 @@ idf.py build
 idf.py qemu
 ```
 
-This confirmed: the firmware builds clean (zero warnings) in both the real-
-hardware config and the QEMU sim-mode config (`CONFIG_TDECK_MAX_SIM_MODE`,
-see `main/Kconfig.projbuild`), and boots cleanly through XL9555/ES8311/
-TCA8418/e-paper init -- each now reported individually via `init OK :` /
-`init FAIL :` lines -- the e-paper render task, and into Wi-Fi driver
-bring-up.
+This confirmed: the firmware builds with zero compiler warnings from
+project sources in **both** the real-hardware config and the QEMU sim-mode
+config (`CONFIG_TDECK_MAX_SIM_MODE`, see `main/Kconfig.projbuild`), and
+boots cleanly through XL9555/ES8311/TCA8418/e-paper init -- each reported
+individually via `init OK :` / `init FAIL :` lines -- the e-paper render
+task, and into Wi-Fi driver bring-up.
+
+(ESP-IDF v6 emits its own deprecation banner for the legacy `driver/i2c.h`
+API this firmware uses. That's an IDF notice, not a project warning, and
+is tracked as future migration debt in #30.)
 
 **Exactly where QEMU stops, measured:** emulated time reaches ~754 ms, at
 `phy_init: falling back to full calibration`, and then stops advancing. It
@@ -66,6 +70,7 @@ perfectly and would only ever have shown up as "drawbridge ignores us".
 - A LilyGO T-Deck MAX flashed with this firmware (`sdkconfig.defaults`, no QEMU fragment).
 - `main/include/poc_config.h` edited with real Wi-Fi credentials and a real drawbridge server IP (currently `CHANGE_ME` placeholders).
 - A drawbridge instance reachable on the same LAN (host build is fastest for iteration: `./build/SipServer --ip <LAN-IP> --port 5060 --web 8080`), with a real 3CX tenant configured via its SSH sysop TUI ("PBX Config" tab) -- see drawbridge's `docs/EXTENSION_SETUP.md`.
+- **drawbridge must be in its open/self-registering registrar mode.** This firmware has no SIP digest authentication at all and treats a `401 Unauthorized` challenge as a flat rejection ([#28](../../issues/28)), so drawbridge's secure mode (learn-mode + assigned secret) will fail at step 1 with a misleading "REGISTER rejected" log rather than retrying with credentials. Confirm this before blaming the network.
 - A desktop softphone on the same LAN, registered as a second extension, for steps 2 and 4.
 
 ## Procedure
@@ -82,7 +87,7 @@ Expected scan on a good board: `0x18` ES8311, `0x20` XL9555, `0x34` TCA8418,
 plus touch/IMU/haptics/charger depending on board revision.
 
 1. **Flash and register.** Flash the device, watch the serial log for `registered as <ext>`, and confirm the extension appears in drawbridge's Extensions list (open registrar -- no pre-created extension needed).
-2. **Inbound call.** Call this device's extension from the desktop softphone. Expect: e-paper shows the caller's extension and "Incoming Call". Press ENT on the keypad to answer -- expect two-way audio and the screen to show "In Call". Press ENT or DEL to hang up -- expect BYE round-trip and the screen to return to "Idle" **without a reset** (this PoC explicitly does not inherit tincan's single-call-per-boot limitation).
+2. **Inbound call.** Call this device's extension from the desktop softphone. Expect: e-paper shows the caller's extension and "Incoming Call". Press ENT on the keypad to answer -- expect two-way audio and the screen to show "In Call". Press ENT or DEL to hang up -- expect BYE round-trip and the screen to return to "Idle" **without a reset** (this PoC explicitly does not inherit tincan's single-call-per-boot limitation). If audio works in one direction only, go to "If the mic is silent" below before anything else -- that is a known, specific, and likely failure.
 3. **Outbound call through 3CX.** Dial `9<number>` from the keypad and press ENT. **Known limitation:** the real T-Deck MAX keypad only has `0`, DEL, and ENT mapped today (#17) -- digits 1-9 sit behind an unconfirmed ALT/SYM shift layer, so a real phone number generally can't be typed yet. Build with `CONFIG_TDECK_MAX_KEYPAD_DEBUG=y` to log the raw event byte / `key_num` / decoded row+col for every press and derive the real map empirically; note the column decode (`col = (COLS-1) - (key_num % COLS)`) is inherited from LilyGO's example and is itself unverified. Until that's done, exercise this path by temporarily hardcoding a test number in `app_main.cpp`'s dial call. Once dialed: expect drawbridge's anchor-call activity to fire and the call to connect through 3CX with two-way audio.
 4. **Inbound call from 3CX.** Have someone call the 3CX DN drawbridge is configured to anchor. Expect this device to ring (RING-ALL fork, first answer wins) alongside any other registered extension -- answerable from the keypad exactly like step 2.
 5. **Second call, no reboot.** Repeat step 2 or 3 a second time without power-cycling the device, to confirm no single-call-per-boot regression.
@@ -104,12 +109,42 @@ device. Step 3 is currently gated on the keypad digit-entry follow-up
 10 is a slow test worth running once unattended rather than blocking the
 bench session.
 
-## If step 2 fails
+## Troubleshooting
 
+### If step 1 fails (never registers)
+Check drawbridge is in **open** registrar mode first -- see Prerequisites.
+A secure-mode 401 challenge is treated as rejection ([#28](../../issues/28)),
+and the log line ("REGISTER rejected") actively points away from the real
+cause.
+
+### If step 2 rings but never connects
 The most likely historical cause is fixed but worth knowing: inbound
 responses were being emitted with doubled header field names (`Via: Via:`),
-which drawbridge silently discards — presenting as ringback that never
+which drawbridge silently discards -- presenting as ringback that never
 progresses, and looking like a drawbridge/3CX fault when it wasn't. That's
 now covered by the host test suite above, so run `ctest` first: if it
 passes, the response format is not the problem. A `tcpdump` on the
 drawbridge side will confirm in one packet.
+
+### If the mic is silent (speaker works, far end hears nothing)
+Two independent causes, both known, check in this order:
+
+1. **I2S slot** ([#27](../../issues/27)) -- `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG`
+   with `I2S_SLOT_MODE_MONO` expands `slot_mask` to `I2S_STD_SLOT_LEFT`. If
+   the ES8311's ADC lands on the right slot on this board, the capture path
+   reads silence with everything else correct. Test by switching the RX
+   channel's `slot_mask` to `I2S_STD_SLOT_RIGHT` in `es8311_audio.c`. Note
+   TX and RX currently share one `std_cfg`, so the real fix is likely
+   separate slot configs per channel rather than one global flip.
+2. **Mic PGA gain** -- `es8311_codec_init()` sets `ES8311_ADC_REG16` to a
+   default that was not verified against a datasheet. If the slot is right
+   but the level is inaudible, raise it before suspecting anything else.
+
+If **both** directions are silent, suspect the codec register init instead
+([#20](../../issues/20)) -- but note the I2S clock will still look perfectly
+healthy on a scope in that case, which is exactly what makes it misleading.
+
+### If audio is choppy or latency grows during a call
+See step 8. The audio pump has its own task now; if this reappears, it is
+being starved rather than a network problem. Check nothing slow was added
+to the main loop or the e-paper task's priority.

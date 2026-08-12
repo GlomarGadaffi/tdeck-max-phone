@@ -39,7 +39,9 @@ static const char *TAG = "EPAPER_DISPLAY";
 #define EPD_PSR_DEFAULT      0x1F
 #define EPD_DEEP_SLEEP_KEY   0xA5
 
-static spi_device_handle_t s_spi = NULL;
+#if !CONFIG_TDECK_MAX_SIM_MODE
+static spi_device_handle_t s_spi = NULL;   // unused (and undefined) in sim builds
+#endif
 static uint8_t s_fb[EPD_BUF_SIZE];       // 1bpp framebuffer, 1=white 0=black, MSB-first per row
 static uint8_t s_old_fb[EPD_BUF_SIZE];   // panel's last-known contents, required by the OLD_DATA transfer
 

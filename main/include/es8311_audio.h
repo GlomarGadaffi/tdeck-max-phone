@@ -23,9 +23,11 @@ void audio_hardware_probe_asdout_activity(void);
 // (something is). See the implementation for how to read the result.
 void audio_hardware_probe_pin_drive(void);
 
-// Swap the I2S data pins (dout <-> din) at runtime so a single boot can test
-// both orientations. `swapped == false` restores the datasheet-named wiring
-// (dout = DSDIN/17, din = ASDOUT/40).
+// Swap the I2S data pins at runtime, so one boot can test both orientations
+// instead of guessing and reflashing (see #34, and BENCH_TEST.md "If audio is
+// silent"). `false` = the verified wiring, dout = BOARD_I2S_DOUT (GPIO40) and
+// din = BOARD_I2S_DIN (GPIO17); `true` = the reverse. Diagnostic only --
+// nothing in the normal boot path calls this.
 esp_err_t audio_hardware_set_pins_swapped(bool swapped);
 
 // Initialize I2S peripheral and ES8311 audio codec at specified sample rate (8000 Hz or 16000 Hz)

@@ -70,10 +70,25 @@ The **XL9555 (I2C `0x20`)** must be initialized early in `app_main.cpp` before a
 
 ## 3. Pending Hardware Bench Tests
 
-- [ ] **I2S Audio Quality**: Verify ES8311 codec 8 kHz mono sampling over `IO38` (MCLK), `IO39` (BCLK), `IO18` (LRCK), `IO40` (Mic DIN), `IO17` (Spk DOUT).
-      *Two known traps here: the codec had no register init at all until #20, and mono mode defaults to the LEFT slot (#27) which silently kills the mic if the ADC lands on the right. See `BENCH_TEST.md` → "If the mic is silent".*
+- [x] **I2S Audio Quality**: ES8311 at 8 kHz over `IO38` (MCLK), `IO39` (BCLK),
+      `IO18` (LRCK), **`IO40` (DOUT, ESP32 → codec)**, **`IO17` (DIN, codec → ESP32)**.
+      Verified 2026-08-13: 0 register-check failures, mic peak 1321 / rms 335 with
+      0/100 silent frames, `*777` echo returns audio.
+      > ⚠ **The data pins are the reverse of what the vendor header names imply.**
+      > LilyGO's `TDeckMaxBoard.h` calls GPIO40 `ASDOUT` and GPIO17 `DSDIN`, which by
+      > ES8311 datasheet naming would make 40 the ESP32's DIN and 17 its DOUT. On real
+      > hardware it is the other way round ([#34](../../issues/34)). Getting this wrong
+      > gives a codec that answers on I2C with every register correct, MCLK/BCLK/WS all
+      > active on a scope, and total silence in **both** directions with a bit-exact-zero
+      > mic. This cost several bench sessions. Pins are now named `BOARD_I2S_DOUT` /
+      > `BOARD_I2S_DIN` from the ESP32's point of view so it cannot be misread again.
 - [ ] **Acoustic Echo & Feedback**: Measure speakerphone feedback in full-duplex mode on physical hardware; tune software AEC / noise suppression.
       *No AEC or noise suppression exists in this firmware -- this is a measurement task, not a tuning task, until something is written.*
+      *Observed 2026-08-13: the `*777` echo service closes an acoustic loop with gain
+      above unity and howls progressively. Speaker and mic are centimetres apart on the
+      same PCB with no isolation. Expected for an echo service on an open speakerphone,
+      not a fault -- a normal call does not do this. Backed off to `POC_MIC_GAIN_DB` 18 dB
+      / `POC_SPK_VOLUME` 70; headphones remove it entirely.*
 - [ ] ~~**A7682E 4G PPP Connection**~~ -- **superseded** (#5). No cellular/PPP code exists; 3CX integration lives in drawbridge and this device is Wi-Fi only.
 - [ ] ~~**Battery & Thermal during 30-minute 3CX VoIP calls**~~ -- the *cellular* framing is superseded (#5); a 30-minute call endurance/thermal test over Wi-Fi remains valid and is tracked in #6.
 

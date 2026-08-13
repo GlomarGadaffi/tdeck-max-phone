@@ -126,23 +126,50 @@ now covered by the host test suite above, so run `ctest` first: if it
 passes, the response format is not the problem. A `tcpdump` on the
 drawbridge side will confirm in one packet.
 
-### If the mic is silent (speaker works, far end hears nothing)
-Two independent causes, both known, check in this order:
+### If audio is silent
 
-1. **I2S slot** ([#27](../../issues/27)) -- `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG`
-   with `I2S_SLOT_MODE_MONO` expands `slot_mask` to `I2S_STD_SLOT_LEFT`. If
-   the ES8311's ADC lands on the right slot on this board, the capture path
-   reads silence with everything else correct. Test by switching the RX
-   channel's `slot_mask` to `I2S_STD_SLOT_RIGHT` in `es8311_audio.c`. Note
-   TX and RX currently share one `std_cfg`, so the real fix is likely
-   separate slot configs per channel rather than one global flip.
-2. **Mic PGA gain** -- `es8311_codec_init()` sets `ES8311_ADC_REG16` to a
-   default that was not verified against a datasheet. If the slot is right
-   but the level is inaudible, raise it before suspecting anything else.
+**Read the self-test output first.** On boot it prints
+`--- ES8311 register check ---` with an expected-vs-actual line per register
+and a `N FAIL(s)` total. If anything FAILs, fix that before investigating
+anything downstream -- a wrong `REG32` in particular is a -95.5 dB mute that
+is indistinguishable from dead hardware (the amp still clicks on enable).
 
-If **both** directions are silent, suspect the codec register init instead
-([#20](../../issues/20)) -- but note the I2S clock will still look perfectly
-healthy on a scope in that case, which is exactly what makes it misleading.
+**If both directions are silent and every register passes**, the wiring is
+the first suspect, not the codec. This exact state -- codec answering on
+I2C, all registers correct, MCLK/BCLK/WS active on a scope, silence both
+ways, mic reading *bit-exact* zero -- was
+[#34](../../issues/34): the I2S data pins are wired the reverse of what
+LilyGO's header names imply. Two ways to check without a scope:
+
+1. **Pull probe** (`audio_hardware_probe_pin_drive()`, runs in the self-test).
+   Applies an internal pull-up then pull-down to each data pin. A pin
+   something drives ignores a ~45k pull; a floating one follows it. The
+   ESP32's DOUT is the control case and must read `DRIVEN`. If the pin you
+   believe is the codec's output reads `FLOATING`, it is not an output.
+2. **A/B both orientations in one boot** via
+   `audio_hardware_set_pins_swapped()`, which uses
+   `i2s_channel_reconfig_std_gpio()`. One flash, unambiguous answer -- do
+   this rather than guessing and reflashing.
+
+Note a bit-exact-zero mic is a stronger signal than a quiet one: a live ADC
+with any PGA gain dithers. Exact zeros mean nothing is arriving at all.
+
+**If only the mic is silent**, raise `POC_MIC_GAIN_DB` in `poc_config.h`
+(ES8311 PGA is quantised to 6 dB steps, 0-42). Do *not* go hunting for slot
+masks -- `esp_codec_dev` rebuilds the slot config during
+`esp_codec_dev_open()` (`audio_codec_data_i2s.c`, `set_drv_fs()`), so
+whatever slot mode you pass to `i2s_channel_init_std_mode()` is discarded.
+Two bench sessions went into toggling that line before anyone read the
+function. This is what the now-closed #27 was wrongly theorising about.
+
+### If the echo test howls
+
+Expected. `*777` is an echo service, so it deliberately closes the loop
+mic → RTP → drawbridge → RTP → speaker → mic. Speaker and mic are
+centimetres apart on the same PCB with no acoustic isolation and there is no
+AEC, so loop gain exceeds unity and it regenerates. A normal call to a person
+does not do this. Lower `POC_MIC_GAIN_DB` / `POC_SPK_VOLUME`, or use
+headphones, if it makes the test hard to judge.
 
 ### If audio is choppy or latency grows during a call
 See step 8. The audio pump has its own task now; if this reappears, it is

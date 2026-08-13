@@ -80,13 +80,31 @@ Local Spk  <--- ES8311 Codec (I2S, full-duplex) <--- G.711 decode <--- RTP <--- 
 samples) -- drawbridge does not transcode, so this must match what it
 expects.
 
-The ESP-IDF I2S driver reports configuring full duplex at init ("the rx
-channel on I2S0 is switched from master to slave for full-duplex mode"), so
-this design doesn't adopt tincan's half-duplex push-to-talk compromise.
-That is a driver-level log line, not proof of working audio: simultaneous
-mic+speaker has **not** been confirmed on hardware, and issue #27 (I2S mono
-mode defaults to the LEFT slot) is an open risk that would silently kill the
-mic path specifically.
+Full duplex is real and confirmed on hardware (2026-08-13), so this design
+doesn't adopt tincan's half-duplex push-to-talk compromise.
+
+Getting there cost most of the bring-up, and the cause is worth recording:
+**the I2S data pins are wired the reverse of what LilyGO's header names
+imply** (#34). `TDeckMaxBoard.h` calls GPIO40 `ASDOUT` and GPIO17 `DSDIN`,
+which by ES8311 datasheet naming would make GPIO40 the ESP32's DIN. It is
+the ESP32's DOUT. The symptom was a codec answering on I2C with every
+register reading back correct, MCLK/BCLK/WS active on a scope, and total
+silence both ways with a bit-exact-zero mic. Pins are now named
+`BOARD_I2S_DOUT`/`BOARD_I2S_DIN` from the ESP32's point of view. #27 (mono
+mode defaulting to the LEFT slot) was a plausible theory that turned out to
+be wrong twice over: `esp_codec_dev` rebuilds the slot config inside
+`esp_codec_dev_open()`, so the mask passed to `i2s_channel_init_std_mode()`
+is discarded anyway.
+
+**Echo, not duplex, is the real acoustic constraint.** Speaker and mic sit
+centimetres apart on one PCB with no isolation and there is no AEC, so at
+usable volume the far end hears itself. The mitigation is *ducking*: while
+the far end is talking the mic is attenuated (`POC_DUCK_DB`, default −24 dB,
+with a 200 ms hangover). That is a deliberate half-duplex compromise at the
+*acoustic* layer — the user cannot interrupt the far end — chosen over real
+AEC because `esp-sr`/`esp_afe` targets 16 kHz while this path is 8 kHz G.711
+end to end and needs a time-aligned playback reference. Setting
+`POC_DUCK_DB` to 0 restores true full duplex, with the echo.
 
 Deliberately absent: no jitter buffer, no RTP sequence-number reordering,
 and no packet-loss concealment. `recvAudioFrame()` takes one datagram and
@@ -99,7 +117,8 @@ pre-answer backlog isn't played out as latency that never recovers.
 - No cellular/4G PPP netif -- this PoC is Wi-Fi only (`main/src/net_wifi.c`, ported from tincan).
 - No direct 3CX integration on this device (see above) -- `TDeckMaxAudioAnchor` is excluded from the build, kept for reference.
 - No jitter buffer / RTP reordering / packet-loss concealment (see §3).
-- Keypad digits 1-9 are unmapped and the row/column decode is unverified (#17); dialling out currently needs a hardcoded number.
-- Full alphabet font, real status icons, and e-paper partial refresh are deferred UI polish (#16).
+- No acoustic echo cancellation -- mic ducking only (see §3).
+- Keypad digits 1-9 are unmapped, so `ENT` from idle fires the hardcoded `POC_TEST_DIAL` target rather than opening a dialler (#17). The map itself is now known -- `UI_DESIGN.md` §0.2 recovers it from LilyGO's own reference firmware -- but implementing it is blocked on the press/release polarity fix (#35), and the row/column decode remains unverified on hardware.
+- Full alphabet font, real status icons, and e-paper partial refresh are deferred UI polish (#16). The phone also rings **silently**: no ringer or ringback tone is generated.
 - No SIP authentication (#28). There is no `Authorization`/`WWW-Authenticate` handling anywhere in `main/`, and `registerExt()` treats any 4xx (including a `401 Unauthorized` challenge) as a flat rejection. This works only because drawbridge's registrar is **open by default**; pointing this firmware at drawbridge's secure/digest mode, or at any conventional PBX, will fail to register rather than retry with credentials.
 - No DTMF (RFC 2833 / `telephone-event`) -- inbound SDP advertising payload 101 is parsed but not acted on, so in-call menu navigation on the far end won't work.

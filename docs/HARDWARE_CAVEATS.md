@@ -82,13 +82,23 @@ The **XL9555 (I2C `0x20`)** must be initialized early in `app_main.cpp` before a
       > active on a scope, and total silence in **both** directions with a bit-exact-zero
       > mic. This cost several bench sessions. Pins are now named `BOARD_I2S_DOUT` /
       > `BOARD_I2S_DIN` from the ESP32's point of view so it cannot be misread again.
-- [ ] **Acoustic Echo & Feedback**: Measure speakerphone feedback in full-duplex mode on physical hardware; tune software AEC / noise suppression.
-      *No AEC or noise suppression exists in this firmware -- this is a measurement task, not a tuning task, until something is written.*
-      *Observed 2026-08-13: the `*777` echo service closes an acoustic loop with gain
-      above unity and howls progressively. Speaker and mic are centimetres apart on the
-      same PCB with no isolation. Expected for an echo service on an open speakerphone,
-      not a fault -- a normal call does not do this. Backed off to `POC_MIC_GAIN_DB` 18 dB
-      / `POC_SPK_VOLUME` 70; headphones remove it entirely.*
+- [x] **Acoustic Echo & Feedback**: Measured 2026-08-13. The `*777` echo service closes an
+      acoustic loop with gain above unity and howls progressively. Speaker and mic are
+      centimetres apart on the same PCB with no isolation. Expected for an echo service on
+      an open speakerphone, not a fault -- a call to a person does not do this, because the
+      far end is not echoing you back. Headphones remove it entirely.
+      > **Mitigation is ducking, not AEC.** The mic is attenuated while the far end is
+      > talking (`POC_DUCK_DB`, with a hangover so their tail doesn't leak back either).
+      > The cost is that you cannot interrupt the far end; `POC_DUCK_DB = 0` restores true
+      > full duplex with the echo. Real AEC (`esp-sr`/`esp_afe`) is out of PoC scope --
+      > it targets 16 kHz while this path is 8 kHz G.711 end to end.
+      >
+      > **Levels live in `main/include/poc_config.h`, not here.** They were settled
+      > empirically and have already moved more than once during bring-up (mic PGA went
+      > 18 → 30 dB after the far end reported a quiet mic on a real 3CX call; the speaker
+      > curve ceiling was raised separately because `esp_codec_dev`'s stock curve tops out
+      > at 0 dB and left most of the ES8311's +32 dB range unused). Every value has its
+      > reasoning at its definition. Do not quote numbers from this file.
 - [ ] ~~**A7682E 4G PPP Connection**~~ -- **superseded** (#5). No cellular/PPP code exists; 3CX integration lives in drawbridge and this device is Wi-Fi only.
 - [ ] ~~**Battery & Thermal during 30-minute 3CX VoIP calls**~~ -- the *cellular* framing is superseded (#5); a 30-minute call endurance/thermal test over Wi-Fi remains valid and is tracked in #6.
 

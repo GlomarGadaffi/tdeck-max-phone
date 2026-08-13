@@ -33,9 +33,15 @@ menu "T-Deck MAX Phone"
 
             Plays a 1 kHz tone for ~2 s with the amplifier enabled (tests
             DAC/I2S/amp), then captures ~2 s of microphone audio and logs
-            peak and RMS amplitude per I2S slot (tests ADC without needing
-            to hear anything). A mic reading ~0 on one slot but not the
-            other is the signature of issue #27.
+            peak and RMS amplitude (tests ADC without needing to hear
+            anything). Also reads back the ES8311 registers that can
+            silently kill audio and probes which data pin the codec
+            actually drives.
+
+            A mic reading bit-exact zero while every register passes is the
+            signature of issue #34 -- the I2S data pins wired the reverse of
+            the vendor header names. That is a stronger signal than a merely
+            quiet mic: a live ADC dithers at any PGA gain.
 
     config TDECK_MAX_HALT_ON_INIT_FAIL
         bool "Abort boot if a peripheral fails to initialize"

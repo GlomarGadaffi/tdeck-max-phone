@@ -95,21 +95,23 @@
 // regenerate into a howl that builds on itself -- expected for an echo
 // service, not a fault, but it also means the defaults want headroom.
 //
-// The mic PGA was briefly 30 dB during bring-up while the ADC was reading
-// bit-exact zero (see #34) and that turned out to be a wiring fault, not a
-// level problem. 30 dB is far hotter than this mic needs: it put ordinary
-// room noise at roughly -13 dBFS peak.
-//
 // ES8311 mic PGA is quantised to 6 dB steps (0/6/12/.../42), so only
 // multiples of 6 are meaningful here.
-// 30 dB: the far end reported a quiet mic at 24 dB on a real 3CX call.
 //
-// This is the same level that made the *777 echo test regenerate into a
+// How this value was arrived at, since it moved twice during bring-up:
+// it was briefly 30 dB while the ADC was reading bit-exact zero, which
+// turned out to be the #34 wiring fault and not a level problem at all;
+// it was then backed off to 18 dB to make the *777 echo test bearable;
+// and it is back at 30 dB because the far end reported a quiet mic at
+// 24 dB on a real 3CX call. Real calls win over bench tests. 36 dB is the
+// next notch if the far end still says quiet.
+//
+// 30 dB is the same level that made the *777 echo test regenerate into a
 // howl, and that is fine -- *777 is an echo service, so it deliberately
 // closes mic -> RTP -> PBX -> RTP -> speaker -> mic. A normal call does not,
 // because the far end is not echoing you back. If you go back to bench-
 // testing against *777, drop this to 18 or use headphones rather than
-// leaving it low for real calls. 36 dB is the next notch if still quiet.
+// leaving it low for real calls.
 #ifndef POC_MIC_GAIN_DB
 #define POC_MIC_GAIN_DB      30.0f            // 0..42 in 6 dB steps
 #endif

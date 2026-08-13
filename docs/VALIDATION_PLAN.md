@@ -2,16 +2,30 @@
 
 This document provides a systematic 6-stage validation protocol (Levels 0 through 5) for bringing up, bench-testing, and verifying `tdeck-max-phone` on physical **LilyGO T-Deck MAX** hardware.
 
-> **Note (2026-08):** this plan predates the implemented SIP-phone PoC and
-> describes a broader, partly-aspirational scope (on-device `pocket-dial`
-> PBX, direct 3CX integration, cellular/LoRa/battery field testing) that
-> doesn't match what's actually built -- see `ARCHITECTURE.md`'s correction
-> note. Level 0's `ctest` host unit tests were also never wired into the
-> build. For the SIP-phone PoC's actual bench-test procedure (what's built
-> today: Wi-Fi + a real SIP UAC/UAS registered to an external drawbridge PBX,
-> keypad-driven dial/answer/hangup, e-paper call UI), see `BENCH_TEST.md`
-> instead. This file is left as-is below as a record of the broader,
-> not-yet-built scope.
+> [!IMPORTANT]
+> **Superseded (2026-08-13). Kept as a historical record — do not plan from this file.**
+>
+> This plan predates the implemented SIP-phone PoC and describes a broader,
+> partly-aspirational scope (on-device `pocket-dial` PBX, direct 3CX
+> integration, cellular/LoRa/battery field testing) that doesn't match what
+> was actually built -- see `ARCHITECTURE.md`'s correction note.
+>
+> Read these instead:
+> - **[ROADMAP.md](ROADMAP.md)** -- what is actually next, and what is deliberately out of scope.
+> - **[BENCH_TEST.md](BENCH_TEST.md)** -- the real verification procedure, with a per-step status ledger.
+>
+> Where the levels below still map to reality: Levels 0-2 are largely satisfied
+> (see issues #1, #2, #3), with the caveat that Level 0's `ctest` target was
+> never the `TelephonyAnchorLogic` one described here -- the real host suite is
+> `test/sip_wire_test.cpp`, and `TelephonyAnchorLogic` is excluded from the
+> build. Level 2's "Audio Path Multiplexer" and partial-refresh items are out
+> of scope for this firmware. Levels 3-5 were superseded outright: Level 3's
+> on-device PBX never existed, and Levels 4-5 assume the cellular/LoRa
+> architecture that #5 retired.
+>
+> Two items here also carry a trap that cost real bench time: the Level 2 pin
+> list below names `Mic DIN IO40` / `Spk DOUT IO17`, which is **backwards**.
+> See #34 and `HARDWARE_CAVEATS.md`.
 
 ---
 

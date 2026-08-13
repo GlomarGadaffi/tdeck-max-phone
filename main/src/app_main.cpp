@@ -17,6 +17,7 @@
 #include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/i2c.h"
 #include <cctype>
 #include <cstring>
@@ -213,26 +214,26 @@ static void audio_task(void *)
 // both yield silence. This separates them: an audible tone proves the
 // DAC/I2S/amp path, and a non-zero mic level proves the ADC path without
 // anyone having to hear anything.
-static void audio_selftest(void)
+// One pass of "play a tone, then listen". Returns the mic peak; logs the
+// speaker result. `label` identifies which pin orientation is under test.
+static int32_t audio_pass(const char *label)
 {
-    ESP_LOGW(TAG, "=== AUDIO SELF-TEST ===");
+    // Derive everything from the rate the codec was ACTUALLY opened at.
+    // Generating a tone for 8 kHz and playing it at 16 kHz halves its
+    // duration and doubles its pitch, which is what made a "2 second" tone
+    // finish in 428 ms and sent us chasing the wrong fault.
+    const uint32_t sr = audio_hardware_sample_rate();
+    const int frames = (int)((sr * 2) / POC_FRAME_SAMPLES);
 
-    // Before measuring anything: prove whether our I2C init actually landed
-    // in the chip. "codec never configured" and "codec fine, wrong slot"
-    // are indistinguishable from the audio alone.
-    audio_hardware_dump_codec_regs();
-    audio_hardware_probe_asdout_activity();
-
-    // -- 1. Speaker: 1 kHz sine at POC_SAMPLE_RATE_HZ, ~2 s, amp on.
     audio_hardware_set_amp(true);
     vTaskDelay(pdMS_TO_TICKS(50));   // let the amp settle before driving it
-    ESP_LOGW(TAG, "[1/2] playing 1 kHz tone for 2 s -- LISTEN NOW");
+    ESP_LOGW(TAG, "[%s] playing 1 kHz tone for 2 s @ %lu Hz -- LISTEN NOW", label, sr);
 
     int16_t tone[POC_FRAME_SAMPLES];
-    const float step = 2.0f * 3.14159265f * 1000.0f / (float)POC_SAMPLE_RATE_HZ;
+    const float step = 2.0f * 3.14159265f * 1000.0f / (float)sr;
     float phase = 0.0f;
-    const int frames = (POC_SAMPLE_RATE_HZ * 2) / POC_FRAME_SAMPLES;
     size_t written_total = 0;
+    int64_t t0 = esp_timer_get_time();
     for (int f = 0; f < frames; f++) {
         for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
             tone[i] = (int16_t)(8000.0f * sinf(phase));   // ~-12 dBFS, not full scale
@@ -241,14 +242,17 @@ static void audio_selftest(void)
         }
         written_total += audio_hardware_write_spk(tone, POC_FRAME_SAMPLES);
     }
-    ESP_LOGW(TAG, "[1/2] tone done -- %u samples accepted by I2S (expected %d)",
-             (unsigned)written_total, frames * POC_FRAME_SAMPLES);
+    int elapsed_ms = (int)((esp_timer_get_time() - t0) / 1000);
+    ESP_LOGW(TAG, "[%s] tone done -- %u samples accepted (expected %d), took %d ms "
+                  "(expected ~2000)", label,
+             (unsigned)written_total, frames * POC_FRAME_SAMPLES, elapsed_ms);
     if (written_total == 0) {
-        ESP_LOGE(TAG, "[1/2] I2S accepted ZERO samples -- TX path is not running at all");
+        ESP_LOGE(TAG, "[%s] I2S accepted ZERO samples -- TX path is not running", label);
+    } else if (elapsed_ms < 1500 || elapsed_ms > 2600) {
+        ESP_LOGE(TAG, "[%s] TX ran at the wrong rate -- sample-rate/channel mismatch", label);
     }
 
-    // -- 2. Microphone: capture ~2 s and report level.
-    ESP_LOGW(TAG, "[2/2] recording 2 s -- SPEAK NOW / make noise");
+    ESP_LOGW(TAG, "[%s] recording 2 s -- SPEAK NOW / make noise", label);
     int16_t mic[POC_FRAME_SAMPLES];
     int32_t peak = 0;
     int64_t sumsq = 0;
@@ -268,38 +272,41 @@ static void audio_selftest(void)
         total += got;
     }
     int rms = (total > 0) ? (int)sqrt((double)sumsq / (double)total) : 0;
-    ESP_LOGW(TAG, "[2/2] mic: %u samples, peak=%d rms=%d, silent/empty frames=%u/%d",
-             (unsigned)total, (int)peak, rms, (unsigned)zeroFrames, frames);
+    ESP_LOGW(TAG, "[%s] mic: %u samples, peak=%d rms=%d, silent/empty frames=%u/%d",
+             label, (unsigned)total, (int)peak, rms, (unsigned)zeroFrames, frames);
 
     if (total == 0) {
-        ESP_LOGE(TAG, "[2/2] mic returned NO DATA -- I2S RX not running");
+        ESP_LOGE(TAG, "[%s] mic returned NO DATA -- I2S RX not running", label);
     } else if (peak == 0) {
-        ESP_LOGE(TAG, "[2/2] mic is bit-exact ZERO -- ADC dead or wrong I2S slot (see #27)");
+        ESP_LOGE(TAG, "[%s] mic is bit-exact ZERO", label);
     } else if (peak < 50) {
-        ESP_LOGW(TAG, "[2/2] mic level very low (peak=%d) -- check PGA gain", (int)peak);
+        ESP_LOGW(TAG, "[%s] mic level very low (peak=%d) -- check PGA gain", label, (int)peak);
     } else {
-        ESP_LOGW(TAG, "[2/2] mic is LIVE (peak=%d) -- ADC path good", (int)peak);
-    }
-
-    // If the mic read zero, sweep the I2S slot masks. A non-zero peak on a
-    // different mask proves #27 (wrong slot) rather than a codec fault.
-    if (peak == 0) {
-        ESP_LOGW(TAG, "[3/3] mic was zero -- sweeping I2S slot masks (make noise)");
-        int pl = audio_hardware_probe_mic_slot(0);
-        int pr = audio_hardware_probe_mic_slot(1);
-        int pb = audio_hardware_probe_mic_slot(2);
-        if (pl <= 0 && pr <= 0 && pb <= 0) {
-            ESP_LOGE(TAG, "[3/3] ALL slot masks read zero -- not a slot problem; "
-                          "look at the codec capture path (REG0E/REG14/REG17)");
-        } else {
-            ESP_LOGW(TAG, "[3/3] a slot mask produced signal -- this is #27; "
-                          "left=%d right=%d both=%d", pl, pr, pb);
-        }
-        // Restore the configuration the phone actually runs with.
-        audio_hardware_probe_mic_slot(0);
+        ESP_LOGW(TAG, "[%s] mic is LIVE (peak=%d) -- ADC path good", label, (int)peak);
     }
 
     audio_hardware_set_amp(false);
+    return peak;
+}
+
+static void audio_selftest(void)
+{
+    ESP_LOGW(TAG, "=== AUDIO SELF-TEST ===");
+
+    // Prove the codec is actually configured before blaming the wiring:
+    // "never configured", "configured but muted" and "configured, wired
+    // wrong" all sound identical from the speaker.
+    int reg_fails = audio_hardware_check_codec_regs();
+    audio_hardware_probe_asdout_activity();
+    audio_hardware_probe_pin_drive();
+
+    if (reg_fails > 0) {
+        ESP_LOGE(TAG, "%d codec register(s) wrong -- fix those before trusting "
+                      "anything below", reg_fails);
+    }
+
+    audio_pass("audio");
+
     ESP_LOGW(TAG, "=== SELF-TEST COMPLETE ===");
 }
 #endif // CONFIG_TDECK_MAX_AUDIO_SELFTEST
@@ -319,6 +326,11 @@ extern "C" void app_main(void)
     // 2. Peripherals. Every one is log-and-continue so a single NAK doesn't
     //    hide the state of the other five.
     try_init("XL9555 expander", xl9555_init());
+    // 8 kHz: G.711 is the only codec drawbridge will carry, and nothing in
+    // this firmware resamples. The bring-up ran at 16 kHz for a while to rule
+    // out the unusually low 2.048 MHz MCLK that 8 k implies; that turned out
+    // not to be the problem (the data pins were swapped), so we are back on
+    // the rate the SIP path actually uses.
     try_init("ES8311 codec", audio_hardware_init(POC_SAMPLE_RATE_HZ));
 
     // xl9555_init() brings the speaker amp up enabled. Nothing should be

@@ -25,9 +25,30 @@ extern "C" {
 #define BOARD_I2S_NUM           I2S_NUM_0
 #define BOARD_I2S_MCLK          GPIO_NUM_38
 #define BOARD_I2S_SCLK          GPIO_NUM_39 // BCLK
-#define BOARD_I2S_ASDOUT        GPIO_NUM_40 // Mic Data (DIN to ESP32)
 #define BOARD_I2S_LRCK          GPIO_NUM_18 // WS / Word Select
-#define BOARD_I2S_DSDIN         GPIO_NUM_17 // Speaker Data (DOUT from ESP32)
+
+// ⚠ The vendor's names for the two data pins are backwards. LilyGO's
+// TDeckMaxBoard.h defines BOARD_ES8311_ASDOUT = 40 and BOARD_ES8311_DSDIN = 17,
+// which by ES8311 datasheet naming would mean GPIO40 is the codec's ADC output
+// (ESP32's DIN) and GPIO17 its DAC input (ESP32's DOUT). On real hardware it is
+// the other way round. Measured on 2026-08-13, COM5:
+//
+//   * pull probe: GPIO40 followed an internal pull-up (1000/1000 high) and a
+//     pull-down (0/1000) -- nothing drives it, so it cannot be a codec output.
+//     GPIO17 ignored both pulls.
+//   * A/B capture: with din=GPIO40 the mic was bit-exact zero across 200/200
+//     frames; with din=GPIO17 it read peak 7513 / rms 1276 and 0 silent frames.
+//
+// LilyGO's own working playWAV.ino calls
+//   codec.setPins(MCLK, SCLK, LRCK, ASDOUT, DSDIN)
+// i.e. its 4th/5th arguments are (dout, din) from the ESP32's point of view --
+// consistent with the measurement, inconsistent with the #define names.
+//
+// Named from the ESP32's perspective here so it can't be misread again. Cost:
+// several bench sessions of "codec answers on I2C, every register correct,
+// total silence in both directions".
+#define BOARD_I2S_DOUT          GPIO_NUM_40 // ESP32 -> codec (codec's DAC input)
+#define BOARD_I2S_DIN           GPIO_NUM_17 // codec -> ESP32 (codec's ADC output)
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  3.1-inch E-Paper Display (GDEQ031T10)

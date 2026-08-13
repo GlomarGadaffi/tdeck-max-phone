@@ -88,3 +88,23 @@
 #define POC_SAMPLE_RATE_HZ   8000
 #define POC_FRAME_SAMPLES    160              // 8000 Hz * 0.020 s
 #define POC_RTP_PAYLOAD_PCMU 0
+
+// Gain staging. Speaker and mic sit a few centimetres apart on the same PCB
+// with no acoustic isolation, so this is a loudspeaking phone with a wide
+// open echo path and no AEC. Loop gain above unity makes the *777 echo test
+// regenerate into a howl that builds on itself -- expected for an echo
+// service, not a fault, but it also means the defaults want headroom.
+//
+// The mic PGA was briefly 30 dB during bring-up while the ADC was reading
+// bit-exact zero (see #34) and that turned out to be a wiring fault, not a
+// level problem. 30 dB is far hotter than this mic needs: it put ordinary
+// room noise at roughly -13 dBFS peak.
+//
+// ES8311 mic PGA is quantised to 6 dB steps (0/6/12/.../42), so only
+// multiples of 6 are meaningful here.
+#ifndef POC_MIC_GAIN_DB
+#define POC_MIC_GAIN_DB      18.0f            // 0..42 in 6 dB steps
+#endif
+#ifndef POC_SPK_VOLUME
+#define POC_SPK_VOLUME       70               // 0..100
+#endif

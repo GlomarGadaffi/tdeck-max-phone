@@ -13,6 +13,7 @@
 // We drive it with an explicit config instead of reimplementing it.
 #include "es8311_audio.h"
 #include "board_tdeck_max.h"
+#include "poc_config.h"
 #include "xl9555.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c.h"
@@ -162,10 +163,12 @@ esp_err_t audio_hardware_init(uint32_t sample_rate)
     // REG32 = 0x00. That is a hard DAC mute. If the call below fails or is
     // skipped the codec stays muted, the amp still clicks on enable, and the
     // board looks exactly like a dead speaker. Hence the return checks.
-    rc = esp_codec_dev_set_out_vol(s_dev, 80);     // 0-100 -> about -6 dB at REG32
+    rc = esp_codec_dev_set_out_vol(s_dev, POC_SPK_VOLUME);
     if (rc != 0) ESP_LOGE(TAG, "set_out_vol failed: %d -- DAC IS STILL MUTED", rc);
-    rc = esp_codec_dev_set_in_gain(s_dev, 30.0f);  // dB, analog mic needs real boost
+    rc = esp_codec_dev_set_in_gain(s_dev, POC_MIC_GAIN_DB);
     if (rc != 0) ESP_LOGE(TAG, "set_in_gain failed: %d -- mic PGA at 0 dB", rc);
+    ESP_LOGI(TAG, "gain staging: spk vol %d/100, mic PGA %.0f dB",
+             POC_SPK_VOLUME, (double)POC_MIC_GAIN_DB);
 
     ESP_LOGI(TAG, "Audio hardware initialized successfully (esp_codec_dev) @ %lu Hz", sample_rate);
     return ESP_OK;
@@ -273,7 +276,8 @@ int audio_hardware_check_codec_regs(void)
         {0x0E, 0x02, 0xFF, "SYSTEM: ADC/PGA powered"},
         {0x12, 0x00, 0xFF, "SYSTEM: DAC powered up"},
         {0x14, 0x1A, 0xFF, "SYSTEM: analog mic selected (not DMIC)"},
-        {0x16, 0x05, 0xFF, "ADC: mic PGA = 30 dB"},
+        // REG16 holds the PGA step index, not dB: 0=0dB, 1=6dB ... 7=42dB.
+        {0x16, (int)(POC_MIC_GAIN_DB / 6.0f), 0xFF, "ADC: mic PGA = POC_MIC_GAIN_DB"},
         {0x17, 0xBF, 0xFF, "ADC: digital volume 0 dB"},
         {0x44, 0x08, 0xFF, "GPIO: no DAC->ADC reference"},
     };

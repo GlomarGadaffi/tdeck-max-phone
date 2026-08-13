@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_sleep.h"
 #include "driver/i2c.h"
 #include <cctype>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include "poc_config.h"
 #include "net_wifi.h"
 #include "xl9555.h"
+#include "pmu_sy6970.h"
 #include "es8311_audio.h"
 #include "tca8418_keypad.h"
 #include "epaper_display.h"
@@ -40,7 +42,7 @@ static const char *TAG = "APP_MAIN";
 // are UI-only distinctions -- TincanUac tracks its own Calling/Ringing/
 // InCall internally and this just decides what the keypad and e-paper do
 // in response.
-enum class UiState { Idle, Dialing, Incoming, InCall };
+enum class UiState { Idle, Dialing, Incoming, InCall, ConfirmOff };
 
 // ── boot-time hardware bring-up helpers ─────────────────────────────────────
 
@@ -150,6 +152,78 @@ static void ui_render(const char *caller, const char *status, bool active)
     // Depth-1 queue with overwrite: only the newest screen matters, and this
     // must never block the control path even if the panel is mid-refresh.
     xQueueOverwrite(s_render_q, &r);
+}
+
+// Real power off, the way the board is built to do it.
+//
+// This mirrors LilyGO's factory ui_shutdown_on(): put the touch controller in
+// reset, then force the SY6970's battery FET open (REG09 bit 5, BATFET_DIS) --
+// what XPowersLib exposes as PPM.shutdown(). That genuinely disconnects the
+// battery rather than idling the CPU, and the PWR button on the top right
+// brings it back, because that button is wired to the PMU's power-on pin and
+// not to any ESP32 GPIO. Which is why it works as an on/off switch at all.
+//
+// Deep sleep is the fallback, not the plan: BATFET_DIS gates only the battery
+// path, so on USB the board keeps running from VBUS. LilyGO's own UI refuses
+// to shut down in that case ("cannot be shut down when connected to USB").
+// Rather than refuse, we sleep instead and say so -- on the bench the board is
+// nearly always on USB, and "nothing happened" would be the worst answer.
+//
+// The e-paper holds its image with no power at all, so the final screen stays
+// readable while the board is off. The panel keeps telling the truth.
+static void power_off(TincanUac &uac)
+{
+    ESP_LOGW(TAG, "powering off");
+
+    // Don't leave the far end talking to a corpse.
+    if (uac.inCall()) {
+        uac.hangup();
+        vTaskDelay(pdMS_TO_TICKS(150));   // let the BYE actually get out
+    }
+    audio_hardware_set_amp(false);
+
+    bool onUsb = false;
+    if (pmu_sy6970_vbus_present(&onUsb) != ESP_OK) {
+        ESP_LOGW(TAG, "could not read VBUS state; assuming battery");
+        onUsb = false;
+    }
+
+    // Posted through the queue, not rendered inline: epaper_task owns the SPI
+    // bus and driving it from here would race a refresh already in flight.
+    // The panel needs roughly two seconds for a full refresh.
+    ui_render("", onUsb ? "Sleeping (USB)" : "Powered Off", false);
+    vTaskDelay(pdMS_TO_TICKS(2500));
+
+    // Touch controller into reset before the rails move. The vendor does this
+    // with the comment that it can otherwise come up in an undefined state.
+    xl9555_reset_touch();
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    // Drop every rail xl9555_init() brought up -- 4G modem, LoRa, GPS,
+    // haptics, speaker amp, 1V8. On the USB path especially, these would
+    // otherwise stay powered for the entire "off" period.
+    xl9555_write_port0(0x00);
+    xl9555_write_port1(0x00);
+
+    if (!onUsb) {
+        pmu_sy6970_shutdown();
+        vTaskDelay(pdMS_TO_TICKS(500));   // the FET should open well inside this
+        // Still here: the write landed but something is still feeding the
+        // system rail. Fall through to sleep rather than sit in a dead loop.
+        ESP_LOGW(TAG, "still running after BATFET_DIS -- sleeping instead");
+    } else {
+        ESP_LOGW(TAG, "on USB: BATFET_DIS cannot cut VBUS, deep sleeping instead. "
+                      "Unplug USB and use the PWR button for a true power off.");
+    }
+
+    // BOOT (GPIO0) wakes it from sleep -- a real physical switch, documented
+    // by the vendor for download mode, and active-low. Not the keypad: waking
+    // on the TCA8418's INT would be nicer but needs the controller left
+    // powered and configured to assert INT while asleep, which is unverified.
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+    esp_deep_sleep_start();
+    // Not reached: deep sleep exits through a reset, so the board comes back
+    // through app_main() and re-registers from scratch.
 }
 
 static void epaper_task(void *)
@@ -471,6 +545,18 @@ extern "C" void app_main(void)
 
         switch (ui) {
         case UiState::Idle:
+            // DEL from Idle asks to power down. Two single taps rather than a
+            // long press: hold detection depends on the TCA8418 press/release
+            // polarity, and tca8418_keypad.cpp:180 reads press as (raw & 0x80)
+            // while the Adafruit driver in the vendor tree documents the
+            // opposite -- unverified, and the same inversion was a real bug in
+            // peri_keypad.cpp. A confirm step also stops a stray DEL from
+            // switching the phone off mid-shift. See docs/UI_DESIGN.md.
+            if (key == '\b') {
+                ui = UiState::ConfirmOff;
+                ui_render("Power off?", "ENT=yes DEL=no", false);
+                break;
+            }
 #ifdef POC_TEST_DIAL
             // Bench workaround for #17 -- ENT from Idle dials the configured
             // test target directly, since '*' and 1-9 can't be typed yet.
@@ -537,6 +623,23 @@ extern "C" void app_main(void)
                 // Caller gave up (CANCEL) before we answered/rejected.
                 ui = UiState::Idle;
                 ui_render(POC_SIP_EXT_SELF, "Idle", false);
+            }
+            break;
+
+        case UiState::ConfirmOff:
+            if (key == '\r') {
+                power_off(uac);             // does not return
+            } else if (key != 0) {
+                // Any other key cancels, not just DEL -- if you are unsure
+                // enough to press something random, you did not mean to shut
+                // the phone down.
+                ui = UiState::Idle;
+                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+            } else if (uac.hasIncomingCall()) {
+                // An incoming call outranks a pending power-off prompt; the
+                // hasIncomingCall() check above the switch has already moved
+                // us on, this just avoids leaving the prompt on screen.
+                ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
             }
             break;
 

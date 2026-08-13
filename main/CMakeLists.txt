@@ -16,6 +16,7 @@ idf_component_register(
         "src/app_main.cpp"
         "src/net_wifi.c"
         "src/xl9555.c"
+        "src/pmu_sy6970.c"
         "src/es8311_audio.c"
         "src/tca8418_keypad.cpp"
         "src/epaper_display.cpp"

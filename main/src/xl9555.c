@@ -51,13 +51,58 @@ esp_err_t xl9555_init(void)
     }
 
     // Default states
-    // P0_0 (6609_EN) must be HIGH for the audio analog path to work -- see
-    // the note in board_tdeck_max.h. LilyGO's own playback example sets it
-    // even though it never uses the modem.
-    s_p0_out = XL9555_P0_6609_EN | XL9555_P0_SPK_AMP_EN | XL9555_P0_TOUCH_RST;
-    s_p1_out = XL9555_P1_4G_PWR | XL9555_P1_KEYBOARD_RST;
-    write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+    // Full power-rail bring-up, mirroring LilyGO's factory example: assert
+    // EVERY enable HIGH, one at a time, with a settle between each.
+    //
+    // We previously set only 4 of 11 pins in a single burst. That left the
+    // 1.8V rail (P0_3), LoRa, GPS and haptics rails unpowered, and produced
+    // a codec that answered on I2C with every register correct while its
+    // ADC and DAC were both dead -- and a BHI260AP that never appeared on
+    // the bus at all. These are power enables; partial assertion leaves
+    // devices half-powered rather than simply absent.
+    //
+    // Sequenced one pin per write (not one bulk write) because the vendor
+    // does it that way with a delay between each, and inrush on several
+    // rails coming up simultaneously is a plausible reason why.
+    static const uint8_t p0_seq[] = {
+        XL9555_P0_6609_EN, XL9555_P0_LORA_EN, XL9555_P0_GPS_EN,
+        XL9555_P0_1V8_EN,  XL9555_P0_LORA_SEL, XL9555_P0_DRV2605_EN,
+        XL9555_P0_SPK_AMP_EN, XL9555_P0_TOUCH_RST,
+    };
+    static const uint8_t p1_seq[] = {
+        XL9555_P1_4G_PWR, XL9555_P1_KEYBOARD_RST, XL9555_P1_AUDIO_ROUTE,
+    };
+
+    s_p0_out = 0;
+    for (size_t i = 0; i < sizeof(p0_seq) / sizeof(p0_seq[0]); i++) {
+        s_p0_out |= p0_seq[i];
+        write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    s_p1_out = 0;
+    for (size_t i = 0; i < sizeof(p1_seq) / sizeof(p1_seq[0]); i++) {
+        s_p1_out |= p1_seq[i];
+        write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    // Let the rails settle before anything talks to a peripheral.
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // AUDIO_SEL comes up HIGH with the rest, but HIGH routes audio to the
+    // A7682E. This firmware uses the local ES8311, so drop it back LOW --
+    // matching LilyGO's playWAV example, which sets it LOW explicitly.
+    s_p1_out &= ~XL9555_P1_AUDIO_ROUTE;
     write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
+
+    // Deterministic touch reset pulse, as the vendor does, so the controller
+    // can't sit half-powered after a warm reset.
+    s_p0_out &= ~XL9555_P0_TOUCH_RST;
+    write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    s_p0_out |= XL9555_P0_TOUCH_RST;
+    write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+    vTaskDelay(pdMS_TO_TICKS(60));
 
     ESP_LOGI(TAG, "XL9555 expander initialized successfully");
     return ESP_OK;

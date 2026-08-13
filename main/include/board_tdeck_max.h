@@ -90,24 +90,38 @@ extern "C" {
 // ─────────────────────────────────────────────────────────────────────────────
 #define XL9555_I2C_ADDR         0x20
 
-// Port 0 Pins
-// P0_0 is labelled "6609_EN / enable A7682 module power" in LilyGO's header,
-// but their PLAYBACK-ONLY ES8311 example (examples/ES8311/playWAV) drives it
-// HIGH too -- a speaker demo has no use for the cellular modem. It therefore
-// gates a shared power rail that the audio analog section depends on.
-// Leaving it low leaves the codec's I2C/digital side alive (registers read
-// back perfectly, CHIPID valid) while ADC and DAC are both dead: no ASDOUT
-// activity and no speaker output. Confirmed on hardware.
-#define XL9555_P0_6609_EN       (1 << 0) // Port 0 Bit 0
-#define XL9555_P0_DRV2605_EN    (1 << 5) // Port 0 Bit 5
-#define XL9555_P0_SPK_AMP_EN    (1 << 6) // Port 0 Bit 6
-#define XL9555_P0_TOUCH_RST     (1 << 7) // Port 0 Bit 7
+// Full XL9555 pin map, matching LilyGO's own BOARD_XL9555_* numbering
+// (their pins 0-7 are P0_0..P0_7, pins 8-15 are P1_0..P1_7).
+//
+// IMPORTANT: LilyGO's factory example drives EVERY one of these HIGH at boot,
+// as outputs, with a 1 ms settle between each, BEFORE touching any peripheral.
+// These are power-rail enables, not per-feature toggles -- leaving any of them
+// low can leave a device half-powered: responsive on I2C while its analog
+// section is dead. Do not "optimise" unused ones away without measuring.
+//
+// Port 0
+#define XL9555_P0_6609_EN       (1 << 0) // A7682E module power rail
+#define XL9555_P0_LORA_EN       (1 << 1) // SX1262 power
+#define XL9555_P0_GPS_EN        (1 << 2) // GPS power
+#define XL9555_P0_1V8_EN        (1 << 3) // 1.8V rail (labelled BHI260AP)
+#define XL9555_P0_LORA_SEL      (1 << 4) // HIGH = internal antenna
+#define XL9555_P0_DRV2605_EN    (1 << 5) // haptics power
+#define XL9555_P0_SPK_AMP_EN    (1 << 6) // speaker power amplifier
+#define XL9555_P0_TOUCH_RST     (1 << 7) // LOW = touch held in reset
 
-// Port 1 Pins
-#define XL9555_P1_4G_PWR        (1 << 0) // Port 1 Bit 0
-#define XL9555_P1_KEYBOARD_RST  (1 << 1) // Port 1 Bit 1
-#define XL9555_P1_AUDIO_ROUTE   (1 << 2) // Port 1 Bit 2 (0=ES8311, 1=A7682E)
-#define XL9555_P1_ANT_SWITCH    (1 << 4) // Port 1 Bit 4 (0=External, 1=Internal)
+// Port 1
+#define XL9555_P1_4G_PWR        (1 << 0) // A7682E POWERKEY
+#define XL9555_P1_KEYBOARD_RST  (1 << 1) // LOW = TCA8418 held in reset
+#define XL9555_P1_AUDIO_ROUTE   (1 << 2) // 0=ES8311, 1=A7682E
+#define XL9555_P1_ANT_SWITCH    (1 << 4) // 0=External, 1=Internal
+
+// Everything LilyGO's factory bring-up asserts HIGH.
+#define XL9555_P0_BRINGUP_ALL   (XL9555_P0_6609_EN | XL9555_P0_LORA_EN | \
+                                 XL9555_P0_GPS_EN | XL9555_P0_1V8_EN | \
+                                 XL9555_P0_LORA_SEL | XL9555_P0_DRV2605_EN | \
+                                 XL9555_P0_SPK_AMP_EN | XL9555_P0_TOUCH_RST)
+#define XL9555_P1_BRINGUP_ALL   (XL9555_P1_4G_PWR | XL9555_P1_KEYBOARD_RST | \
+                                 XL9555_P1_AUDIO_ROUTE)
 
 #ifdef __cplusplus
 }

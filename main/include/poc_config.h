@@ -102,9 +102,17 @@
 //
 // ES8311 mic PGA is quantised to 6 dB steps (0/6/12/.../42), so only
 // multiples of 6 are meaningful here.
+// 30 dB: the far end reported a quiet mic at 24 dB on a real 3CX call.
+//
+// This is the same level that made the *777 echo test regenerate into a
+// howl, and that is fine -- *777 is an echo service, so it deliberately
+// closes mic -> RTP -> PBX -> RTP -> speaker -> mic. A normal call does not,
+// because the far end is not echoing you back. If you go back to bench-
+// testing against *777, drop this to 18 or use headphones rather than
+// leaving it low for real calls. 36 dB is the next notch if still quiet.
 #ifndef POC_MIC_GAIN_DB
-#define POC_MIC_GAIN_DB      18.0f            // 0..42 in 6 dB steps
+#define POC_MIC_GAIN_DB      30.0f            // 0..42 in 6 dB steps
 #endif
 #ifndef POC_SPK_VOLUME
-#define POC_SPK_VOLUME       70               // 0..100
+#define POC_SPK_VOLUME       80               // 0..100
 #endif

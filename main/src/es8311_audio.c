@@ -23,6 +23,7 @@
 
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "esp_codec_dev_vol.h"
 #include "es8311_codec.h"
 
 static const char *TAG = "ES8311_AUDIO";
@@ -163,12 +164,29 @@ esp_err_t audio_hardware_init(uint32_t sample_rate)
     // REG32 = 0x00. That is a hard DAC mute. If the call below fails or is
     // skipped the codec stays muted, the amp still clicks on enable, and the
     // board looks exactly like a dead speaker. Hence the return checks.
+    // Raise the ceiling before setting the volume. esp_codec_dev's built-in
+    // curve maps volume 100 to 0 dB, so the top of the user's knob left the
+    // ES8311 well short of what it can do (REG32 goes to +32 dB). This curve
+    // must be installed before set_out_vol(), since that is what evaluates it.
+    esp_codec_dev_vol_map_t vol_map[2] = {
+        { .vol = 0,   .db_value = -50.0f },
+        { .vol = 100, .db_value = POC_SPK_MAX_DB },
+    };
+    esp_codec_dev_vol_curve_t curve = { .vol_map = vol_map, .count = 2 };
+    rc = esp_codec_dev_set_vol_curve(s_dev, &curve);
+    if (rc != 0) ESP_LOGW(TAG, "set_vol_curve failed: %d -- falling back to 0 dB ceiling", rc);
+
     rc = esp_codec_dev_set_out_vol(s_dev, POC_SPK_VOLUME);
     if (rc != 0) ESP_LOGE(TAG, "set_out_vol failed: %d -- DAC IS STILL MUTED", rc);
     rc = esp_codec_dev_set_in_gain(s_dev, POC_MIC_GAIN_DB);
     if (rc != 0) ESP_LOGE(TAG, "set_in_gain failed: %d -- mic PGA at 0 dB", rc);
-    ESP_LOGI(TAG, "gain staging: spk vol %d/100, mic PGA %.0f dB",
-             POC_SPK_VOLUME, (double)POC_MIC_GAIN_DB);
+
+    int v32 = 0;
+    esp_codec_dev_read_reg(s_dev, 0x32, &v32);
+    ESP_LOGI(TAG, "gain staging: spk %d/100 (ceiling %+.0f dB) -> REG32 0x%02X = %+.1f dB, "
+                  "mic PGA %.0f dB",
+             POC_SPK_VOLUME, (double)POC_SPK_MAX_DB, v32 & 0xFF,
+             (double)((v32 & 0xFF) * 0.5f - 95.5f), (double)POC_MIC_GAIN_DB);
 
     ESP_LOGI(TAG, "Audio hardware initialized successfully (esp_codec_dev) @ %lu Hz", sample_rate);
     return ESP_OK;

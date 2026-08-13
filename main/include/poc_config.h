@@ -113,6 +113,63 @@
 #ifndef POC_MIC_GAIN_DB
 #define POC_MIC_GAIN_DB      30.0f            // 0..42 in 6 dB steps
 #endif
+// Speaker. POC_SPK_VOLUME is the 0..100 user knob; POC_SPK_MAX_DB is what
+// volume 100 maps to on the curve.
+//
+// esp_codec_dev's default curve tops out at 0 dB, which left most of this
+// codec's range unused: the ES8311's REG32 runs to +32 dB, and at the old
+// volume 80 the DAC was sitting at -6.4 dB (REG32 = 0xB2). That is why the
+// speaker was too soft -- the amplifier was already enabled, and the hardware
+// had plenty of headroom nobody was asking for.
+//
+// +9 dB is digital gain applied ahead of the DAC, so it is not free: anything
+// in the incoming RTP above -9 dBFS will clip. Telephony audio normally sits
+// well below that, so this is the usual trade for a small speaker. If calls
+// sound distorted rather than merely loud, lower POC_SPK_MAX_DB before
+// touching POC_SPK_VOLUME -- the curve ceiling is the thing that clips.
 #ifndef POC_SPK_VOLUME
-#define POC_SPK_VOLUME       80               // 0..100
+#define POC_SPK_VOLUME       100              // 0..100
+#endif
+#ifndef POC_SPK_MAX_DB
+#define POC_SPK_MAX_DB       9.0f             // dB at volume 100; codec allows up to +32
+#endif
+
+// Received-audio gain, applied in software to the decoded RTP stream only.
+//
+// The boot self-test beep and a call's voice go through the same DAC but
+// arrive ~18 dB apart: the beep is synthesised locally near -12 dBFS, while
+// PSTN voice through 3CX lands nearer -30 dBFS. Raising the codec volume
+// lifts both, so it makes the beep painful before it makes the voice
+// comfortable. This knob lifts only the thing that is actually quiet.
+//
+// Saturating, so it cannot wrap; loud far ends clip rather than invert.
+#ifndef POC_RX_GAIN_DB
+#define POC_RX_GAIN_DB       12.0f            // 0 disables
+#endif
+
+// ── Half-duplex ducking (poor man's echo control) ────────────────────────
+//
+// Speaker and mic are centimetres apart on the same PCB with no acoustic
+// isolation, so at usable speaker volume the far end hears itself. While the
+// far end is talking we attenuate the mic hard, with a short hangover so the
+// tail of their speech does not leak back either.
+//
+// This is NOT acoustic echo cancellation. Real AEC (esp-sr / esp_afe) would
+// preserve full duplex, but it targets 16 kHz while this path is 8 kHz G.711
+// end to end, it needs a time-aligned playback reference through the DMA and
+// RTP chain, and it wants RAM and CPU alongside SIP, RTP and the e-paper
+// task. That is a workstream, not a setting. Ducking is how speakerphones
+// worked for decades and costs about twenty lines.
+//
+// The tradeoff is real and worth knowing: while the far end is talking, your
+// mic is attenuated, so you cannot interrupt them. Set POC_DUCK_DB to 0 to
+// disable ducking and get full duplex back with the echo.
+#ifndef POC_DUCK_DB
+#define POC_DUCK_DB          -24.0f           // mic attenuation while far end talks; 0 = off
+#endif
+#ifndef POC_DUCK_THRESHOLD
+#define POC_DUCK_THRESHOLD   300              // mean |sample| of the RAW rx frame, 0..32767
+#endif
+#ifndef POC_DUCK_HANGOVER_MS
+#define POC_DUCK_HANGOVER_MS 200              // keep ducking this long after they stop
 #endif

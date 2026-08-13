@@ -173,13 +173,23 @@ static TincanUac *s_uac = nullptr;
 static void audio_task(void *)
 {
     int16_t pcm[POC_FRAME_SAMPLES];
+    int16_t micbuf[POC_FRAME_SAMPLES];
     static const int16_t silence[POC_FRAME_SAMPLES] = {0};
     bool pumping = false;
+
+    // Q8 fixed point so the per-sample work is a multiply and a shift.
+    const int32_t rxGainQ8 = (int32_t)(powf(10.0f, POC_RX_GAIN_DB / 20.0f) * 256.0f);
+    const int32_t duckQ8   = (POC_DUCK_DB == 0.0f)
+                             ? 256
+                             : (int32_t)(powf(10.0f, POC_DUCK_DB / 20.0f) * 256.0f);
+    const int hangoverFrames = POC_DUCK_HANGOVER_MS / 20;   // frames are 20 ms
+    int duckFrames = 0;
 
     for (;;) {
         if (!s_uac || !s_uac->inCall()) {
             // Not in a call: nothing to pace against, so idle politely.
             pumping = false;
+            duckFrames = 0;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -192,11 +202,42 @@ static void audio_task(void *)
         }
 
         // Blocking read IS the clock for this loop.
-        size_t got = audio_hardware_read_mic(pcm, POC_FRAME_SAMPLES);
-        if (got > 0) s_uac->sendAudioFrame(pcm, got);
+        size_t got = audio_hardware_read_mic(micbuf, POC_FRAME_SAMPLES);
+        if (got > 0) {
+            // Duck the mic if the far end was talking on the previous frame.
+            // Reading the mic before writing the speaker is what makes this
+            // the right frame to attenuate: it was captured while their audio
+            // was coming out of the speaker.
+            if (duckFrames > 0) {
+                for (size_t i = 0; i < got; i++) {
+                    micbuf[i] = (int16_t)((micbuf[i] * duckQ8) >> 8);
+                }
+                duckFrames--;
+            }
+            s_uac->sendAudioFrame(micbuf, got);
+        }
 
         size_t rx = s_uac->recvAudioFrame(pcm, POC_FRAME_SAMPLES);
         if (rx > 0) {
+            // Decide "is the far end talking" on the RAW decoded frame, before
+            // the gain below. Measuring post-gain would mean the threshold
+            // silently retunes itself every time POC_RX_GAIN_DB changes.
+            int32_t sumAbs = 0;
+            for (size_t i = 0; i < rx; i++) {
+                sumAbs += pcm[i] < 0 ? -pcm[i] : pcm[i];
+            }
+            if ((sumAbs / (int32_t)rx) > POC_DUCK_THRESHOLD && duckQ8 != 256) {
+                duckFrames = hangoverFrames;
+            }
+
+            if (rxGainQ8 != 256) {
+                for (size_t i = 0; i < rx; i++) {
+                    int32_t v = ((int32_t)pcm[i] * rxGainQ8) >> 8;
+                    if (v >  32767) v =  32767;
+                    if (v < -32768) v = -32768;
+                    pcm[i] = (int16_t)v;
+                }
+            }
             audio_hardware_write_spk(pcm, rx);
         } else {
             // Feed silence so the I2S DMA doesn't replay its last buffer.
@@ -236,7 +277,12 @@ static int32_t audio_pass(const char *label)
     int64_t t0 = esp_timer_get_time();
     for (int f = 0; f < frames; f++) {
         for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
-            tone[i] = (int16_t)(8000.0f * sinf(phase));   // ~-12 dBFS, not full scale
+            // ~-24 dBFS. Was 8000 (-12 dBFS), which is roughly where PSTN
+            // voice sits *before* POC_RX_GAIN_DB lifts it -- so once the DAC
+            // ceiling went up, the beep was painful while calls were still
+            // quiet. The beep is a diagnostic, not a ringtone; it only has to
+            // be clearly audible.
+            tone[i] = (int16_t)(2000.0f * sinf(phase));
             phase += step;
             if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
         }
@@ -251,6 +297,14 @@ static int32_t audio_pass(const char *label)
     } else if (elapsed_ms < 1500 || elapsed_ms > 2600) {
         ESP_LOGE(TAG, "[%s] TX ran at the wrong rate -- sample-rate/channel mismatch", label);
     }
+
+    // Amp off before capturing. Speaker and mic are centimetres apart with no
+    // isolation, so leaving the amp powered lets speaker output couple back
+    // into the mic and inflate the level we are trying to measure -- which is
+    // exactly what it looked like the first time the DAC ceiling was raised.
+    // The capture measures the mic, so the speaker has no business being live.
+    audio_hardware_set_amp(false);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_LOGW(TAG, "[%s] recording 2 s -- SPEAK NOW / make noise", label);
     int16_t mic[POC_FRAME_SAMPLES];

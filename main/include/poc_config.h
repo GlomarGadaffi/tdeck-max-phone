@@ -57,6 +57,22 @@
 #define POC_SIP_REG_EXPIRES  3600
 #endif
 
+// Bench-test speed dial. TEMPORARY WORKAROUND for #17: the keypad can only
+// produce '0', DEL and ENT today, so a target containing '*' or digits 1-9
+// cannot be typed. When this is defined, pressing ENT from the Idle screen
+// dials it immediately instead of opening an empty dial buffer.
+//
+//   "777"    drawbridge's own SDP loopback echo -- local, no 3CX leg.
+//            Use this FIRST: it isolates mic/speaker/RTP from the trunk.
+//   "9*777"  3CX's echo test via the anchor (drawbridge strips the leading
+//            '9' and sends *777 onward). Use this SECOND, once local audio
+//            is proven.
+//
+// Comment out to restore normal dial-buffer behaviour.
+#ifndef POC_TEST_DIAL
+#define POC_TEST_DIAL        "777"
+#endif
+
 // ── Fixed protocol/hardware settings (not site-specific) ─────────────────
 
 // Local ports.

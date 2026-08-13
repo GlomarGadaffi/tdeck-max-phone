@@ -20,6 +20,7 @@
 #include "driver/i2c.h"
 #include <cctype>
 #include <cstring>
+#include <cmath>
 #include <string>
 
 #include "board_tdeck_max.h"
@@ -207,6 +208,102 @@ static void audio_task(void *)
     }
 }
 
+#if CONFIG_TDECK_MAX_AUDIO_SELFTEST
+// Speaker and microphone failures are indistinguishable during a call --
+// both yield silence. This separates them: an audible tone proves the
+// DAC/I2S/amp path, and a non-zero mic level proves the ADC path without
+// anyone having to hear anything.
+static void audio_selftest(void)
+{
+    ESP_LOGW(TAG, "=== AUDIO SELF-TEST ===");
+
+    // Before measuring anything: prove whether our I2C init actually landed
+    // in the chip. "codec never configured" and "codec fine, wrong slot"
+    // are indistinguishable from the audio alone.
+    audio_hardware_dump_codec_regs();
+    audio_hardware_probe_asdout_activity();
+
+    // -- 1. Speaker: 1 kHz sine at POC_SAMPLE_RATE_HZ, ~2 s, amp on.
+    audio_hardware_set_amp(true);
+    vTaskDelay(pdMS_TO_TICKS(50));   // let the amp settle before driving it
+    ESP_LOGW(TAG, "[1/2] playing 1 kHz tone for 2 s -- LISTEN NOW");
+
+    int16_t tone[POC_FRAME_SAMPLES];
+    const float step = 2.0f * 3.14159265f * 1000.0f / (float)POC_SAMPLE_RATE_HZ;
+    float phase = 0.0f;
+    const int frames = (POC_SAMPLE_RATE_HZ * 2) / POC_FRAME_SAMPLES;
+    size_t written_total = 0;
+    for (int f = 0; f < frames; f++) {
+        for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
+            tone[i] = (int16_t)(8000.0f * sinf(phase));   // ~-12 dBFS, not full scale
+            phase += step;
+            if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
+        }
+        written_total += audio_hardware_write_spk(tone, POC_FRAME_SAMPLES);
+    }
+    ESP_LOGW(TAG, "[1/2] tone done -- %u samples accepted by I2S (expected %d)",
+             (unsigned)written_total, frames * POC_FRAME_SAMPLES);
+    if (written_total == 0) {
+        ESP_LOGE(TAG, "[1/2] I2S accepted ZERO samples -- TX path is not running at all");
+    }
+
+    // -- 2. Microphone: capture ~2 s and report level.
+    ESP_LOGW(TAG, "[2/2] recording 2 s -- SPEAK NOW / make noise");
+    int16_t mic[POC_FRAME_SAMPLES];
+    int32_t peak = 0;
+    int64_t sumsq = 0;
+    size_t total = 0, zeroFrames = 0;
+    for (int f = 0; f < frames; f++) {
+        size_t got = audio_hardware_read_mic(mic, POC_FRAME_SAMPLES);
+        if (got == 0) { zeroFrames++; continue; }
+        bool allZero = true;
+        for (size_t i = 0; i < got; i++) {
+            int32_t v = mic[i];
+            if (v != 0) allZero = false;
+            int32_t a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+            sumsq += (int64_t)v * v;
+        }
+        if (allZero) zeroFrames++;
+        total += got;
+    }
+    int rms = (total > 0) ? (int)sqrt((double)sumsq / (double)total) : 0;
+    ESP_LOGW(TAG, "[2/2] mic: %u samples, peak=%d rms=%d, silent/empty frames=%u/%d",
+             (unsigned)total, (int)peak, rms, (unsigned)zeroFrames, frames);
+
+    if (total == 0) {
+        ESP_LOGE(TAG, "[2/2] mic returned NO DATA -- I2S RX not running");
+    } else if (peak == 0) {
+        ESP_LOGE(TAG, "[2/2] mic is bit-exact ZERO -- ADC dead or wrong I2S slot (see #27)");
+    } else if (peak < 50) {
+        ESP_LOGW(TAG, "[2/2] mic level very low (peak=%d) -- check PGA gain", (int)peak);
+    } else {
+        ESP_LOGW(TAG, "[2/2] mic is LIVE (peak=%d) -- ADC path good", (int)peak);
+    }
+
+    // If the mic read zero, sweep the I2S slot masks. A non-zero peak on a
+    // different mask proves #27 (wrong slot) rather than a codec fault.
+    if (peak == 0) {
+        ESP_LOGW(TAG, "[3/3] mic was zero -- sweeping I2S slot masks (make noise)");
+        int pl = audio_hardware_probe_mic_slot(0);
+        int pr = audio_hardware_probe_mic_slot(1);
+        int pb = audio_hardware_probe_mic_slot(2);
+        if (pl <= 0 && pr <= 0 && pb <= 0) {
+            ESP_LOGE(TAG, "[3/3] ALL slot masks read zero -- not a slot problem; "
+                          "look at the codec capture path (REG0E/REG14/REG17)");
+        } else {
+            ESP_LOGW(TAG, "[3/3] a slot mask produced signal -- this is #27; "
+                          "left=%d right=%d both=%d", pl, pr, pb);
+        }
+        // Restore the configuration the phone actually runs with.
+        audio_hardware_probe_mic_slot(0);
+    }
+
+    audio_hardware_set_amp(false);
+    ESP_LOGW(TAG, "=== SELF-TEST COMPLETE ===");
+}
+#endif // CONFIG_TDECK_MAX_AUDIO_SELFTEST
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "==================================================");
@@ -242,6 +339,10 @@ extern "C" void app_main(void)
         ESP_LOGW(TAG, "*** one or more peripherals failed to init (see above) ***");
         ESP_LOGW(TAG, "*** continuing anyway; check the I2C scan for absent devices ***");
     }
+
+#if CONFIG_TDECK_MAX_AUDIO_SELFTEST
+    audio_selftest();   // before Wi-Fi, so nothing else competes for the bus
+#endif
 
     // 3. Display task first, so failures after this point can be shown.
     s_render_q = xQueueCreate(1, sizeof(RenderRequest));
@@ -304,7 +405,28 @@ extern "C" void app_main(void)
 
         switch (ui) {
         case UiState::Idle:
+#ifdef POC_TEST_DIAL
+            // Bench workaround for #17 -- ENT from Idle dials the configured
+            // test target directly, since '*' and 1-9 can't be typed yet.
+            if (key == '\r') {
+                const char *target = POC_TEST_DIAL;
+                ESP_LOGI(TAG, "test-dial -> %s", target);
+                ui_render(target, "Calling...", false);
+                if (uac.placeCall(target)) {
+                    ui = UiState::InCall;
+                    audio_hardware_set_amp(true);
+                    ui_render(target, "In Call", true);
+                    ESP_LOGI(TAG, "call up -- speak now, echo should return your voice");
+                } else {
+                    ui_render(target, "Call Failed", false);
+                    ESP_LOGW(TAG, "test-dial to %s failed", target);
+                }
+                break;
+            }
+            if (std::isdigit((unsigned char)key)) {
+#else
             if (key == '\r' || std::isdigit((unsigned char)key)) {
+#endif
                 dialBuffer.clear();
                 if (std::isdigit((unsigned char)key)) dialBuffer += key;
                 ui = UiState::Dialing;

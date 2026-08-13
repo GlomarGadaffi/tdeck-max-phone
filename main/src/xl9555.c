@@ -51,7 +51,10 @@ esp_err_t xl9555_init(void)
     }
 
     // Default states
-    s_p0_out = XL9555_P0_SPK_AMP_EN | XL9555_P0_TOUCH_RST;
+    // P0_0 (6609_EN) must be HIGH for the audio analog path to work -- see
+    // the note in board_tdeck_max.h. LilyGO's own playback example sets it
+    // even though it never uses the modem.
+    s_p0_out = XL9555_P0_6609_EN | XL9555_P0_SPK_AMP_EN | XL9555_P0_TOUCH_RST;
     s_p1_out = XL9555_P1_4G_PWR | XL9555_P1_KEYBOARD_RST;
     write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
     write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);

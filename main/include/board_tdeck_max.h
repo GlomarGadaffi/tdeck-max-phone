@@ -91,6 +91,14 @@ extern "C" {
 #define XL9555_I2C_ADDR         0x20
 
 // Port 0 Pins
+// P0_0 is labelled "6609_EN / enable A7682 module power" in LilyGO's header,
+// but their PLAYBACK-ONLY ES8311 example (examples/ES8311/playWAV) drives it
+// HIGH too -- a speaker demo has no use for the cellular modem. It therefore
+// gates a shared power rail that the audio analog section depends on.
+// Leaving it low leaves the codec's I2C/digital side alive (registers read
+// back perfectly, CHIPID valid) while ADC and DAC are both dead: no ASDOUT
+// activity and no speaker output. Confirmed on hardware.
+#define XL9555_P0_6609_EN       (1 << 0) // Port 0 Bit 0
 #define XL9555_P0_DRV2605_EN    (1 << 5) // Port 0 Bit 5
 #define XL9555_P0_SPK_AMP_EN    (1 << 6) // Port 0 Bit 6
 #define XL9555_P0_TOUCH_RST     (1 << 7) // Port 0 Bit 7

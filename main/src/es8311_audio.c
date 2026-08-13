@@ -138,7 +138,19 @@ static esp_err_t es8311_codec_init(void)
     ret |= es8311_write_reg(ES8311_SYSTEM_REG13, 0x10);
     ret |= es8311_write_reg(ES8311_ADC_REG1B, 0x0A);
     ret |= es8311_write_reg(ES8311_ADC_REG1C, 0x6A);
-    ret |= es8311_write_reg(ES8311_GPIO_REG44, 0x58); // internal ref signal (ADCL+DACR)
+    // REG44 is "GPIO, dac2adc for test" -- an internal DAC->ADC loopback.
+    // The vendor driver gates it on cfg.no_dac_ref: 0x58 routes the DAC as
+    // the ADC's reference (their no_dac_ref == false branch), 0x08 leaves
+    // the real analog input connected.
+    //
+    // This was 0x58, copied unconditionally without carrying the flag over.
+    // The effect is that the ADC listens to the DAC instead of the
+    // microphone -- so capture returns exactly what the DAC is playing,
+    // which during a silent moment is bit-exact zero. That matched the
+    // observed symptom precisely: registers all correct, every I2S slot
+    // mask reading zero. This board has a real differential analog mic on
+    // MIC1P/MIC1N, so we want the input connected: 0x08.
+    ret |= es8311_write_reg(ES8311_GPIO_REG44, 0x08);
 
     // I2S standard (Philips) format, 16-bit slot width.
     uint8_t dac_iface, adc_iface;
@@ -183,7 +195,18 @@ static esp_err_t es8311_codec_init(void)
 
     // Start: enable both ADC and DAC paths (this phone uses both).
     ret |= es8311_write_reg(ES8311_ADC_REG17, 0xBF);
-    ret |= es8311_write_reg(ES8311_SYSTEM_REG0E, 0x02);
+    // REG0E powers the analog capture blocks. Reset default is 0x6A, with
+    // PDN_PGA (bit 6) and PDN_MOD (bit 5) SET = powered down. We must clear
+    // exactly those two and leave the rest of the default alone -> 0x0A.
+    //
+    // This was 0x02, copied from LilyGO's esp_codec_dev driver. That value
+    // additionally clears bit 3, which the reset default sets. Their only
+    // ES8311 examples (playFormSD, playWAV) are playback-only, so their
+    // capture path was never exercised on this board and 0x02 was never
+    // validated for recording. Confirmed on hardware: with 0x02 the ADC
+    // returned bit-exact zero on every I2S slot mask (left/right/both)
+    // while all other registers read back correct.
+    ret |= es8311_write_reg(ES8311_SYSTEM_REG0E, 0x0A);
     ret |= es8311_write_reg(ES8311_SYSTEM_REG12, 0x00); // enable DAC
     ret |= es8311_write_reg(ES8311_SYSTEM_REG14, 0x1A); // analog mic PGA, no digital mic
 
@@ -276,4 +299,202 @@ size_t audio_hardware_write_spk(const int16_t *buf, size_t samples)
     esp_err_t err = i2s_channel_write(tx_chan, buf, samples * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(50));
     if (err != ESP_OK) return 0;
     return bytes_written / sizeof(int16_t);
+}
+
+// ── Bench diagnostics ───────────────────────────────────────────────────────
+// A dead ES8311 ADC and a wrong I2S slot mask both produce bit-exact silence,
+// so these two helpers exist to tell them apart on hardware.
+
+void audio_hardware_dump_codec_regs(void)
+{
+#if CONFIG_TDECK_MAX_SIM_MODE
+    ESP_LOGW(TAG, "[sim] codec register dump skipped");
+#else
+    // If these read back as written, the codec accepted our init and the
+    // fault is downstream (I2S slot/format). If they read 0x00/0xFF, the
+    // I2C writes didn't stick and the codec was never really configured.
+    struct { uint8_t reg; const char *name; uint8_t expect; } regs[] = {
+        {ES8311_RESET_REG00,       "RESET/mode",      0x80},
+        {ES8311_CLK_MANAGER_REG01, "clk src",         0x3F},
+        {ES8311_SDPIN_REG09,       "DAC serial fmt",  0x0C},
+        {ES8311_SDPOUT_REG0A,      "ADC serial fmt",  0x0C},
+        {ES8311_SYSTEM_REG0D,      "power up",        0x01},
+        {ES8311_SYSTEM_REG0E,      "ADC/PGA power",   0x0A},
+        {ES8311_SYSTEM_REG12,      "DAC enable",      0x00},
+        {ES8311_SYSTEM_REG14,      "mic sel/PGA",     0x1A},
+        {ES8311_ADC_REG15,         "ADC ramp",        0x40},
+        {ES8311_ADC_REG16,         "mic gain",        0x04},
+        {ES8311_ADC_REG17,         "ADC volume",      0xBF},
+        {ES8311_DAC_REG31,         "DAC mute",        0x00},
+        {ES8311_DAC_REG32,         "DAC volume",      0xBF},
+    };
+    // Full sweep first: the targeted table below only checks what we wrote,
+    // which can't reveal a register we never touched holding a bad default.
+    ESP_LOGW(TAG, "--- ES8311 FULL DUMP 0x00-0x1C, 0x31-0x37, 0x44-0x45 ---");
+    {
+        char line[96];
+        int n = 0;
+        for (uint8_t r = 0x00; r <= 0x1C; r++) {
+            uint8_t v = 0;
+            if (es8311_read_reg(r, &v) != ESP_OK) v = 0xEE;
+            n += snprintf(line + n, sizeof(line) - n, "%02x:%02x ", r, v);
+            if ((r % 8) == 7 || r == 0x1C) { ESP_LOGW(TAG, "  %s", line); n = 0; line[0] = 0; }
+        }
+        n = 0; line[0] = 0;
+        for (uint8_t r = 0x31; r <= 0x37; r++) {
+            uint8_t v = 0;
+            if (es8311_read_reg(r, &v) != ESP_OK) v = 0xEE;
+            n += snprintf(line + n, sizeof(line) - n, "%02x:%02x ", r, v);
+        }
+        for (uint8_t r = 0x44; r <= 0x45; r++) {
+            uint8_t v = 0;
+            if (es8311_read_reg(r, &v) != ESP_OK) v = 0xEE;
+            n += snprintf(line + n, sizeof(line) - n, "%02x:%02x ", r, v);
+        }
+        ESP_LOGW(TAG, "  %s", line);
+        uint8_t id1 = 0, id2 = 0, ver = 0;
+        es8311_read_reg(0xFD, &id1); es8311_read_reg(0xFE, &id2); es8311_read_reg(0xFF, &ver);
+        ESP_LOGW(TAG, "  CHIPID1=0x%02x CHIPID2=0x%02x VER=0x%02x (expect 83/11/xx)", id1, id2, ver);
+    }
+
+    ESP_LOGW(TAG, "--- ES8311 register readback (addr 0x%02x) ---", BOARD_ES8311_I2C_ADDR);
+    int mismatches = 0, failures = 0;
+    for (size_t i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
+        uint8_t v = 0;
+        esp_err_t err = es8311_read_reg(regs[i].reg, &v);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "  0x%02x %-16s READ FAILED (%d)", regs[i].reg, regs[i].name, err);
+            failures++;
+            continue;
+        }
+        bool ok = (v == regs[i].expect);
+        if (!ok) mismatches++;
+        ESP_LOGW(TAG, "  0x%02x %-16s = 0x%02x (wrote 0x%02x) %s",
+                 regs[i].reg, regs[i].name, v, regs[i].expect, ok ? "" : "  <-- MISMATCH");
+    }
+    if (failures) {
+        ESP_LOGE(TAG, "--- %d register READS failed: codec not responding on I2C ---", failures);
+    } else if (mismatches) {
+        ESP_LOGE(TAG, "--- %d registers differ: init did NOT take ---", mismatches);
+    } else {
+        ESP_LOGW(TAG, "--- all registers match: codec IS configured; look at I2S slot/format ---");
+    }
+#endif
+}
+
+int audio_hardware_probe_mic_slot(int mask)
+{
+#if CONFIG_TDECK_MAX_SIM_MODE
+    (void)mask; return -1;
+#else
+    if (rx_chan == NULL) return -1;
+
+    i2s_std_slot_config_t slot =
+        I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    const char *name = "left";
+    if (mask == 1)      { slot.slot_mask = I2S_STD_SLOT_RIGHT; name = "right"; }
+    else if (mask == 2) { slot.slot_mask = I2S_STD_SLOT_BOTH;  name = "both";
+                          slot.slot_mode = I2S_SLOT_MODE_STEREO; }
+    else                { slot.slot_mask = I2S_STD_SLOT_LEFT; }
+
+    // Reconfiguring slots requires the channel disabled.
+    i2s_channel_disable(rx_chan);
+    esp_err_t err = i2s_channel_reconfig_std_slot(rx_chan, &slot);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "  slot=%-5s reconfig failed (%d)", name, err);
+        i2s_channel_enable(rx_chan);
+        return -1;
+    }
+    i2s_channel_enable(rx_chan);
+
+    // Discard the first buffers so we measure steady state, not startup.
+    int16_t buf[256];
+    for (int i = 0; i < 5; i++) audio_hardware_read_mic(buf, 256);
+
+    int32_t peak = 0;
+    size_t total = 0;
+    for (int f = 0; f < 40; f++) {
+        size_t got = audio_hardware_read_mic(buf, 256);
+        for (size_t i = 0; i < got; i++) {
+            int32_t a = buf[i] < 0 ? -buf[i] : buf[i];
+            if (a > peak) peak = a;
+        }
+        total += got;
+    }
+    ESP_LOGW(TAG, "  slot=%-5s peak=%-6d samples=%u", name, (int)peak, (unsigned)total);
+    return (int)peak;
+#endif
+}
+
+// Is the codec driving its data-out line at all? I2S owning the pin doesn't
+// stop us reading the pad's input level. Constant level across a burst of
+// samples means the ES8311 is not transmitting; observed transitions mean it
+// is, and the fault is on the ESP32 receive side instead.
+void audio_hardware_probe_asdout_activity(void)
+{
+#if CONFIG_TDECK_MAX_SIM_MODE
+    ESP_LOGW(TAG, "[sim] ASDOUT probe skipped");
+#else
+    int hi = 0, lo = 0, edges = 0, last = -1;
+    for (int i = 0; i < 20000; i++) {
+        int v = gpio_get_level(BOARD_I2S_ASDOUT);
+        if (v) hi++; else lo++;
+        if (last >= 0 && v != last) edges++;
+        last = v;
+    }
+    ESP_LOGW(TAG, "ASDOUT(GPIO%d): hi=%d lo=%d edges=%d -> %s",
+             BOARD_I2S_ASDOUT, hi, lo, edges,
+             edges > 0 ? "CODEC IS DRIVING DATA" : "line static: codec NOT transmitting");
+
+    // MCLK is the one the ES8311's clock manager actually needs. Without it
+    // the chip is inert in BOTH directions while I2C still works perfectly
+    // -- which is exactly the symptom here.
+    int mh = 0, ml = 0, medges = 0; last = -1;
+    for (int i = 0; i < 20000; i++) {
+        int v = gpio_get_level(BOARD_I2S_MCLK);
+        if (v) mh++; else ml++;
+        if (last >= 0 && v != last) medges++;
+        last = v;
+    }
+    ESP_LOGW(TAG, "MCLK(GPIO%d):   hi=%d lo=%d edges=%d -> %s",
+             BOARD_I2S_MCLK, mh, ml, medges,
+             medges > 0 ? "MCLK PRESENT" : "NO MCLK -- codec has no master clock!");
+
+    // WS/LRCK: without frame sync the codec never frames a sample in either
+    // direction. At 8 kHz this is ~32x slower than BCLK, so expect few edges.
+    int wh = 0, wl = 0, wedges = 0; last = -1;
+    for (int i = 0; i < 20000; i++) {
+        int v = gpio_get_level(BOARD_I2S_LRCK);
+        if (v) wh++; else wl++;
+        if (last >= 0 && v != last) wedges++;
+        last = v;
+    }
+    ESP_LOGW(TAG, "WS/LRCK(GPIO%d): hi=%d lo=%d edges=%d -> %s",
+             BOARD_I2S_LRCK, wh, wl, wedges,
+             wedges > 0 ? "frame sync running" : "NO WS -- codec never frames a sample!");
+
+    // DSDIN: our data OUT to the codec. If this is static while we are
+    // playing a tone, the ESP32 is not actually shifting samples out.
+    int dh = 0, dl = 0, dedges = 0; last = -1;
+    for (int i = 0; i < 20000; i++) {
+        int v = gpio_get_level(BOARD_I2S_DSDIN);
+        if (v) dh++; else dl++;
+        if (last >= 0 && v != last) dedges++;
+        last = v;
+    }
+    ESP_LOGW(TAG, "DSDIN(GPIO%d):  hi=%d lo=%d edges=%d -> %s",
+             BOARD_I2S_DSDIN, dh, dl, dedges,
+             dedges > 0 ? "ESP32 is shifting data out" : "static (expected if playing silence)");
+
+    int bh = 0, bl = 0, bedges = 0; last = -1;
+    for (int i = 0; i < 20000; i++) {
+        int v = gpio_get_level(BOARD_I2S_SCLK);
+        if (v) bh++; else bl++;
+        if (last >= 0 && v != last) bedges++;
+        last = v;
+    }
+    ESP_LOGW(TAG, "BCLK(GPIO%d):   hi=%d lo=%d edges=%d -> %s",
+             BOARD_I2S_SCLK, bh, bl, bedges,
+             bedges > 0 ? "clock running" : "NO CLOCK - I2S not driving the bus");
+#endif
 }

@@ -23,6 +23,20 @@ menu "T-Deck MAX Phone"
             this during bench bring-up to derive the real map empirically,
             then turn it back off (it logs on every keypress).
 
+    config TDECK_MAX_AUDIO_SELFTEST
+        bool "Run an audio self-test at boot (tone out, mic level in)"
+        default n
+        help
+            Bench diagnostic that separates the speaker path from the mic
+            path, which otherwise fail identically -- both just produce
+            silence on a call.
+
+            Plays a 1 kHz tone for ~2 s with the amplifier enabled (tests
+            DAC/I2S/amp), then captures ~2 s of microphone audio and logs
+            peak and RMS amplitude per I2S slot (tests ADC without needing
+            to hear anything). A mic reading ~0 on one slot but not the
+            other is the signature of issue #27.
+
     config TDECK_MAX_HALT_ON_INIT_FAIL
         bool "Abort boot if a peripheral fails to initialize"
         default n

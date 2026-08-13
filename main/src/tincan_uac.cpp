@@ -451,10 +451,20 @@ bool TincanUac::placeCall(const std::string &calleeExt)
     ESP_LOGI(TAG, "INVITE %s via %s:%d", calleeExt.c_str(), _serverIp.c_str(), _serverPort);
 
     char rbuf[2048];
-    // Wait up to ~120s for the callee to answer. Retransmit only in the
-    // first few seconds (UDP-loss guard); once ringing, just wait.
+    // Wait up to ~120s for the callee to answer. Retransmit only in the first
+    // few seconds as a UDP-loss guard, and ONLY until the far end proves it
+    // heard us.
+    //
+    // This used to gate retransmission on the loop counter alone, and the
+    // provisional-response branch below reaches this via `continue` -- so
+    // receiving 180 Ringing advanced `attempt` and the INVITE went out again
+    // on attempts 2 and 4, while the callee's phone was already ringing. On a
+    // real PSTN call through 3CX that presented as the phone ringing twice.
+    // RFC 3261 17.1.1.2 is explicit: retransmission ceases on receipt of ANY
+    // response, provisional included.
+    bool answered = false;
     for (int attempt = 0; attempt < 240; ++attempt) {
-        if (attempt < 6 && attempt % 2 == 0) sendToServer(invite);
+        if (!answered && attempt < 6 && attempt % 2 == 0) sendToServer(invite);
 
         sockaddr_in src{};
         socklen_t sl = sizeof(src);
@@ -470,6 +480,9 @@ bool TincanUac::placeCall(const std::string &calleeExt)
         int code = statusCode(msg->getType());
         ESP_LOGI(TAG, "<- %.*s", (int)msg->getType().size(), msg->getType().data());
 
+        // Any response at all stops retransmission -- the far end has the
+        // INVITE, and sending it again forks a second leg.
+        answered = true;
         if (code == 100 || code == 180 || code == 183) continue;
         if (code == 200) {
             _remoteTag = extractParam(msg->getTo(), ";tag=");
@@ -560,8 +573,30 @@ void TincanUac::handleInboundBye(const std::string &raw)
 
     // getCallID() returns the raw header line ("Call-ID: id@host"); _callId
     // holds just the bare value, so strip the prefix before comparing.
-    if (_state == State::InCall && headerValue(msg->getCallID()) == _callId) {
+    const std::string byeCallId = headerValue(msg->getCallID());
+    if (_state == State::InCall && byeCallId == _callId) {
         ESP_LOGI(TAG, "<- BYE (peer hung up)");
+        resetDialog();
+        _state = State::Idle;
+        _callEndedPending = true;
+        return;
+    }
+
+    // We 200-OK'd it above, so the far end and the PBX both consider the call
+    // torn down -- but our own state machine did not, which strands the UI in
+    // "In Call" with no way out but a reset. Say exactly which half of the
+    // guard failed; guessing at this from the outside is what made it look
+    // like the BYE was never delivered at all.
+    ESP_LOGW(TAG, "<- BYE ACKed but NOT matched: state=%d (InCall=%d), "
+                  "their Call-ID '%s' vs ours '%s'",
+             (int)_state, (int)State::InCall, byeCallId.c_str(), _callId.c_str());
+
+    // Tear down anyway when we have no better information. A BYE arriving
+    // while we believe we are in a call means the call is over regardless of
+    // whose dialog bookkeeping is wrong -- and a phone stuck off-hook is a
+    // worse failure than a dialog matched too loosely.
+    if (_state == State::InCall) {
+        ESP_LOGW(TAG, "tearing down anyway -- refusing to strand the call");
         resetDialog();
         _state = State::Idle;
         _callEndedPending = true;

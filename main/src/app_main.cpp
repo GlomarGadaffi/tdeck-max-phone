@@ -307,6 +307,13 @@ static void audio_task(void *)
     const int hangoverFrames = POC_DUCK_HANGOVER_MS / 20;   // frames are 20 ms
     int duckFrames = 0;
     int statFrames = 0;
+    // Mean |sample| accumulators for the census. Packet counts alone can't
+    // tell "RTP is flowing" from "RTP is flowing and every frame is silence",
+    // which is the difference between a codec fault here and a media fault
+    // upstream. 64-bit because 250 frames * 160 samples * 32767 overflows 32.
+    int64_t statMicSum = 0, statRxSum = 0;
+    int32_t statMicN = 0, statRxN = 0;
+    int16_t statMicPeak = 0, statRxPeak = 0;
 
     for (;;) {
         if (!s_uac || !s_uac->inCall()) {
@@ -332,13 +339,20 @@ static void audio_task(void *)
         // 250 frames * 20 ms = 5 s.
         if (++statFrames >= 250) {
             statFrames = 0;
-            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu%s",
+            // mic~/rx~ are mean |sample| out of 32767. Anything under ~30 is
+            // effectively digital silence; speech sits in the hundreds.
+            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu | mic~%ld peak %d | rx~%ld peak %d%s",
                      (unsigned long)s_uac->rtpTx(), (unsigned long)s_uac->rtpRx(),
+                     (long)(statMicN ? statMicSum / statMicN : 0), (int)statMicPeak,
+                     (long)(statRxN ? statRxSum / statRxN : 0), (int)statRxPeak,
                      s_uac->lastTxErrno() ? " TX FAILING" : "");
             if (s_uac->lastTxErrno()) {
                 ESP_LOGE(TAG, "  sendto() errno %d -- RTP is not leaving the board",
                          s_uac->lastTxErrno());
             }
+            statMicSum = statRxSum = 0;
+            statMicN = statRxN = 0;
+            statMicPeak = statRxPeak = 0;
         }
 
         // Blocking read IS the clock for this loop.
@@ -354,6 +368,14 @@ static void audio_task(void *)
                 }
                 duckFrames--;
             }
+            // Census: measure what we are ACTUALLY transmitting, i.e. after
+            // ducking, since that is what the far end receives.
+            for (size_t i = 0; i < got; i++) {
+                int16_t a = micbuf[i] < 0 ? (int16_t)-micbuf[i] : micbuf[i];
+                statMicSum += a;
+                if (a > statMicPeak) statMicPeak = a;
+            }
+            statMicN += (int32_t)got;
             s_uac->sendAudioFrame(micbuf, got);
         }
 
@@ -363,9 +385,18 @@ static void audio_task(void *)
             // the gain below. Measuring post-gain would mean the threshold
             // silently retunes itself every time POC_RX_GAIN_DB changes.
             int32_t sumAbs = 0;
+            int16_t framePeak = 0;
             for (size_t i = 0; i < rx; i++) {
-                sumAbs += pcm[i] < 0 ? -pcm[i] : pcm[i];
+                int16_t a = pcm[i] < 0 ? (int16_t)-pcm[i] : pcm[i];
+                sumAbs += a;
+                if (a > framePeak) framePeak = a;
             }
+            // Census on the RAW decoded frame, before rx gain -- this is what
+            // actually arrived from the bridge.
+            statRxSum += sumAbs;
+            statRxN += (int32_t)rx;
+            if (framePeak > statRxPeak) statRxPeak = framePeak;
+
             if ((sumAbs / (int32_t)rx) > POC_DUCK_THRESHOLD && duckQ8 != 256) {
                 duckFrames = hangoverFrames;
             }

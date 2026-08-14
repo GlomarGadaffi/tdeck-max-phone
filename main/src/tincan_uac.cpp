@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 
 // Vendored pocket-dial SIP layer (MIT, ported from tincan/components/sip_core)
 // -- used to PARSE requests/responses + SDP. See sip_core/CMakeLists.txt.
@@ -171,6 +172,9 @@ bool TincanUac::learnRemoteMedia(SipMessage *msg)
 // endpoint (see the field comments in tincan_uac.hpp).
 void TincanUac::publishMediaTarget()
 {
+    _rtpTx = 0;
+    _rtpRx = 0;
+    _lastTxErrno = 0;
     _mediaIpBe = (uint32_t)inet_addr(_remoteRtpIp.c_str());
     _mediaPortBe = htons((uint16_t)_remoteRtpPort);
     _mediaActive.store(true, std::memory_order_release);
@@ -880,7 +884,13 @@ void TincanUac::sendAudioFrame(const int16_t *pcm, size_t samples)
     dst.sin_family = AF_INET;
     dst.sin_addr.s_addr = _mediaIpBe;
     dst.sin_port = _mediaPortBe;
-    sendto(_rtpSock, pkt, RTP_HEADER_LEN + samples, 0, (const sockaddr *)&dst, sizeof(dst));
+    int rc = sendto(_rtpSock, pkt, RTP_HEADER_LEN + samples, 0,
+                    (const sockaddr *)&dst, sizeof(dst));
+    // A failing sendto() used to be invisible here, which made "the far end
+    // hears nothing" indistinguishable from a codec fault. Record it instead;
+    // audio_task prints it with the counters.
+    if (rc < 0) _lastTxErrno = errno;
+    else        _rtpTx++;
 }
 
 size_t TincanUac::recvAudioFrame(int16_t *pcm, size_t maxSamples)
@@ -890,6 +900,7 @@ size_t TincanUac::recvAudioFrame(int16_t *pcm, size_t maxSamples)
     int n = recvfrom(_rtpSock, rx, sizeof(rx), MSG_DONTWAIT, nullptr, nullptr);
     if (n <= (int)RTP_HEADER_LEN) return 0;
 
+    _rtpRx++;
     size_t plen = n - RTP_HEADER_LEN;
     if (plen > maxSamples) plen = maxSamples;
     g711_ulaw_decode_buf(rx + RTP_HEADER_LEN, pcm, plen);

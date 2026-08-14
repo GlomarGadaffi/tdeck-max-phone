@@ -175,6 +175,24 @@ private:
     uint32_t _mediaIpBe = 0;
     uint16_t _mediaPortBe = 0;
 
+public:
+    // RTP frame counters, for the periodic in-call diagnostic line. Only the
+    // audio task writes them, and a torn read of a counter that exists purely
+    // to be printed is harmless, so these are deliberately not atomic.
+    //
+    // They exist because "no audio" has three very different causes that look
+    // identical from the outside: tx==0 (we never sent), rx==0 (they never
+    // sent), or both moving (RTP is fine and the fault is in the codec path).
+    // Without this you cannot tell them apart without a packet capture.
+    uint32_t rtpTx() const { return _rtpTx; }
+    uint32_t rtpRx() const { return _rtpRx; }
+    int lastTxErrno() const { return _lastTxErrno; }
+
+private:
+    uint32_t _rtpTx = 0;
+    uint32_t _rtpRx = 0;
+    int _lastTxErrno = 0;
+
     // Parse an SDP body's RTP endpoint into _remoteRtpIp/_remoteRtpPort.
     // Returns false when the message carries no usable offer/answer -- which
     // is normal for a delayed-offer INVITE, where the endpoint only shows up

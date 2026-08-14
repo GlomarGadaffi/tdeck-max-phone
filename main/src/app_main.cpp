@@ -306,6 +306,7 @@ static void audio_task(void *)
                              : (int32_t)(powf(10.0f, POC_DUCK_DB / 20.0f) * 256.0f);
     const int hangoverFrames = POC_DUCK_HANGOVER_MS / 20;   // frames are 20 ms
     int duckFrames = 0;
+    int statFrames = 0;
 
     for (;;) {
         if (!s_uac || !s_uac->inCall()) {
@@ -321,6 +322,23 @@ static void audio_task(void *)
             // started pumping, so we don't inherit that as permanent latency.
             s_uac->flushRtpBacklog();
             pumping = true;
+            statFrames = 0;
+        }
+
+        // Periodic RTP census. "No audio" has three causes that are
+        // indistinguishable from the outside -- we never sent, they never
+        // sent, or both flowed and the codec path is at fault -- and this is
+        // the cheapest way to tell them apart without a packet capture.
+        // 250 frames * 20 ms = 5 s.
+        if (++statFrames >= 250) {
+            statFrames = 0;
+            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu%s",
+                     (unsigned long)s_uac->rtpTx(), (unsigned long)s_uac->rtpRx(),
+                     s_uac->lastTxErrno() ? " TX FAILING" : "");
+            if (s_uac->lastTxErrno()) {
+                ESP_LOGE(TAG, "  sendto() errno %d -- RTP is not leaving the board",
+                         s_uac->lastTxErrno());
+            }
         }
 
         // Blocking read IS the clock for this loop.

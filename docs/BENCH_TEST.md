@@ -85,7 +85,7 @@ What has actually been run on a real board. Session logs and serial captures are
 | 1a | `777` local echo, two-way audio | ✅ mic peak 1321 / rms 335, 0/100 silent frames |
 | 2 | Inbound from a desktop softphone | ✅ operator-confirmed 2026-08-13 |
 | 3 | Outbound `9<number>` through 3CX | ✅ real mobile rang; two-way audio confirmed **both ends** |
-| 4 | Inbound from a 3CX DN (RING-ALL) | ⬜ not run |
+| 4 | Inbound from a 3CX DN (RING-ALL) | 🟡 phone side ✅ 2026-08-14; **no far-end audio — upstream**, see below |
 | 5 | Second call, no reboot | ✅ two consecutive calls in one boot, clean teardown |
 | 6 | Busy handling (486) | ⬜ not run |
 | 7 | Race: dial-out vs. inbound | ⬜ not run (expected to fail by design, #18) |
@@ -196,6 +196,37 @@ masks -- `esp_codec_dev` rebuilds the slot config during
 whatever slot mode you pass to `i2s_channel_init_std_mode()` is discarded.
 Two bench sessions went into toggling that line before anyone read the
 function. This is what the now-closed #27 was wrongly theorising about.
+
+### Step 4 as measured on 2026-08-14: phone good, upstream silent
+
+Run on hardware. Everything on this device works: the delayed-offer INVITE rings,
+the screen shows the caller, ENT answers, the ACK's SDP answer arms media, and RTP
+flows both ways at 50 pkt/s for the whole call with no socket errors. **But there
+is no audio in either direction**, and the RTP census says why:
+
+```
+tx=241 rx=240 | mic~350 peak 5219 | rx~10 peak 24
+tx=491 rx=490 | mic~374 peak 6090 | rx~10 peak 24
+tx=741 rx=740 | mic~440 peak 4643 | rx~10 peak 24
+```
+
+`mic~` tracks the operator talking, so this device is sending real audio. `rx~` sits
+at **exactly** mean 10 / peak 24 for fifteen seconds and never moves — a fixed
+comfort-noise generator, not quiet speech. Real audio varies; this does not.
+
+So the PSTN leg's audio never reaches drawbridge's media bridge, and the bridge
+streams comfort noise to fill the gap. That is the "dead air with a comfort tone"
+an operator hears. **Nothing on this device will fix it.**
+
+First thing to check upstream, from drawbridge's own note at
+`TelephonyAnchorClient.cpp:535-537`: a route point configured as an *External Call
+Flow* app expects `/route`, not `/answer`, and that comment explicitly calls this
+out as the first thing to flip when a deployment's inbound calls never connect.
+Then confirm `startMediaStreams()` opened the GET (PSTN→bridge) stream — an empty
+playout buffer is exactly what produces a constant comfort-noise floor.
+
+Note this cannot regress silently any more: the census makes "RTP flowing" and
+"RTP flowing but silent" different log lines.
 
 ### If an inbound call from a 3CX DN connects but the caller hears nothing
 

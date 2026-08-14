@@ -4,6 +4,11 @@ main/include/poc_secrets.h
 
 build/
 build-host/
+# Out-of-tree QEMU sim build. Kept separate (with its own SDKCONFIG) so
+# checking the sim config compiles doesn't clobber the real sdkconfig:
+#   idf.py -B build-qemu -D SDKCONFIG="build-qemu/sdkconfig" \
+#          -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.qemu" build
+build-qemu/
 sdkconfig
 sdkconfig.old
 managed_components/

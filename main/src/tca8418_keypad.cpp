@@ -31,18 +31,39 @@ static const char *TAG = "TCA8418_KEYPAD";
 #define KEYPAD_ROWS 4
 #define KEYPAD_COLS 10
 
+// There is a telephone keypad already sitting inside this QWERTY matrix, on
+// the keycaps' own printed alt legends. Overlaying LilyGO's base map
+// (examples/keypad/keypad.ino:17-22) with its symbol layer
+// (examples/factory/ui_deckpro.cpp:1415-1420, wifi_password_chat_map) gives:
+//
+//      Q  W  E  R  T  Y  U  I  O  P         #  1  2  3  (  )  _  -  +  @
+//      A  S  D  F  G  H  J  K  L DEL   -->  *  4  5  6  /  :  ;  '  " DEL
+//     ALT Z  X  C  V  B  N  M  $ ENT       ALT 7  8  9  ?  !  ,  .  -  ENT
+//      .  .  .  .  . UP  0 SPC SYM UP       .  .  .  .  . UP  0 SPC SYM UP
+//
+// 1-9 form a contiguous 3x3 block on W E R / S D F / Z X C, 0 is a dedicated
+// physical key, and * and # are stacked on A and Q at the left edge.
+//
+// These are bound as the DEFAULT layer, not behind ALT/SYM. A phone's primary
+// input is digits, and making the user hold a modifier for every digit of an
+// 11-digit number is bad on any device -- but specifically here, a held
+// modifier is the exact mechanism that broke LilyGO's own factory firmware
+// (its shift layer latched on after one tap; see docs/UI_DESIGN.md 9.1). ALT
+// (r2c0) and SYM (r3c8) are therefore left deliberately INERT and reserved:
+// alpha entry will want them one day, and re-teaching a key is worse than
+// leaving it dead. Everything unmapped here is consumed silently -- a stray
+// letter must never reach the dial buffer or end a call.
+//
+// Verified on hardware 2026-08-13: the column decode is correct (Q -> r0c0,
+// P -> r0c9), and r3c6 really is the '0' key -- see the U6 entry in
+// docs/UI_DESIGN.md for the argument from the vendor's own key-count constant.
 static const char s_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
-    {0,   0,   0,   0,   0,   0,   0,   0,   0,   0  },
-    {0,   0,   0,   0,   0,   0,   0,   0,   0,   '\b'}, // DEL (backspace/cancel)
-    {0,   0,   0,   0,   0,   0,   0,   0,   0,   '\r'}, // ENT (dial/answer)
-    {0,   0,   0,   0,   0,   0,   '0', ' ', 0,   0  },
+    //  c0    c1   c2   c3   c4   c5   c6   c7   c8   c9
+    {  '#',  '1', '2', '3',  0,   0,   0,   0,  '+',  0   }, // Q W E R . . . . O P
+    {  '*',  '4', '5', '6',  0,   0,   0,   0,   0,  '\b' }, // A S D F . . . . L DEL
+    {   0,   '7', '8', '9',  0,   0,   0,   0,   0,  '\r' }, // ALT Z X C . . . . $ ENT
+    {   0,    0,   0,   0,   0,   0,  '0',  0,   0,   0   }, // . . . . . UP 0 SPC SYM UP
 };
-// Digits 1-9 and *,# aren't on this QWERTY matrix at all on real hardware
-// (it's a chat-style keyboard, not a numeric keypad) -- number entry needs
-// the top QWERTY row via an ALT/SYM shift layer whose mapping isn't
-// confirmed. For the PoC's answer/reject/hangup flow this reduced map is
-// sufficient; deriving the full map is #17 (build with
-// CONFIG_TDECK_MAX_KEYPAD_DEBUG=y to dump raw key_num per press).
 
 // Read path is defined only for real-hardware builds -- its only caller
 // (read_raw_event) short-circuits in sim mode, so defining it there would

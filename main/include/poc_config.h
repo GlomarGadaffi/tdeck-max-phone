@@ -57,21 +57,21 @@
 #define POC_SIP_REG_EXPIRES  3600
 #endif
 
-// Bench-test speed dial. TEMPORARY WORKAROUND for #17: the keypad can only
-// produce '0', DEL and ENT today, so a target containing '*' or digits 1-9
-// cannot be typed. When this is defined, pressing ENT from the Idle screen
-// dials it immediately instead of opening an empty dial buffer.
+// POC_TEST_DIAL is GONE (#17 landed). It was a bench workaround for a keypad
+// that could only produce '0', DEL and ENT: ENT from the Idle screen dialled a
+// compile-time constant because a real number could not be typed.
 //
-//   "777"    drawbridge's own SDP loopback echo -- local, no 3CX leg.
-//            Use this FIRST: it isolates mic/speaker/RTP from the trunk.
-//   "9*777"  3CX's echo test via the anchor (drawbridge strips the leading
-//            '9' and sends *777 onward). Use this SECOND, once local audio
-//            is proven.
+// The keypad now has the full dialpad (0-9 * # +), so ENT from Idle redials
+// the last number that connected instead -- persisted in NVS, so it survives a
+// reboot. Same muscle memory, no hardcoded target, and nothing to leak into a
+// public repo. If you still want a fixed bench target, just dial it once and
+// ENT will keep redialling it.
 //
-// Comment out to restore normal dial-buffer behaviour.
-#ifndef POC_TEST_DIAL
-#define POC_TEST_DIAL        "777"
-#endif
+// Useful numbers to dial by hand:
+//   777     drawbridge's own SDP loopback echo -- local, no 3CX leg. Dial this
+//           FIRST when bringing up audio: it isolates mic/speaker/RTP from the
+//           trunk. It will howl; that is the echo service doing its job.
+//   9*777   3CX's echo test via the anchor (drawbridge strips the leading 9).
 
 // ── Fixed protocol/hardware settings (not site-specific) ─────────────────
 

@@ -675,15 +675,30 @@ The depth-1 `xQueueOverwrite` queue already discards superseded frames
 typing into 2–4 partials instead of 11. This is the single highest-value change in the
 whole refresh strategy, and it is about six lines.
 
-### 5.7 Timing is unverified — measure it before tuning anything above
+### 5.7 Full-refresh timing — MEASURED 2026-08-13
 
-The README asserts a 2–3 s full refresh; nothing in-tree measures it, and **no partial
-refresh has ever run on this hardware**, so every number in §5.5/§5.6 is reasoning from
-an unmeasured baseline. Before tuning: bracket the busy-wait in `epd_full_refresh()` and
-the new partial path with `esp_timer_get_time()`, log milliseconds, and run 20 of each.
-The two numbers that decide the design are **partial-refresh wall time** and **how many
-consecutive partials it takes before ghosting is objectionable on this specific panel**
-(count them by eye — the FAQ's "5" is generic advice, not a measurement of this unit).
+**A full refresh takes 3277 ms.** Measured inside `epd_full_refresh()` with
+`esp_timer_get_time()` over a live dialling session; the spread was 3274–3277 ms, so treat it
+as a hard 3.3 s constant, not a range. The README's "2–3 s" was optimistic and is corrected.
+
+Worse than this design assumed, which sharpens three of its conclusions:
+
+- **§5.5's "no live call timer" verdict is now emphatic rather than cautious.** A 1 Hz counter
+  is not a 30 % duty cycle, it is impossible — the panel cannot finish one refresh inside a
+  second.
+- **§2.5's render-lag hazard is real and observed.** Typing `*777` produced renders at
+  t=157863 (`*`), t=161148 (`*77`), t=164425 (`*777`). The `*7` frame never reached the glass —
+  the depth-1 `xQueueOverwrite` discarded it, which is the queue working as designed. The panel
+  trails the fingers by ~3.3 s, so **the input grace window on entering INCOMING is not
+  optional.**
+- **§5.6's 250 ms coalescing window is confirmed as the highest-value change here.** Three `7`
+  presses inside 550 ms cost two full refreshes — 6.5 s of panel time where a settle window
+  would have cost one.
+
+**Still unmeasured: partial-refresh wall time**, since no partial refresh has ever run on this
+hardware. That, plus **how many consecutive partials it takes before ghosting is objectionable
+on this specific unit** (count by eye — LilyGO's "5" is generic advice, not a measurement of
+this panel), is what remains before §5.6's caps can be tuned honestly.
 
 ---
 
@@ -916,7 +931,7 @@ Everything this design rests on that I could not confirm from source or a named 
 | U4 | Which of the two `UP` keys is physically left | **Unverified.** Decides which is vol-down. |
 | U5 | Whether `r3c0`–`r3c4` are physical keys | **RESOLVED from vendor source — they are not.** See the `KEYPAD_PRESS_VAL_MAX` argument below. Nothing is bound to them. |
 | U6 | `r3c6` is the `0` key | **RESOLVED from vendor source — yes.** `peri_keypad.cpp`'s `KEYPAD_PRESS_VAL_MAX 35` admits key indices 0–34 and rejects 35–39. Under `col = 9 - (idx % 10)` the five rejected indices are exactly `r3c4`…`r3c0`, the five `NONE` positions — 40 matrix positions minus 5 dead = 35 real keys, which *is* the constant. Index 33 = `r3c6` falls inside the accepted range, so the vendor's working firmware does treat it as `0`. |
-| U7 | Full-refresh wall time (README claims 2–3 s) | **Unmeasured in-tree.** |
+| U7 | Full-refresh wall time (README claimed 2–3 s) | **RESOLVED 2026-08-13 — 3277 ms**, spread 3274–3277. Slower than the README claimed; see §5.7. |
 | U8 | Partial-refresh wall time, and the real ghosting threshold on this unit | **Never run on this hardware.** All of §5.5–§5.6 is reasoning from an unmeasured baseline. |
 | U9 | Whether `0x90`'s X parameters are pixels or byte-columns | **Unresolved — and deliberately side-stepped** by using full-width bands only (§5.3). |
 | U10 | Whether the panel accepts the partial sequence after the driver's `DEEP_SLEEP` | The partial path begins with its own reset + power-on, so it should. **Unverified.** |

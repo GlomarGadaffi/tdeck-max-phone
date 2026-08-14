@@ -61,12 +61,20 @@ static void fill_rect(int x, int y, int w, int h, bool black)
             set_pixel(x + i, y + j, black);
 }
 
-// Compact 5x7 digit font (0-9), MSB of each row byte = leftmost column.
-// Used for caller ID / extension number readout -- the only free-form text
-// this PoC's UI needs to render precisely. Status is drawn as a fixed
-// pictogram per state (see epaper_render_call_status) rather than a full
-// alphabet font; a real character set is UI-polish scope beyond this PoC.
-static const uint8_t s_digit_font[10][7] = {
+// Compact 5x7 dialpad font, MSB of each row byte = leftmost column. Covers
+// exactly the characters a dial buffer can contain: 0-9 plus * # +. Indexed
+// through glyph_index() rather than `c - '0'`, because the set is no longer
+// contiguous. Status is drawn as a fixed pictogram per state (see
+// epaper_render_call_status) rather than a full alphabet font; a real
+// character set is UI-polish scope beyond this PoC (#16).
+//
+// * and # matter because they are dialable: *777 is the echo test, and star
+// codes are how most PBXes expose features. Before this they rendered as
+// blank gaps, so "*777" displayed as " 777". + is here only because it is the
+// printed legend on the O key and costs one glyph; neither drawbridge nor the
+// 3CX anchor consumes it today.
+#define GLYPH_COUNT 13
+static const uint8_t s_dial_font[GLYPH_COUNT][7] = {
     {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70}, // 0
     {0x20, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70}, // 1
     {0x70, 0x88, 0x08, 0x10, 0x20, 0x40, 0xF8}, // 2
@@ -77,13 +85,35 @@ static const uint8_t s_digit_font[10][7] = {
     {0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x40}, // 7
     {0x70, 0x88, 0x88, 0x70, 0x88, 0x88, 0x70}, // 8
     {0x70, 0x88, 0x88, 0x78, 0x08, 0x10, 0x60}, // 9
+    // '*' -- a six-point asterisk sitting high in the cell, the way a
+    // typographic asterisk does. Rows 5-6 blank so it never reads as a plus.
+    {0x20, 0xA8, 0x70, 0xF8, 0x70, 0xA8, 0x20}, // *
+    // '#' -- two verticals crossed by two horizontals, full cell width.
+    {0x50, 0x50, 0xF8, 0x50, 0xF8, 0x50, 0x50}, // #
+    // '+' -- centred, deliberately shorter than '#' so the two don't confuse.
+    {0x00, 0x20, 0x20, 0xF8, 0x20, 0x20, 0x00}, // +
 };
 
-static void draw_digit(int x, int y, int digit, int scale)
+// Map a dialable character to its row in s_dial_font, or -1 if we can't draw
+// it. Keep this in sync with s_keymap in tca8418_keypad.cpp: anything the
+// keypad can put in the dial buffer must be drawable here, or the user types
+// a character and sees nothing appear.
+static int glyph_index(char c)
 {
-    if (digit < 0 || digit > 9) return;
+    if (c >= '0' && c <= '9') return c - '0';
+    switch (c) {
+        case '*': return 10;
+        case '#': return 11;
+        case '+': return 12;
+        default:  return -1;
+    }
+}
+
+static void draw_glyph(int x, int y, int idx, int scale)
+{
+    if (idx < 0 || idx >= GLYPH_COUNT) return;
     for (int row = 0; row < 7; row++) {
-        uint8_t bits = s_digit_font[digit][row];
+        uint8_t bits = s_dial_font[idx][row];
         for (int col = 0; col < 5; col++) {
             if (bits & (0x80 >> col)) {
                 fill_rect(x + col * scale, y + row * scale, scale, scale, true);
@@ -92,16 +122,14 @@ static void draw_digit(int x, int y, int digit, int scale)
     }
 }
 
-// Draws digits only; any other character (including '+', spaces, letters
-// in a caller name) is rendered as a blank gap. Good enough for phone
-// numbers/extensions, which is what this field actually carries.
+// Draws 0-9 * # +; anything else (letters in a caller name, spaces) still
+// renders as a blank gap, which is correct -- the gap preserves position so a
+// partially-drawable string doesn't silently shift left.
 static void draw_digit_string(int x, int y, const char *s, int scale, int spacing)
 {
     int cx = x;
     for (const char *p = s; p && *p; p++) {
-        if (*p >= '0' && *p <= '9') {
-            draw_digit(cx, y, *p - '0', scale);
-        }
+        draw_glyph(cx, y, glyph_index(*p), scale);
         cx += 5 * scale + spacing;
         if (cx > EPD_WIDTH - 5 * scale) break; // clip to panel width
     }

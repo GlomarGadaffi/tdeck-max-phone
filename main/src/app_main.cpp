@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
@@ -171,6 +172,53 @@ static void ui_render(const char *caller, const char *status, bool active)
 //
 // The e-paper holds its image with no power at all, so the final screen stays
 // readable while the board is off. The panel keeps telling the truth.
+// ── Dial buffer + last-number redial ────────────────────────────────────────
+
+// Characters the dial buffer accepts. Must stay in sync with s_keymap
+// (tca8418_keypad.cpp) on the input side and glyph_index() (epaper_display.cpp)
+// on the output side -- a character the keypad can produce but the display
+// can't draw looks like a dropped keypress.
+static bool is_dial_char(char c)
+{
+    return (c >= '0' && c <= '9') || c == '*' || c == '#' || c == '+';
+}
+
+// A dial buffer longer than this is a mistake, not a number. Further presses
+// are ignored rather than beeped (there is no beep path) -- the buffer simply
+// stops growing, which is visible on the panel.
+#define DIAL_BUFFER_MAX 20
+
+// Last dialled number, persisted so ENT-from-idle survives a reboot. This is
+// what replaced the POC_TEST_DIAL bench hack: it keeps the muscle memory that
+// ENT from the idle screen places a call, but the target is now something the
+// user actually dialled rather than a compile-time constant.
+static const char *NVS_NS_PHONE   = "phone";
+static const char *NVS_KEY_LASTNO = "lastno";
+
+static std::string load_last_dialled(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_PHONE, NVS_READONLY, &h) != ESP_OK) return {};
+
+    char   buf[DIAL_BUFFER_MAX + 1] = {0};
+    size_t len = sizeof(buf);
+    esp_err_t err = nvs_get_str(h, NVS_KEY_LASTNO, buf, &len);
+    nvs_close(h);
+
+    if (err != ESP_OK) return {};
+    return std::string(buf);
+}
+
+static void save_last_dialled(const std::string &number)
+{
+    if (number.empty() || number.size() > DIAL_BUFFER_MAX) return;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_PHONE, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_str(h, NVS_KEY_LASTNO, number.c_str()) == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+}
+
 static void power_off(TincanUac &uac)
 {
     ESP_LOGW(TAG, "powering off");
@@ -513,15 +561,37 @@ extern "C" void app_main(void)
 
     UiState ui = UiState::Idle;
     std::string dialBuffer;
+    std::string lastDialled = load_last_dialled();
     ui_render(POC_SIP_EXT_SELF, registered ? "Idle" : "Register failed", false);
     ESP_LOGI(TAG, "System operational (registered=%d).", registered);
+    if (!lastDialled.empty()) {
+        ESP_LOGI(TAG, "ENT from idle will redial %s", lastDialled.c_str());
+    }
 
-    // NOTE: the real T-Deck MAX keypad is a 4x10 QWERTY matrix, not a
-    // numeric keypad -- only '0', DEL, and ENT are mapped today (#17).
-    // Digits 1-9 live behind an ALT/SYM shift layer whose mapping isn't
-    // confirmed, so dialling out is limited until that's derived on
-    // hardware. Answer/reject/hangup need no digit entry and are fully
-    // wired below.
+    // Places a call and drives the UI through it. Shared by redial-from-idle
+    // and dial-from-buffer so the two can't drift apart -- they had already
+    // grown slightly different logging and teardown before this was factored.
+    auto placeCallTo = [&](const std::string &target) {
+        ui_render(target.c_str(), "Calling...", false);
+        ESP_LOGI(TAG, "dialing %s", target.c_str());
+
+        if (uac.placeCall(target)) {
+            // Only remember numbers that actually connected. Persisting a
+            // failed attempt would make redial replay a typo.
+            if (target != lastDialled) {
+                lastDialled = target;
+                save_last_dialled(target);
+            }
+            ui = UiState::InCall;
+            audio_hardware_set_amp(true);
+            ui_render(target.c_str(), "In Call", true);
+        } else {
+            ui = UiState::Idle;
+            ui_render(target.c_str(), "Call Failed", false);
+            ESP_LOGW(TAG, "call to %s failed", target.c_str());
+        }
+    };
+
     for (;;) {
         uac.poll();
 
@@ -543,41 +613,28 @@ extern "C" void app_main(void)
         switch (ui) {
         case UiState::Idle:
             // DEL from Idle asks to power down. Two single taps rather than a
-            // long press: hold detection depends on the TCA8418 press/release
-            // polarity, and tca8418_keypad.cpp:180 reads press as (raw & 0x80)
-            // while the Adafruit driver in the vendor tree documents the
-            // opposite -- unverified, and the same inversion was a real bug in
-            // peri_keypad.cpp. A confirm step also stops a stray DEL from
-            // switching the phone off mid-shift. See docs/UI_DESIGN.md.
+            // long press: long-press needs both key edges, and
+            // tca8418_get_key() discards the release edge, so a hold is not
+            // representable against today's API (UI_DESIGN 9.2). A confirm
+            // step also stops a stray DEL from switching the phone off
+            // mid-shift.
             if (key == '\b') {
                 ui = UiState::ConfirmOff;
                 ui_render("Power off?", "ENT=yes DEL=no", false);
                 break;
             }
-#ifdef POC_TEST_DIAL
-            // Bench workaround for #17 -- ENT from Idle dials the configured
-            // test target directly, since '*' and 1-9 can't be typed yet.
+            // ENT on an empty buffer redials the last number that connected.
+            // Inert when there is nothing stored -- a phone that dials
+            // something unpredictable on an idle keypress is worse than one
+            // that does nothing.
             if (key == '\r') {
-                const char *target = POC_TEST_DIAL;
-                ESP_LOGI(TAG, "test-dial -> %s", target);
-                ui_render(target, "Calling...", false);
-                if (uac.placeCall(target)) {
-                    ui = UiState::InCall;
-                    audio_hardware_set_amp(true);
-                    ui_render(target, "In Call", true);
-                    ESP_LOGI(TAG, "call up -- speak now, echo should return your voice");
-                } else {
-                    ui_render(target, "Call Failed", false);
-                    ESP_LOGW(TAG, "test-dial to %s failed", target);
-                }
+                if (!lastDialled.empty()) placeCallTo(lastDialled);
+                else ESP_LOGI(TAG, "ENT from idle: nothing to redial yet");
                 break;
             }
-            if (std::isdigit((unsigned char)key)) {
-#else
-            if (key == '\r' || std::isdigit((unsigned char)key)) {
-#endif
+            if (is_dial_char(key)) {
                 dialBuffer.clear();
-                if (std::isdigit((unsigned char)key)) dialBuffer += key;
+                dialBuffer += key;
                 ui = UiState::Dialing;
                 ui_render(dialBuffer.c_str(), "Dialing", false);
             }
@@ -588,21 +645,18 @@ extern "C" void app_main(void)
                 if (!dialBuffer.empty()) dialBuffer.pop_back();
                 else ui = UiState::Idle;
                 ui_render(dialBuffer.c_str(), ui == UiState::Idle ? "Idle" : "Dialing", false);
-            } else if (std::isdigit((unsigned char)key)) {
-                dialBuffer += key;
-                ui_render(dialBuffer.c_str(), "Dialing", false);
-            } else if (key == '\r' && !dialBuffer.empty()) {
-                ui_render(dialBuffer.c_str(), "Calling...", false);
-                ESP_LOGI(TAG, "dialing %s", dialBuffer.c_str());
-                if (uac.placeCall(dialBuffer)) {
-                    ui = UiState::InCall;
-                    audio_hardware_set_amp(true);
-                    ui_render(dialBuffer.c_str(), "In Call", true);
-                } else {
-                    ui = UiState::Idle;
-                    ui_render(dialBuffer.c_str(), "Call Failed", false);
+            } else if (is_dial_char(key)) {
+                // Silently stop growing at the cap rather than wrapping or
+                // truncating on dial -- the user can see the number isn't
+                // getting longer.
+                if (dialBuffer.size() < DIAL_BUFFER_MAX) {
+                    dialBuffer += key;
+                    ui_render(dialBuffer.c_str(), "Dialing", false);
                 }
+            } else if (key == '\r' && !dialBuffer.empty()) {
+                std::string target = dialBuffer;
                 dialBuffer.clear();
+                placeCallTo(target);
             }
             break;
 

@@ -31,20 +31,33 @@ static const char *TAG = "ES8311_AUDIO";
 static i2s_chan_handle_t tx_chan = NULL;
 static i2s_chan_handle_t rx_chan = NULL;
 
+// Everything below except s_sample_rate is referenced only from the real
+// hardware paths (each is inside a `#else` of a CONFIG_TDECK_MAX_SIM_MODE
+// guard), so defining them unconditionally gave eight -Wunused-variable
+// warnings in the QEMU sim build. That quietly falsified the zero-warning
+// claim in docs/BENCH_TEST.md, since the sim config is only built when
+// someone explicitly asks for it.
+#if !CONFIG_TDECK_MAX_SIM_MODE
 static const audio_codec_data_if_t *s_data_if = NULL;
 static const audio_codec_ctrl_if_t *s_ctrl_if = NULL;
 static const audio_codec_gpio_if_t *s_gpio_if = NULL;
 static const audio_codec_if_t      *s_codec_if = NULL;
 static esp_codec_dev_handle_t       s_dev = NULL;
-static uint32_t                     s_sample_rate = 0;
 static bool                         s_pins_swapped = false;
+#endif
+
+// Reported by audio_hardware_sample_rate() on both paths, so it is not
+// guarded -- callers that synthesise audio must not assume POC_SAMPLE_RATE_HZ.
+static uint32_t                     s_sample_rate = 0;
 
 // The codec device is opened 2-channel, so wire traffic is interleaved
 // stereo while our SIP path is mono. Scratch buffers do the conversion
 // without allocating per frame.
 #define AUDIO_STEREO_SCRATCH 512
+#if !CONFIG_TDECK_MAX_SIM_MODE
 static int16_t s_stereo_rx[AUDIO_STEREO_SCRATCH];
 static int16_t s_stereo_tx[AUDIO_STEREO_SCRATCH];
+#endif
 
 uint32_t audio_hardware_sample_rate(void) { return s_sample_rate; }
 

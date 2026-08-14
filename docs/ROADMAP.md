@@ -27,8 +27,10 @@ number it wasn't compiled with, and it rings silently.
 | ES8311 codec, gain staging, mic ducking | Working on hardware, tuned empirically |
 | Power rails, XL9555 bring-up, SY6970 power-off | Working on hardware |
 | E-paper render (full refresh, digits only) | Working on hardware |
-| Keypad | Initialises; only `0` / DEL / ENT mapped; **cannot dial** |
-| Inbound from a 3CX DN, far-end BYE | **Never exercised** |
+| Keypad dialpad (`0`-`9` `*` `#` `+`), NVS redial | Working on hardware |
+| Inbound from a desktop softphone | Working on hardware |
+| Inbound from a **3CX DN** (RING-ALL fork) | **Never exercised** |
+| Ringer / ringback | **Does not exist — the phone rings silently** |
 
 ---
 
@@ -49,11 +51,11 @@ This is the critical path, in dependency order. The design work is already done 
    bug in LilyGO's `peri_keypad.cpp` that made the wrong answer look well-evidenced.
    **The keypad work is unblocked.**
 
-3. **[#17](../../issues/17) — Digit entry.** No longer a research problem: UI_DESIGN §0.2
-   recovers a full telephone keypad from two LilyGO reference files that agree — `1`-`9` on
-   `W E R / S D F / Z X C`, `0` on its own key, `*` and `#` on `A` and `Q`. The column decode
-   and the `0` key are both now confirmed (U1, U6). Implement the per-state map and the dial
-   buffer, then delete `POC_TEST_DIAL`. **This is the next thing to build.**
+3. ~~**[#17](../../issues/17) — Digit entry.**~~ **Done 2026-08-13.** The dialpad is bound as
+   the default layer (`1`-`9` on `W E R / S D F / Z X C`, `0` on its own key, `*`/`#` on `A`/`Q`,
+   `+` on `O`); `*` `#` `+` glyphs added to the display font; `POC_TEST_DIAL` deleted and
+   replaced by NVS-persisted last-number redial on ENT-from-idle. Verified on hardware: `*777`
+   and `9*777` both typed and connected, and redial survives a reboot.
 
 4. **P2 — Event-based keypad API.** `tca8418_get_key()` returns a `char` and drops release
    events, so long-press and hold-to-clear are unrepresentable. Needs a scancode + edge API.

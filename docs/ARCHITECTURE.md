@@ -41,7 +41,7 @@ Three tasks (`main/src/app_main.cpp`):
 |---|---|---|---|
 | `main_task` | any | 1 | SIP control (`uac.poll()`), registration refresh, keypad, UI state machine |
 | `audio` | 1 (pinned) | 6 | RTP ↔ I2S pump, paced **solely** by the blocking `i2s_channel_read()` |
-| `epaper` | any | 3 | The 2-3 s panel refresh, fed by a depth-1 `xQueueOverwrite` |
+| `epaper` | any | 3 | The **3.3 s** panel refresh (measured 3277 ms), fed by a depth-1 `xQueueOverwrite` |
 
 Audio and display each originally ran inline on the main loop. That was
 wrong in both cases and the symptoms were distinct:
@@ -50,7 +50,7 @@ wrong in both cases and the symptoms were distinct:
   on top of an already-blocking I2S read gave ~20 packets/sec outbound
   instead of 50, while the inbound socket backlog grew ~30 packets/sec --
   so one-way latency climbed monotonically for the whole call.
-- Display: a synchronous 2-3 s refresh on every state change *and every
+- Display: a synchronous 3.3 s refresh on every state change *and every
   dialled digit* blacked out audio for seconds at a time.
 
 The audio task therefore adds **no** delay of its own -- the blocking I2S
@@ -118,7 +118,8 @@ pre-answer backlog isn't played out as latency that never recovers.
 - No direct 3CX integration on this device (see above) -- `TDeckMaxAudioAnchor` is excluded from the build, kept for reference.
 - No jitter buffer / RTP reordering / packet-loss concealment (see §3).
 - No acoustic echo cancellation -- mic ducking only (see §3).
-- Keypad digits 1-9 are unmapped, so `ENT` from idle fires the hardcoded `POC_TEST_DIAL` target rather than opening a dialler (#17). The map itself is now known -- `UI_DESIGN.md` §0.2 recovers it from LilyGO's own reference firmware -- but implementing it is blocked on the press/release polarity fix (#35), and the row/column decode remains unverified on hardware.
+- Full alpha entry. The keypad binds the dialpad only (`0`-`9` `*` `#` `+`, as the default layer -- see `UI_DESIGN.md` §0.2/§3.3); `ALT` and `SYM` are reserved and inert. Nothing downstream consumes letters, since `placeCall()` builds `sip:<ext>@server` and drawbridge extensions are numeric.
+- Long-press and hold-to-clear. `tca8418_get_key()` returns a `char` and discards the release edge, so no gesture needing both edges is representable (`UI_DESIGN.md` §9.2). Hence power-off is two taps and a confirm rather than a hold.
 - Full alphabet font, real status icons, and e-paper partial refresh are deferred UI polish (#16). The phone also rings **silently**: no ringer or ringback tone is generated.
 - No SIP authentication (#28). There is no `Authorization`/`WWW-Authenticate` handling anywhere in `main/`, and `registerExt()` treats any 4xx (including a `401 Unauthorized` challenge) as a flat rejection. This works only because drawbridge's registrar is **open by default**; pointing this firmware at drawbridge's secure/digest mode, or at any conventional PBX, will fail to register rather than retry with credentials.
 - No DTMF (RFC 2833 / `telephone-event`) -- inbound SDP advertising payload 101 is parsed but not acted on, so in-call menu navigation on the far end won't work.

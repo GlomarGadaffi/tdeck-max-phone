@@ -82,8 +82,8 @@ What has actually been run on a real board. Session logs and serial captures are
 | :--- | :--- | :--- |
 | 0 | Boot log + I2C scan | ✅ 7 devices responding; BQ25896/BHI260AP absences explained |
 | 1 | Flash and register | ✅ `registered as 1002` |
-| 1a | `*777` local echo, two-way audio | ✅ mic peak 1321 / rms 335, 0/100 silent frames |
-| 2 | Inbound from a desktop softphone | ⬜ not run |
+| 1a | `777` local echo, two-way audio | ✅ mic peak 1321 / rms 335, 0/100 silent frames |
+| 2 | Inbound from a desktop softphone | ✅ operator-confirmed 2026-08-13 |
 | 3 | Outbound `9<number>` through 3CX | ✅ real mobile rang; two-way audio confirmed **both ends** |
 | 4 | Inbound from a 3CX DN (RING-ALL) | ⬜ not run |
 | 5 | Second call, no reboot | ✅ two consecutive calls in one boot, clean teardown |
@@ -93,8 +93,13 @@ What has actually been run on a real board. Session logs and serial captures are
 | 9 | UI responsiveness during a call | 🟡 e-paper renders mid-call without audio dropout |
 | 10 | Long-idle re-REGISTER | ⬜ not run |
 
-Hangup has only been driven from the **local** end. A BYE arriving *from* the far end is
-untested — the handling was fixed in `13e98ca` but never exercised on hardware.
+**Keypad dialling: ✅ 2026-08-13.** `*777` and `9*777` both typed on the keypad and connected
+(`INVITE` → `180 Ringing` → `200 OK` → ACK). The `9*777` case matters — a star code through the
+3CX anchor was physically untypeable before the dialpad landed. Last-number redial persists
+across a reboot (NVS), confirmed on hardware.
+
+**Measured:** full e-paper refresh **3277 ms** (spread 3274–3277), which is slower than the
+2–3 s previously claimed. See `UI_DESIGN.md` §5.7.
 
 ## Procedure
 
@@ -110,17 +115,18 @@ Expected scan on a good board: `0x18` ES8311, `0x20` XL9555, `0x34` TCA8418,
 plus touch/IMU/haptics/charger depending on board revision.
 
 1. **Flash and register.** Flash the device, watch the serial log for `registered as <ext>`, and confirm the extension appears in drawbridge's Extensions list (open registrar -- no pre-created extension needed).
-1a. **Local echo first.** Set `POC_TEST_DIAL` to `"777"` (drawbridge's own SDP loopback echo, no 3CX leg) and press ENT from the idle screen. This isolates mic/speaker/RTP from the trunk, so run it before anything involving 3CX. Expect to hear your own voice back. **It will howl** -- see "If the echo test howls" below; that is the echo service doing its job, not a fault. If it is silent instead, stop here and read "If audio is silent" -- do not proceed to a real call.
+1a. **Local echo first.** Type `777` on the keypad (drawbridge's own SDP loopback echo, no 3CX leg) and press ENT. This isolates mic/speaker/RTP from the trunk, so run it before anything involving 3CX. Expect to hear your own voice back. **It will howl** -- see "If the echo test howls" below; that is the echo service doing its job, not a fault. If it is silent instead, stop here and read "If audio is silent" -- do not proceed to a real call.
 2. **Inbound call.** Call this device's extension from the desktop softphone. Expect: e-paper shows the caller's extension and "Incoming Call". Press ENT on the keypad to answer -- expect two-way audio and the screen to show "In Call". Press ENT or DEL to hang up -- expect BYE round-trip and the screen to return to "Idle" **without a reset** (this PoC explicitly does not inherit tincan's single-call-per-boot limitation). Hang up from the **softphone** side too, on a second attempt: only the local-BYE direction has ever been driven on hardware.
-3. **Outbound call through 3CX.** Dial `9<number>` and press ENT. **Known limitation:** the keypad only has `0`, DEL, and ENT mapped (#17), so a real phone number cannot be typed yet -- `ENT` from idle dials the hardcoded `POC_TEST_DIAL` target instead. Put the number in the **gitignored** `poc_secrets.h`, not the tracked `poc_config.h`. Expect drawbridge's anchor-call activity to fire and the call to connect through 3CX with two-way audio.
-   *The map is no longer unknown:* `UI_DESIGN.md` §0.2 recovers a full telephone keypad from LilyGO's own reference firmware. Implementing it is gated on the press/release polarity fix (#35). `CONFIG_TDECK_MAX_KEYPAD_DEBUG=y` logs the raw event byte / `key_num` / decoded row+col per press -- use it to settle the polarity and to confirm the column decode (`col = (COLS-1) - (key_num % COLS)`), which is inherited from LilyGO's example and still unverified.
+3. **Outbound call through 3CX.** Type `9<number>` on the keypad and press ENT. Expect drawbridge's anchor-call activity to fire and the call to connect through 3CX with two-way audio.
+   *The dialpad is the default layer, no modifier:* `1`-`9` sit on `W E R / S D F / Z X C`, `0` has its own key, `*` and `#` are on `A` and `Q`, `+` is on `O`. `ALT`/`SYM` are reserved and inert. `CONFIG_TDECK_MAX_KEYPAD_DEBUG=y` (or the `sdkconfig.bench` fragment) logs the raw event byte / `bit7` / `key_num` / decoded row+col per press if you need to check a key.
+   *Note the panel lags.* A full refresh is 3.3 s and the render queue is depth-1, so the number on screen trails what you typed and intermediate frames are dropped. The buffer is correct even when the display hasn't caught up -- trust the serial `dialing <target>` line over the glass.
 4. **Inbound call from 3CX.** Have someone call the 3CX DN drawbridge is configured to anchor. Expect this device to ring (RING-ALL fork, first answer wins) alongside any other registered extension -- answerable from the keypad exactly like step 2.
 5. **Second call, no reboot.** Repeat step 2 or 3 a second time without power-cycling the device, to confirm no single-call-per-boot regression.
 6. **Busy handling.** While already in a call (from step 2 or 3), have a third party call this device. Expect a 486 Busy Here (`tincan_uac.cpp`'s `handleInboundInvite` early-reject branch) -- the caller should hear busy/rejection, not silence or a hang.
 7. **Race: dial-out vs. inbound.** While mid-dial (after pressing ENT in step 3, before it resolves), have someone call this device. **Expected failure, not a bug to chase during this bench test:** `placeCall()` blocks the loop and drains no other traffic while waiting, so this inbound call gets no SIP response at all until the outbound attempt resolves -- documented in `tincan_uac.hpp`. The caller's UAC will eventually time out. Confirming this behavior (rather than a crash or hang) is the point of this step.
 
 8. **Audio quality sanity.** During any established call, confirm the far end doesn't sound choppy and that one-way delay stays constant rather than growing over the call's duration. Both were real defects (#22) caused by the audio pump sharing the control loop; it now runs on its own task paced solely by the blocking I2S read, at 50 frames/sec. If choppiness or creeping latency reappears, suspect the pump being starved rather than the network.
-9. **UI responsiveness during a call.** Press keys while in a call. The e-paper refresh (2-3 s of panel time) now runs on its own task behind a depth-1 queue (#23), so it must not interrupt audio. Audio dropping out for seconds on a screen change is a regression.
+9. **UI responsiveness during a call.** Press keys while in a call. The e-paper refresh (3.3 s of panel time, measured) runs on its own task behind a depth-1 queue (#23), so it must not interrupt audio. Audio dropping out for seconds on a screen change is a regression.
 10. **Long-idle registration.** Leave the phone idle for longer than `POC_SIP_REG_EXPIRES` (default 3600 s) and then call it. It must still ring: `maintainRegistration()` re-REGISTERs at Expires/2 (#24). Before that fix the phone went silently unreachable after an hour with no log and no UI change — worth confirming explicitly, since the failure is invisible.
 
 ## What "done" looks like
@@ -133,11 +139,10 @@ device. Step 7 is a known, documented limitation (#18), not a blocker; step
 10 is a slow test worth running once unattended rather than blocking the
 bench session.
 
-**As of 2026-08-13 the outbound half of that claim is proven** (steps 0, 1,
-1a, 3, 5) and the inbound half is not (steps 2 and 4 have never been run).
-Step 3 no longer needs a source edit to `app_main.cpp` -- `POC_TEST_DIAL` in
-`poc_secrets.h` reaches it -- but it is still not *dialling*, which is what
-#17 tracks.
+**As of 2026-08-13 that claim holds**, with one gap: steps 0, 1, 1a, 2, 3 and 5
+all pass, including keypad-dialled outbound calls through 3CX and an inbound
+call from a desktop softphone. Step 4 -- inbound from a 3CX DN via the RING-ALL
+fork -- is the remaining unproven path, along with the slow tests (6, 7, 10).
 
 ## Troubleshooting
 

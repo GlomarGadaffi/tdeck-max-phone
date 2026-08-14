@@ -351,12 +351,9 @@ static int32_t audio_pass(const char *label)
     int64_t t0 = esp_timer_get_time();
     for (int f = 0; f < frames; f++) {
         for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
-            // ~-24 dBFS. Was 8000 (-12 dBFS), which is roughly where PSTN
-            // voice sits *before* POC_RX_GAIN_DB lifts it -- so once the DAC
-            // ceiling went up, the beep was painful while calls were still
-            // quiet. The beep is a diagnostic, not a ringtone; it only has to
-            // be clearly audible.
-            tone[i] = (int16_t)(2000.0f * sinf(phase));
+            // Amplitude is POC_SELFTEST_TONE_AMPL -- see poc_config.h for why
+            // it is a knob and not a literal. It has been turned down twice.
+            tone[i] = (int16_t)(POC_SELFTEST_TONE_AMPL * sinf(phase));
             phase += step;
             if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
         }

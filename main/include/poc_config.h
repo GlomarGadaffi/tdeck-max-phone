@@ -149,6 +149,20 @@
 #define POC_RX_GAIN_DB       12.0f            // 0 disables
 #endif
 
+// Boot self-test tone amplitude (CONFIG_TDECK_MAX_AUDIO_SELFTEST only).
+//
+// This is the startup beep. It is a *diagnostic* -- it only has to prove the
+// DAC/I2S/amp path is alive, so it only has to be clearly audible, not loud.
+// It has been turned down twice now for the same reason: it is synthesised
+// locally at full digital scale while PSTN voice arrives ~18 dB lower, so
+// every time POC_SPK_MAX_DB goes up the beep gets painful before calls get
+// comfortable. Hence a knob rather than another magic number in app_main.
+//
+// Peak amplitude out of 32767:  2000 ~= -24 dBFS,  500 ~= -36 dBFS.
+#ifndef POC_SELFTEST_TONE_AMPL
+#define POC_SELFTEST_TONE_AMPL 500.0f
+#endif
+
 // ── Half-duplex ducking (poor man's echo control) ────────────────────────
 //
 // Speaker and mic are centimetres apart on the same PCB with no acoustic

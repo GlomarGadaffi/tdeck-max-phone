@@ -183,6 +183,13 @@ static void epd_power_off_and_sleep(void)
 // update"), and deep-sleeps afterward to protect panel lifespan.
 static void epd_full_refresh(const uint8_t *new_fb)
 {
+    // Timed because the whole partial-refresh design (UI_DESIGN 5.5/5.6 --
+    // the ghost budget, the coalescing window, the no-live-timer verdict) is
+    // currently reasoning from an UNMEASURED baseline: the README's "2-3 s"
+    // is an estimate nobody in-tree ever checked (U7). This is the control
+    // number that the partial path gets compared against.
+    int64_t t_start = esp_timer_get_time();
+
     if (!epd_panel_init()) return;
 
     epd_write_cmd(EPD_CMD_OLD_DATA);
@@ -197,6 +204,8 @@ static void epd_full_refresh(const uint8_t *new_fb)
     epd_wait_busy();
 
     epd_power_off_and_sleep();
+
+    ESP_LOGI(TAG, "full refresh: %lld ms", (esp_timer_get_time() - t_start) / 1000);
 }
 #endif // !CONFIG_TDECK_MAX_SIM_MODE
 

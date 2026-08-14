@@ -42,21 +42,23 @@ This is the critical path, in dependency order. The design work is already done 
    pin correction, the XL9555 rail sequence, gain staging, the SIP retransmit fix and the
    power-off path — currently live only on the branch.
 
-2. **P1 — Keypad press/release polarity ([#35](../../issues/35)). Blocking.**
-   `tca8418_keypad.cpp` treats bit 7 as *press*; the Adafruit driver in the vendor tree and
-   LilyGO's own factory firmware both document it as *release*. Simple taps hide this, which
-   is why the phone appears to work today — but every hold and every modifier built on top
-   would fail, in exactly the way the factory firmware's shift layer failed. Five minutes on
-   the bench with `CONFIG_TDECK_MAX_KEYPAD_DEBUG=y` settles it. Nothing else in the UI plan
-   is safe to build until it is.
+2. ~~**P1 — Keypad press/release polarity (#35).**~~ **Done 2026-08-13 — there was no bug.**
+   Measured on hardware: bit 7 set means *press*, so the existing code was correct all along
+   and #35 is closed as invalid. Two vendor sources claim the opposite and are both wrong —
+   see the corrected [UI_DESIGN.md](UI_DESIGN.md) §9.1, which also documents the fall-through
+   bug in LilyGO's `peri_keypad.cpp` that made the wrong answer look well-evidenced.
+   **The keypad work is unblocked.**
 
-3. **P2 — Event-based keypad API.** `tca8418_get_key()` returns a `char` and drops release
-   events, so long-press and hold-to-clear are unrepresentable. Needs a scancode + edge API.
-
-4. **[#17](../../issues/17) — Digit entry.** No longer a research problem: UI_DESIGN §0.2
+3. **[#17](../../issues/17) — Digit entry.** No longer a research problem: UI_DESIGN §0.2
    recovers a full telephone keypad from two LilyGO reference files that agree — `1`-`9` on
-   `W E R / S D F / Z X C`, `0` on its own key, `*` and `#` on `A` and `Q`. Implement the
-   per-state map and the dial buffer, then delete `POC_TEST_DIAL`.
+   `W E R / S D F / Z X C`, `0` on its own key, `*` and `#` on `A` and `Q`. The column decode
+   and the `0` key are both now confirmed (U1, U6). Implement the per-state map and the dial
+   buffer, then delete `POC_TEST_DIAL`. **This is the next thing to build.**
+
+4. **P2 — Event-based keypad API.** `tca8418_get_key()` returns a `char` and drops release
+   events, so long-press and hold-to-clear are unrepresentable. Needs a scancode + edge API.
+   No longer urgent — it is a missing feature, not a latent defect, and digit entry does not
+   depend on it.
 
 5. **P3 / P6 — Fonts and a ringer ([#16](../../issues/16)).** An 8x16 ASCII font for status
    text, `*`/`#`/`+` added to the digit font, and ring/ringback tone generation. A phone that

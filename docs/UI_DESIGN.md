@@ -802,41 +802,50 @@ history of more than a handful of entries is the plausible one). Neither holds t
 
 None of the key map is implementable against today's APIs. In dependency order:
 
-### 9.1 P1 — Fix the press/release polarity **(blocking)**
+### 9.1 ~~P1 — Fix the press/release polarity~~ **— RESOLVED 2026-08-13: there was no bug**
 
-`tca8418_keypad.cpp:180` reads:
+> **This section was wrong.** It is kept, corrected, because the reasoning that produced the
+> wrong answer is a trap the next person will walk into as well — the vendor's own driver
+> documentation states the opposite of what the hardware does.
 
-```c
-bool pressed = (raw & 0x80) != 0;
-```
-
-The Adafruit TCA8418 driver in the vendor tree documents the opposite
-(`lib/Adafruit TCA8418/Adafruit_TCA8418.cpp:156-160`):
+**Measured on real hardware.** `CONFIG_TDECK_MAX_KEYPAD_DEBUG=y`, held one key for 4.58 s:
 
 ```
- *     key event 0x00        no event
- *               0x01..0x50  key  press
- *               0x81..0xD0  key  release
+key[1] t=29144ms raw=0x8a bit7=1 key_num=9 -> r0c0    <- press (first event of the hold)
+key[2] t=33728ms raw=0x0a bit7=0 key_num=9 -> r0c0    <- release, 4584 ms later
 ```
 
-i.e. **bit 7 set means release.** Note that LilyGO's own examples contradict each other —
-`examples/keypad/keypad.ino:86` uses `if (k & 0x80) PRESS`, the same as this repo, while
-`examples/factory/peri_keypad.cpp:8-14` uses press = 1..80. The factory file is the one
-that was **corrected against observed hardware behaviour** (it explains a real, reproduced
-symptom: a hold-shift layer that latched on permanently after one tap, precisely because
-press and release were swapped).
+The first event of a hold is the press by definition, and it carries **bit 7 set**. So
+`tca8418_keypad.cpp`'s `bool pressed = (raw & 0x80) != 0;` is **correct as written**, and
+issue #35 is closed as invalid. Do not flip it.
 
-Why this matters here and not before: with the polarity inverted, every key fires on
-*release* instead of press. For a simple tap that is invisible — which is why the phone
-appears to work today, and why "it works" is **not** evidence either way. But hold-`DEL`-
-to-clear, and any modifier added later, would be **guaranteed to fail in exactly the way
-the factory firmware failed**: the press and release edges arrive swapped, so a hold
-never registers as a hold and a held-modifier counter latches on and never clears.
+**Why this document got it wrong**, since the same argument will look convincing again:
 
-**Settle it in five minutes on the bench:** `CONFIG_TDECK_MAX_KEYPAD_DEBUG=y`, press and
-hold one key for two seconds, release. Two events are logged; the first is the press. Read
-its bit 7. Fix the constant to match, and add a comment citing the measurement so this
-never gets re-flipped.
+1. **The two vendor sources were not independent.** `examples/factory/peri_keypad.cpp:8-14`
+   documents press = `0x01..0x50` / release = `0x81..0xD0` — but its comment opens with
+   *"see Adafruit_TCA8418.cpp getEvent() docs"*. It is quoting
+   `lib/Adafruit TCA8418/Adafruit_TCA8418.cpp:156-158`, not corroborating it. That made the
+   evidence look 2-against-1 when it was 1-against-1 — and the lone dissenter,
+   `examples/keypad/keypad.ino:86`, was the only one citing the **primary** source
+   ("datasheet page 15 - Table 1"). It was right.
+2. **The historical tiebreaker was bogus.** This section argued the factory file must be
+   correct because its polarity explained a latched shift layer. It does not: the same file
+   has a **fall-through bug** at `peri_keypad.cpp:167-175`, where two sequential `if`s should
+   be `if`/`else if`. A release lands in the release branch (`k -= 129`), then falls into the
+   press branch and is decremented *again* (`k -= 1`) and relabelled `PRESS`. So every
+   release is reported as a press of the **adjacent key**, and no release ever reaches the
+   consumer as a release — which latches a held modifier under *either* polarity.
+
+   That bug also fully explains the "one press emits two characters" behaviour seen on
+   modified vendor images: pressing `Q` (index 9) emits a phantom at index 8 = `W`, `V`
+   (index 25) emits index 24 = `B`, and `P` (index 0) emits **no** phantom because index −1
+   fails the `1 <= k <= 35` guard. **This repo does not inherit it** — it masks bit 7 before
+   decoding, so press and release yield the same `key_num` and the `!pressed` filter drops
+   exactly one of each pair.
+
+**Consequence for this document:** nothing here is blocked. §9.2's event API is still needed
+for hold-`DEL` and long-press (the release edge is discarded at `tca8418_keypad.cpp:198`),
+but that is a missing *feature*, not a latent defect, and digit entry does not depend on it.
 
 ### 9.2 P2 — Event-based keypad API
 
@@ -901,12 +910,12 @@ Everything this design rests on that I could not confirm from source or a named 
 
 | # | Item | Status |
 | :-- | :-- | :-- |
-| U1 | Row/column decode, specifically the `col = 9 - (n % 10)` reversal | Inherited from LilyGO's example; already flagged in-repo. **Unverified.** |
-| U2 | Event bit 7 = release (not press) | Vendor's own two files disagree; the corrected one is backed by an observed symptom. **Unverified on this repo's hardware path — settle first (§9.1).** |
+| U1 | Row/column decode, specifically the `col = 9 - (n % 10)` reversal | **RESOLVED 2026-08-13 — correct.** Measured: `Q` → `key_num 9` → `r0c0`, `P` → `key_num 0` → `r0c9`. The controller numbers this matrix right-to-left (P=1 … Q=10), which the reversal exactly compensates. |
+| U2 | ~~Event bit 7 = release (not press)~~ | **RESOLVED 2026-08-13 — the opposite is true. Bit 7 set = PRESS**, so the existing code is correct and #35 is closed as invalid. Measured by holding one key 4.58 s: the first event carried `bit7=1`. See the corrected §9.1 for why two vendor sources say otherwise and are both wrong. |
 | U3 | Digit / `*` / `#` legends are physically printed on the keycaps | Inferred from the factory firmware's symbol map. **Cannot be verified from code — the user can check by looking at the keyboard.** |
 | U4 | Which of the two `UP` keys is physically left | **Unverified.** Decides which is vol-down. |
-| U5 | Whether `r3c0`–`r3c4` are physical keys | Mapped `NONE` by LilyGO. **Unverified; nothing is bound to them.** |
-| U6 | `r3c6` is the `0` key | Base map says `'0'`; all three factory text layers say `NONE`. **Unverified — and `0` matters.** |
+| U5 | Whether `r3c0`–`r3c4` are physical keys | **RESOLVED from vendor source — they are not.** See the `KEYPAD_PRESS_VAL_MAX` argument below. Nothing is bound to them. |
+| U6 | `r3c6` is the `0` key | **RESOLVED from vendor source — yes.** `peri_keypad.cpp`'s `KEYPAD_PRESS_VAL_MAX 35` admits key indices 0–34 and rejects 35–39. Under `col = 9 - (idx % 10)` the five rejected indices are exactly `r3c4`…`r3c0`, the five `NONE` positions — 40 matrix positions minus 5 dead = 35 real keys, which *is* the constant. Index 33 = `r3c6` falls inside the accepted range, so the vendor's working firmware does treat it as `0`. |
 | U7 | Full-refresh wall time (README claims 2–3 s) | **Unmeasured in-tree.** |
 | U8 | Partial-refresh wall time, and the real ghosting threshold on this unit | **Never run on this hardware.** All of §5.5–§5.6 is reasoning from an unmeasured baseline. |
 | U9 | Whether `0x90`'s X parameters are pixels or byte-columns | **Unresolved — and deliberately side-stepped** by using full-width bands only (§5.3). |

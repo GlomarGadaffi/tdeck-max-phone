@@ -39,7 +39,7 @@ Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incomi
 > **QEMU's ceiling is earlier than it looks.** Emulated time reaches ~754 ms at `phy_init`'s full-calibration fallback and then **stops advancing entirely** -- the emulator wedges there. It does not merely fail to associate. Measured by compiling the Wi-Fi timeout down to 2 s and waiting 200 s of wall clock: emulated time never moved and the timeout never fired. So **nothing downstream of Wi-Fi is reachable in QEMU at any timeout value** -- no registration, no SIP, no RTP, not even the Wi-Fi failure path. See [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
 >
 > **Known limitations** (tracked as GitHub issues, not silently omitted):
-> - **The keypad cannot dial.** Only `0`, DEL, and ENT are mapped, so `ENT` from idle fires the hardcoded `POC_TEST_DIAL` target rather than opening a dialler. The map itself is no longer a mystery — [docs/UI_DESIGN.md](docs/UI_DESIGN.md) §0.2 recovers a full telephone keypad from LilyGO's own reference firmware (`1`-`9` on `W E R / S D F / Z X C`) — but implementing it is blocked on a press/release polarity fix ([#35](../../issues/35)) and gated behind [#17](../../issues/17). Answering/rejecting/hanging up needs no digit entry.
+> - **The keypad cannot dial.** Only `0`, DEL, and ENT are mapped, so `ENT` from idle fires the hardcoded `POC_TEST_DIAL` target rather than opening a dialler ([#17](../../issues/17)). The map itself is no longer a mystery — [docs/UI_DESIGN.md](docs/UI_DESIGN.md) §0.2 recovers a full telephone keypad from LilyGO's own reference firmware (`1`-`9` on `W E R / S D F / Z X C`) — and as of 2026-08-13 the row/column decode and the press/release polarity are both confirmed on hardware, so this is now purely an implementation task. Answering/rejecting/hanging up needs no digit entry.
 > - **No acoustic echo cancellation.** Speaker and mic sit centimetres apart on one PCB, so at usable volume the far end hears itself. Mitigated by *ducking* the mic while the far end talks (`POC_DUCK_DB`, ~24 dB, 200 ms hangover) — a deliberate half-duplex compromise, not AEC. You cannot interrupt the far end while ducking is on; set `POC_DUCK_DB` to 0 for true full duplex plus the echo. The `*777` echo service will still howl by design.
 > - `TincanUac::placeCall()` blocks while dialing out (bounded, ~120 s worst case); a genuinely new inbound call arriving in that window gets no SIP response until it resolves ([#18](../../issues/18)).
 > - No SIP digest authentication ([#28](../../issues/28)) -- a `401` challenge is treated as a flat rejection, so this works only against drawbridge's open registrar.
@@ -186,10 +186,10 @@ Full bench-test procedure (what needs real hardware and why): [docs/BENCH_TEST.m
 ## Roadmap
 
 The telephony path is proven; **the UI is now the weak point.** The phone cannot dial a number
-it wasn't compiled with, and it rings silently. Next up, in dependency order: fix the keypad
-press/release polarity ([#35](../../issues/35)), then digit entry ([#17](../../issues/17)),
-then the fonts, partial refresh and ringer that make it usable as a phone
-([#16](../../issues/16)).
+it wasn't compiled with, and it rings silently. Next up, in dependency order: digit entry
+([#17](../../issues/17)) — now unblocked, since the keypad decode and press/release polarity
+were confirmed on hardware on 2026-08-13 — then the fonts, partial refresh and ringer that
+make it usable as a phone ([#16](../../issues/16)).
 
 Full plan, including what is deliberately out of scope: **[docs/ROADMAP.md](docs/ROADMAP.md)**.
 

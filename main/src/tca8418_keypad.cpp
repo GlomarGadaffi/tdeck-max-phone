@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -177,22 +178,62 @@ char tca8418_get_key(void)
     uint8_t raw = read_raw_event();
     if (raw == 0) return 0;
 
+    // bit 7 SET = PRESS. MEASURED on real hardware 2026-08-13 -- do NOT "fix"
+    // this to match the Adafruit driver's comment, which claims the opposite.
+    // Held one key for 4.58 s with CONFIG_TDECK_MAX_KEYPAD_DEBUG=y:
+    //
+    //   key[1] t=29144ms raw=0x8a bit7=1   <- press  (first event of the hold)
+    //   key[2] t=33728ms raw=0x0a bit7=0   <- release, 4584 ms later
+    //
+    // The first event of a hold is the press by definition, and it carries
+    // bit 7 set. Two vendor sources say otherwise and both are wrong for this
+    // board: `lib/Adafruit TCA8418/Adafruit_TCA8418.cpp:156-158` documents
+    // 0x01..0x50 as press / 0x81..0xD0 as release, and
+    // `examples/factory/peri_keypad.cpp:8-14` repeats that claim while citing
+    // it. `examples/keypad/keypad.ino:86` -- which cites "datasheet page 15 -
+    // Table 1" -- agrees with the measurement. Tracked and closed as invalid
+    // in #35; docs/UI_DESIGN.md U2 / 9.1 were wrong on this point.
     bool pressed = (raw & 0x80) != 0;
-    int key_num = (raw & 0x7F) - 1; // datasheet: 1-based, 0x80 = press bit
+
+    int key_num = (raw & 0x7F) - 1; // 1-based on the wire
     if (key_num < 0 || key_num >= KEYPAD_ROWS * KEYPAD_COLS) return 0;
 
-    // NOTE: this row/col decode is inherited from LilyGO's example and is
-    // NOT yet verified against physical hardware -- in particular the
-    // column reversal. Build with CONFIG_TDECK_MAX_KEYPAD_DEBUG=y to log
-    // raw key_num per press and derive the real map empirically (#17).
+    // Column reversal also MEASURED in the same session (U1): the controller
+    // numbers this matrix right-to-left, so Q is key_num 9 and P is key_num 0.
+    //
+    //   Q -> raw 0x8a -> key_num 9 -> r0c0    P -> raw 0x81 -> key_num 0 -> r0c9
+    //
+    // which is what the QWERTY map expects. Both vendor files use this same
+    // formula. Note press and release decode to the SAME key_num, so the
+    // `!pressed` filter below drops exactly one of each pair -- no key can be
+    // entered twice.
     int row = key_num / KEYPAD_COLS;
     int col = (KEYPAD_COLS - 1) - (key_num % KEYPAD_COLS);
 
 #if CONFIG_TDECK_MAX_KEYPAD_DEBUG
-    ESP_LOGI(TAG, "raw=0x%02x key_num=%d %s -> row=%d col=%d mapped='%c'(0x%02x)",
-             raw, key_num, pressed ? "PRESS" : "RELEASE", row, col,
+    // Deliberately NEUTRAL about what bit 7 means -- that is the thing under
+    // test (#35 / UI_DESIGN U2), so labelling the event PRESS or RELEASE here
+    // would just restate the assumption instead of measuring it. What settles
+    // it is the timestamp: hold ONE key for ~2 s and release it. Two events
+    // log, and the first one is the press by definition. Read its bit7.
+    //
+    // The bracketed reading at the end is what the CURRENT code believes, kept
+    // so you can see at a glance whether the code agrees with the measurement.
+    //
+    // Column decode (U1): press Q then P -- they must read r0c0 and r0c9. If
+    // they come out swapped, the `col = 9 - (key_num % 10)` reversal below is
+    // wrong. Also confirm r3c6 really is the '0' key (U6): the vendor's base
+    // map says '0' but all three of its text layers say NONE, and 0 matters.
+    static uint32_t s_evt_seq = 0;
+    ESP_LOGI(TAG,
+             "key[%3lu] t=%7lums raw=0x%02x bit7=%d key_num=%2d -> r%dc%d "
+             "map='%c'(0x%02x)  [code reads this as %s]",
+             (unsigned long)++s_evt_seq,
+             (unsigned long)(esp_timer_get_time() / 1000),
+             raw, (raw & 0x80) ? 1 : 0, key_num, row, col,
              s_keymap[row][col] ? s_keymap[row][col] : '.',
-             (unsigned)s_keymap[row][col]);
+             (unsigned)s_keymap[row][col],
+             pressed ? "PRESS" : "RELEASE");
 #endif
 
     if (!pressed) return 0; // only report presses, matching this function's existing contract

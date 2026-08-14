@@ -197,6 +197,34 @@ whatever slot mode you pass to `i2s_channel_init_std_mode()` is discarded.
 Two bench sessions went into toggling that line before anyone read the
 function. This is what the now-closed #27 was wrongly theorising about.
 
+### If an inbound call from a 3CX DN connects but the caller hears nothing
+
+Step 4 only. This was [#48](../../issues/48), fixed but **not yet bench-verified** —
+if it reappears, this is the shape of it.
+
+drawbridge's inbound ring-all forks a **delayed-offer INVITE**: no SDP at all,
+because its media bridge cannot advertise a port before it binds. It takes our
+offer from the 200 OK and sends its answer in the **ACK**. This firmware
+originally learned the far-end RTP endpoint only from the INVITE, so on that path
+it armed the audio task with an unset endpoint (`255.255.255.255:0`) — sending
+nothing while still receiving fine, because drawbridge learned *our* address from
+our 200 OK.
+
+Note this is invisible on steps 2 and 3: a desktop softphone puts SDP in its
+INVITE, so only drawbridge's anchor-inbound fork exercises the delayed-offer path.
+
+What the log should show on a healthy inbound anchor call:
+
+```
+<- INVITE from <caller> (...) [delayed offer -- media endpoint deferred to ACK]
+answered; awaiting SDP answer in the ACK before arming media
+<- ACK carried the SDP answer; media to 192.168.x.x:4xxxx
+```
+
+If the third line is instead `ACK with no usable SDP answer`, the endpoint never
+arrived and audio stays deliberately disarmed — check drawbridge's bridge came up
+for that call. Silence with **no** third line at all means the ACK never arrived.
+
 ### If the echo test howls
 
 Expected. `*777` is an echo service, so it deliberately closes the loop

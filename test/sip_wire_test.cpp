@@ -43,6 +43,24 @@ static std::string headerValue(std::string_view line)
     return std::string(line.substr(p));
 }
 
+// Mirrors the displayName() helper added to tincan_uac.cpp for #48.
+static std::string displayName(std::string_view header)
+{
+    size_t q1 = header.find('"');
+    if (q1 == std::string_view::npos) return {};
+    size_t q2 = header.find('"', q1 + 1);
+    if (q2 == std::string_view::npos || q2 == q1 + 1) return {};
+    return std::string(header.substr(q1 + 1, q2 - q1 - 1));
+}
+
+// Mirrors tincan_uac.cpp's ipFromConnection(): last token of "IN IP4 x.x.x.x".
+static std::string ipFromConnection(std::string_view conn)
+{
+    size_t sp = conn.rfind(' ');
+    return (sp == std::string_view::npos) ? std::string(conn)
+                                          : std::string(conn.substr(sp + 1));
+}
+
 // Counts non-overlapping occurrences of `needle` in `hay`.
 static int countOf(const std::string &hay, const std::string &needle)
 {
@@ -226,6 +244,85 @@ int main()
         // And demonstrate the old broken comparison would have failed.
         check(!(std::string(byeParsed.value()->getCallID()) == bare),
               "raw-vs-bare compare would NOT have matched (the old bug)");
+    }
+
+    // --- Delayed-offer inbound (#48) ------------------------------------
+    // drawbridge's inbound ring-all forks an INVITE with NO SDP -- it can't
+    // advertise a media-bridge port before the bridge binds -- takes our offer
+    // from the 200 OK, and puts its answer in the ACK. The firmware used to
+    // learn the RTP endpoint only from the INVITE, so on this path it armed
+    // the audio task with an unset endpoint and the far end heard silence.
+    //
+    // These assertions pin the sip_core behaviour that fix depends on. They
+    // are here rather than in a tincan_uac test because that file needs
+    // ESP-IDF headers; the parser invariants are what could silently regress.
+    std::cout << "\n[delayed offer] assertions:\n";
+
+    // Byte-shape of RequestsHandler::buildInboundInviteFork(): the PSTN caller
+    // is ONLY in the display name, and the From/To URI user is OUR OWN ext.
+    const char *kDelayedInvite =
+        "INVITE sip:1002@192.168.1.50:5060 SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKfeedface\r\n"
+        "From: \"3125551234\" <sip:1002@192.168.1.10:5060>;tag=inb99\r\n"
+        "To: <sip:1002@192.168.1.10>\r\n"
+        "Call-ID: inbound-anchor-1@192.168.1.10\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Max-Forwards: 70\r\n"
+        "Contact: <sip:1002@192.168.1.10:5060;transport=UDP>\r\n"
+        "Content-Length: 0\r\n\r\n";
+
+    sockaddr_in src5{};
+    SipMessageFactory f5;
+    auto dParsed = f5.createMessage(std::string(kDelayedInvite), src5);
+    check(dParsed.has_value(), "delayed-offer INVITE parses");
+    if (dParsed.has_value()) {
+        auto d = dParsed.value();
+        check(!d->hasSdp(), "delayed-offer INVITE reports hasSdp() == false");
+        // This is the whole bug: learnRemoteMedia() must return false here so
+        // answer() does NOT publish a media target it doesn't have yet.
+        check(std::string(d->getFromNumber()) == "1002",
+              "From URI user is our OWN ext (why caller ID needed a fallback)");
+        check(displayName(d->getFrom()) == "3125551234",
+              "display name carries the real PSTN caller");
+    }
+
+    // The ACK that actually carries the answer. The fix static_casts to
+    // SipSdpMessage after checking hasSdp(); that is only sound because the
+    // factory types by body content, not by method -- assert it for an ACK.
+    const std::string kAckWithSdp =
+        "ACK sip:1002@192.168.1.50:5060 SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKfeedface\r\n"
+        "From: \"3125551234\" <sip:1002@192.168.1.10:5060>;tag=inb99\r\n"
+        "To: <sip:1002@192.168.1.10>;tag=" + ourToTag + "\r\n"
+        "Call-ID: inbound-anchor-1@192.168.1.10\r\n"
+        "CSeq: 1 ACK\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: 129\r\n"
+        "\r\n"
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 192.168.1.10\r\n"
+        "s=drawbridge\r\n"
+        "c=IN IP4 192.168.1.77\r\n"
+        "t=0 0\r\n"
+        "m=audio 41234 RTP/AVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n";
+
+    sockaddr_in src6{};
+    SipMessageFactory f6;
+    auto aParsed = f6.createMessage(kAckWithSdp, src6);
+    check(aParsed.has_value(), "ACK carrying SDP parses");
+    if (aParsed.has_value()) {
+        auto a = aParsed.value();
+        check(a->hasSdp(), "ACK reports hasSdp() == true (factory types by body, not method)");
+        auto *asdp = dynamic_cast<SipSdpMessage *>(a.get());
+        check(asdp != nullptr, "ACK really IS a SipSdpMessage (the static_cast is sound)");
+        if (asdp) {
+            check(asdp->getRtpPort() == 41234, "ACK's SDP yields the far-end RTP port");
+            check(ipFromConnection(asdp->getConnectionInformation()) == "192.168.1.77",
+                  "ACK's c= line yields the far-end RTP IP");
+        }
+        check(headerValue(a->getCallID()) == "inbound-anchor-1@192.168.1.10",
+              "ACK Call-ID matches the dialog (handleInboundAck accepts it)");
     }
 
     std::cout << "\n=== " << (g_checks - g_failures) << "/" << g_checks

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstddef>
 
+class SipMessage;   // components/sip_core -- only needed by a private helper
+
 // SIP UAC/UAS for this phone. Registers as a plain LAN extension to a
 // drawbridge PBX instance, which owns all 3CX Call Control API integration
 // -- this class never talks to 3CX directly, and never needs to.
@@ -172,6 +174,12 @@ private:
     std::atomic<bool> _mediaActive{false};
     uint32_t _mediaIpBe = 0;
     uint16_t _mediaPortBe = 0;
+
+    // Parse an SDP body's RTP endpoint into _remoteRtpIp/_remoteRtpPort.
+    // Returns false when the message carries no usable offer/answer -- which
+    // is normal for a delayed-offer INVITE, where the endpoint only shows up
+    // in the ACK (#48). Callers must not publish media on a false return.
+    bool learnRemoteMedia(SipMessage *msg);
 
     void publishMediaTarget();   // fill POD fields, then arm _mediaActive
     void retireMediaTarget();    // disarm _mediaActive

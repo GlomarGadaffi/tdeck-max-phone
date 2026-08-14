@@ -67,6 +67,23 @@ static std::string headerValue(std::string_view line)
     return std::string(line.substr(p));
 }
 
+// The quoted display name out of a From/To header (`From: "Alice" <sip:...>`),
+// or empty if there isn't one.
+//
+// Needed because drawbridge's inbound anchor fork addresses each leg to the
+// target's OWN extension and carries the real PSTN caller only in the display
+// name (RequestsHandler::buildInboundInviteFork). getFromNumber() parses the
+// URI user part, so on that path it returns our own DN -- the incoming-call
+// screen would name us as the caller. See #48.
+static std::string displayName(std::string_view header)
+{
+    size_t q1 = header.find('"');
+    if (q1 == std::string_view::npos) return {};
+    size_t q2 = header.find('"', q1 + 1);
+    if (q2 == std::string_view::npos || q2 == q1 + 1) return {};
+    return std::string(header.substr(q1 + 1, q2 - q1 - 1));
+}
+
 // ── ctor/dtor ────────────────────────────────────────────────────────────--
 TincanUac::TincanUac() {}
 TincanUac::~TincanUac()
@@ -122,6 +139,29 @@ bool TincanUac::openRtpSocket()
         ESP_LOGE(TAG, "RTP bind() failed");
         return false;
     }
+    return true;
+}
+
+// Learn the far end's RTP endpoint from a message's SDP, if it has any.
+// Returns true only when a usable endpoint was found, so callers can tell
+// "no offer yet" apart from "offer parsed".
+//
+// That distinction is the whole of #48. An offer does not have to arrive in
+// the INVITE: drawbridge's inbound ring-all forks a DELAYED-OFFER INVITE with
+// no SDP at all (it can't advertise a bridge port before the bridge binds),
+// takes our offer from the 200 OK, and sends its answer in the ACK. Publishing
+// an unset endpoint there aims RTP at 255.255.255.255:0, which is silent in
+// the send direction only -- so the call looks established and the far end
+// hears nothing.
+bool TincanUac::learnRemoteMedia(SipMessage *msg)
+{
+    if (!msg->hasSdp()) return false;
+    auto *sdp = static_cast<SipSdpMessage *>(msg);
+    int port = sdp->getRtpPort();
+    std::string ip = ipFromConnection(sdp->getConnectionInformation());
+    if (port <= 0 || ip.empty()) return false;
+    _remoteRtpPort = port;
+    _remoteRtpIp = std::move(ip);
     return true;
 }
 
@@ -486,11 +526,7 @@ bool TincanUac::placeCall(const std::string &calleeExt)
         if (code == 100 || code == 180 || code == 183) continue;
         if (code == 200) {
             _remoteTag = extractParam(msg->getTo(), ";tag=");
-            if (msg->hasSdp()) {
-                auto *sdp = static_cast<SipSdpMessage *>(msg.get());
-                _remoteRtpPort = sdp->getRtpPort();
-                _remoteRtpIp = ipFromConnection(sdp->getConnectionInformation());
-            }
+            learnRemoteMedia(msg.get());
             sendToServer(buildAck());
             _rtpSeq = (uint16_t)esp_random();
             _rtpTs = esp_random();
@@ -541,17 +577,25 @@ void TincanUac::handleInboundInvite(const std::string &raw)
     _inTo = std::string(msg->getTo());
     _inCallId = std::string(msg->getCallID());
     _inCseqInvite = std::string(msg->getCSeq());
-    _peerExt = std::string(msg->getFromNumber());
     _ourToTag = IDGen::GenerateID(8);
 
-    if (msg->hasSdp()) {
-        auto *sdp = static_cast<SipSdpMessage *>(msg.get());
-        _remoteRtpPort = sdp->getRtpPort();
-        _remoteRtpIp = ipFromConnection(sdp->getConnectionInformation());
-    }
+    // Prefer the From display name, fall back to the URI user part. On
+    // drawbridge's inbound anchor fork the URI user is our own extension and
+    // only the display name holds the PSTN caller (#48); on a direct
+    // extension-to-extension INVITE there is usually no display name and the
+    // URI user is the right answer. Taking the display name first is correct
+    // for both.
+    _peerExt = displayName(_inFrom);
+    if (_peerExt.empty()) _peerExt = std::string(msg->getFromNumber());
+
+    // May legitimately find nothing: a delayed-offer INVITE carries no SDP,
+    // and the endpoint then arrives in the ACK. handleInboundAck() picks it
+    // up and publishes; answer() below deliberately does not.
+    learnRemoteMedia(msg.get());
 
     _state = State::Ringing;
-    ESP_LOGI(TAG, "<- INVITE from %s (caller %s)", _peerExt.c_str(), _inFrom.c_str());
+    ESP_LOGI(TAG, "<- INVITE from %s (caller %s)%s", _peerExt.c_str(), _inFrom.c_str(),
+             _remoteRtpPort > 0 ? "" : " [delayed offer -- media endpoint deferred to ACK]");
     sendToServer(buildInviteResponse(180, "Ringing", false));
 }
 
@@ -681,6 +725,26 @@ void TincanUac::handleInboundAck(const std::string &raw)
 
     _awaitingAck = false;
     _pendingOk.clear();
+
+    // Delayed offer (#48): we answered an SDP-less INVITE with our own offer,
+    // so THIS ACK carries the far end's answer and is the first time the media
+    // endpoint exists. Publish it here rather than in answer(). Ordering is
+    // safe -- the audio task is still disarmed, so this is the same
+    // fill-then-arm sequence publishMediaTarget() documents.
+    if (!_mediaActive.load(std::memory_order_acquire) && _state == State::InCall) {
+        if (learnRemoteMedia(parsed.value().get())) {
+            publishMediaTarget();
+            ESP_LOGI(TAG, "<- ACK carried the SDP answer; media to %s:%d",
+                     _remoteRtpIp.c_str(), _remoteRtpPort);
+        } else {
+            // Nothing to send RTP to. Audio stays disarmed rather than
+            // broadcasting to 255.255.255.255:0, and the log says why.
+            ESP_LOGE(TAG, "<- ACK with no usable SDP answer -- no media endpoint, "
+                          "call will be receive-only");
+        }
+        return;
+    }
+
     ESP_LOGI(TAG, "<- ACK (call fully established)");
 }
 
@@ -740,9 +804,18 @@ bool TincanUac::answer()
     _rtpSeq = (uint16_t)esp_random();
     _rtpTs = esp_random();
     _rtpSsrc = esp_random();
-    publishMediaTarget();   // arm the audio task (see hpp field notes)
+
+    // Only arm the audio task if the offer actually named an endpoint. On a
+    // delayed-offer INVITE it hasn't yet -- the answer is in the ACK, and
+    // handleInboundAck() publishes there. Publishing an unset endpoint here is
+    // what made drawbridge's inbound ring-all one-way (#48).
     _state = State::InCall;
-    ESP_LOGI(TAG, "answered; media to %s:%d", _remoteRtpIp.c_str(), _remoteRtpPort);
+    if (_remoteRtpPort > 0 && !_remoteRtpIp.empty()) {
+        publishMediaTarget();   // arm the audio task (see hpp field notes)
+        ESP_LOGI(TAG, "answered; media to %s:%d", _remoteRtpIp.c_str(), _remoteRtpPort);
+    } else {
+        ESP_LOGI(TAG, "answered; awaiting SDP answer in the ACK before arming media");
+    }
     return true;
 }
 
@@ -790,6 +863,11 @@ void TincanUac::hangup()
 void TincanUac::sendAudioFrame(const int16_t *pcm, size_t samples)
 {
     if (!_mediaActive.load(std::memory_order_acquire) || samples == 0) return;
+    // Backstop: an unset endpoint resolves to 255.255.255.255:0, which floods
+    // the LAN broadcast address instead of failing loudly. Nothing should arm
+    // media without an endpoint any more (#48) -- this makes a regression
+    // silent-and-local rather than silent-and-on-the-wire.
+    if (_mediaPortBe == 0 || _mediaIpBe == 0 || _mediaIpBe == 0xFFFFFFFFu) return;
     uint8_t pkt[RTP_HEADER_LEN + POC_FRAME_SAMPLES];
     if (samples > POC_FRAME_SAMPLES) samples = POC_FRAME_SAMPLES;
 

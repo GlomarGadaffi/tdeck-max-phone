@@ -56,6 +56,13 @@
 #ifndef POC_SIP_REG_EXPIRES
 #define POC_SIP_REG_EXPIRES  3600
 #endif
+// Digest secret for drawbridge's Learn/Secure registrar modes (SSH TUI:
+// SECURITY -> Devices generates one per extension; the plaintext is shown
+// once). Empty is fine against an Open registrar: it is only ever sent in
+// answer to a 401/407 challenge. Put the real value in poc_secrets.h.
+#ifndef POC_SIP_SECRET
+#define POC_SIP_SECRET       ""
+#endif
 
 // POC_TEST_DIAL is GONE (#17 landed). It was a bench workaround for a keypad
 // that could only produce '0', DEL and ENT: ENT from the Idle screen dialled a
@@ -188,4 +195,34 @@
 #endif
 #ifndef POC_DUCK_HANGOVER_MS
 #define POC_DUCK_HANGOVER_MS 200              // keep ducking this long after they stop
+#endif
+
+// ── Jitter buffer (PlayoutBuffer, tincan-core) ───────────────────────────
+// Target is the standing cushion playout drains toward; max is the hard
+// ceiling (drop-oldest beyond it). Same defaults as tincan. Underruns are
+// reported in the rtp census line -- raise the target if they climb on
+// your Wi-Fi.
+#ifndef POC_JITTER_TARGET_MS
+#define POC_JITTER_TARGET_MS 60
+#endif
+#ifndef POC_JITTER_MAX_MS
+#define POC_JITTER_MAX_MS    200
+#endif
+
+// ── Ringer ───────────────────────────────────────────────────────────────
+// 440+480 Hz, 2 s on / 4 s off, synthesised into the speaker while an
+// inbound INVITE is pending. Peak per tone out of 32767 (the pair sums to
+// 2x): 6000 ~= -15 dBFS each, clearly audible on the small speaker without
+// the boot-beep problem of being painful.
+#ifndef POC_RING_AMPL
+#define POC_RING_AMPL        6000.0f
+#endif
+
+// ── DTMF media path ──────────────────────────────────────────────────────
+// 0 = in-band tones (default: survives drawbridge's PSTN anchor to a far-end
+// IVR, since the anchor bridges PCM and drops telephone-event). 1 = RFC 2833
+// named events, for third-party peers that expect them. SIP INFO is always
+// sent as well -- it is the only transport drawbridge's star codes listen to.
+#ifndef POC_DTMF_RFC2833
+#define POC_DTMF_RFC2833     0
 #endif

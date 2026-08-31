@@ -35,6 +35,8 @@
 #include "tca8418_keypad.h"
 #include "epaper_display.h"
 #include "tincan_uac.hpp"
+#include "playout_buffer.hpp"
+#include "tone_gen.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -296,8 +298,18 @@ static void audio_task(void *)
 {
     int16_t pcm[POC_FRAME_SAMPLES];
     int16_t micbuf[POC_FRAME_SAMPLES];
-    static const int16_t silence[POC_FRAME_SAMPLES] = {0};
     bool pumping = false;
+
+    // Jitter buffer between RTP arrival and the speaker. pumpRx() drains the
+    // socket into it every tick; read() always yields a full frame (real
+    // audio, or low-level comfort noise on underrun) so the DMA never
+    // replays stale samples and a late packet no longer costs a 20 ms hole.
+    static PlayoutBuffer jb(POC_JITTER_MAX_MS * POC_SAMPLE_RATE_HZ / 1000,
+                            POC_JITTER_TARGET_MS * POC_SAMPLE_RATE_HZ / 1000);
+
+    // Ringer state (idle branch below).
+    tone_gen_t ringTone{};
+    int ringFrame = 0;
 
     // Q8 fixed point so the per-sample work is a multiply and a shift.
     const int32_t rxGainQ8 = (int32_t)(powf(10.0f, POC_RX_GAIN_DB / 20.0f) * 256.0f);
@@ -317,9 +329,25 @@ static void audio_task(void *)
 
     for (;;) {
         if (!s_uac || !s_uac->inCall()) {
-            // Not in a call: nothing to pace against, so idle politely.
             pumping = false;
             duckFrames = 0;
+            if (s_uac && s_uac->hasIncomingCall()) {
+                // Ringer. The main loop turned the amp on when the INVITE
+                // arrived; this just paces the cadence off the blocking
+                // speaker write -- 300 frames = 6 s, first 100 = 2 s on.
+                const bool on = (ringFrame % 300) < 100;
+                if (on) {
+                    tone_gen_fill(&ringTone, 440.0f, 480.0f, POC_RING_AMPL,
+                                  POC_SAMPLE_RATE_HZ, pcm, POC_FRAME_SAMPLES);
+                } else {
+                    memset(pcm, 0, sizeof(pcm));
+                }
+                audio_hardware_write_spk(pcm, POC_FRAME_SAMPLES);
+                ringFrame++;
+                continue;
+            }
+            // Not in a call: nothing to pace against, so idle politely.
+            ringFrame = 0;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -328,6 +356,7 @@ static void audio_task(void *)
             // Entering a call -- drop anything the far end queued before we
             // started pumping, so we don't inherit that as permanent latency.
             s_uac->flushRtpBacklog();
+            jb.clear();
             pumping = true;
             statFrames = 0;
         }
@@ -341,8 +370,11 @@ static void audio_task(void *)
             statFrames = 0;
             // mic~/rx~ are mean |sample| out of 32767. Anything under ~30 is
             // effectively digital silence; speech sits in the hundreds.
-            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu | mic~%ld peak %d | rx~%ld peak %d%s",
+            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu lost=%lu oo=%lu | jb=%u smp under=%llu"
+                          " | mic~%ld peak %d | rx~%ld peak %d%s",
                      (unsigned long)s_uac->rtpTx(), (unsigned long)s_uac->rtpRx(),
+                     (unsigned long)s_uac->rtpLost(), (unsigned long)s_uac->rtpOutOfOrder(),
+                     (unsigned)jb.getLength(), (unsigned long long)jb.getUnderruns(),
                      (long)(statMicN ? statMicSum / statMicN : 0), (int)statMicPeak,
                      (long)(statRxN ? statRxSum / statRxN : 0), (int)statRxPeak,
                      s_uac->lastTxErrno() ? " TX FAILING" : "");
@@ -379,8 +411,14 @@ static void audio_task(void *)
             s_uac->sendAudioFrame(micbuf, got);
         }
 
-        size_t rx = s_uac->recvAudioFrame(pcm, POC_FRAME_SAMPLES);
-        if (rx > 0) {
+        // Everything queued since the last tick goes into the jitter buffer;
+        // one frame comes back out. `real` is false on underrun, in which
+        // case pcm holds comfort noise -- play it, but don't let it drive
+        // ducking or the census.
+        s_uac->pumpRx(jb);
+        const size_t rx = POC_FRAME_SAMPLES;
+        const bool real = jb.read(pcm, rx);
+        if (real) {
             // Decide "is the far end talking" on the RAW decoded frame, before
             // the gain below. Measuring post-gain would mean the threshold
             // silently retunes itself every time POC_RX_GAIN_DB changes.
@@ -409,15 +447,8 @@ static void audio_task(void *)
                     pcm[i] = (int16_t)v;
                 }
             }
-            audio_hardware_write_spk(pcm, rx);
-        } else {
-            // Feed silence so the I2S DMA doesn't replay its last buffer.
-            // NOTE: no jitter buffer, no sequence-number reordering and no
-            // packet-loss concealment -- one datagram in, one frame out. On
-            // a clean LAN this is fine; it will audibly suffer on a lossy
-            // or bursty link. Out of scope for the PoC.
-            audio_hardware_write_spk(silence, POC_FRAME_SAMPLES);
         }
+        audio_hardware_write_spk(pcm, rx);
     }
 }
 
@@ -601,6 +632,9 @@ extern "C" void app_main(void)
         ui_render(POC_SIP_EXT_SELF, "SIP init fail", false);
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
+    uac.setCredentials("", POC_SIP_SECRET);   // only used if the registrar challenges (#28)
+    uac.setDtmfMode(POC_DTMF_RFC2833 ? TincanUac::DtmfMode::Rfc2833
+                                     : TincanUac::DtmfMode::Inband);
     bool registered = uac.registerExt();
     s_uac = &uac;
 
@@ -657,6 +691,7 @@ extern "C" void app_main(void)
         if (uac.hasIncomingCall() && ui != UiState::InCall && ui != UiState::Incoming) {
             ui = UiState::Incoming;
             ESP_LOGI(TAG, "incoming call from %s", uac.incomingCallerId().c_str());
+            audio_hardware_set_amp(true);   // audio_task rings while hasIncomingCall()
             ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
         }
 
@@ -719,10 +754,12 @@ extern "C" void app_main(void)
             } else if (key == '\b') {
                 uac.reject();
                 ui = UiState::Idle;
+                audio_hardware_set_amp(false);
                 ui_render(POC_SIP_EXT_SELF, "Idle", false);
             } else if (!uac.hasIncomingCall()) {
                 // Caller gave up (CANCEL) before we answered/rejected.
                 ui = UiState::Idle;
+                audio_hardware_set_amp(false);
                 ui_render(POC_SIP_EXT_SELF, "Idle", false);
             }
             break;
@@ -745,8 +782,10 @@ extern "C" void app_main(void)
             break;
 
         case UiState::InCall:
-            // Media is handled entirely by audio_task; nothing to do here
-            // but watch for hangup from either end.
+            // Media is handled entirely by audio_task. Dial keys become DTMF
+            // (SIP INFO for drawbridge's star codes + in-band/RFC 2833 on the
+            // media path); DEL/ENT hang up.
+            if (is_dial_char(key)) uac.sendDtmf(key);
             if (key == '\b' || key == '\r') uac.hangup();
             if (uac.callEnded() || !uac.inCall()) {
                 ui = UiState::Idle;

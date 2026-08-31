@@ -20,8 +20,6 @@ idf_component_register(
         "src/es8311_audio.c"
         "src/tca8418_keypad.cpp"
         "src/epaper_display.cpp"
-        "src/tincan_uac.cpp"
-        "src/g711.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -33,5 +31,6 @@ idf_component_register(
         esp_timer
         esp_hw_support
         lwip
-        sip_core
+        tincan_uac       # tincan-core (pulls sip_core/tincan_media/tincan_codecs)
+        tincan_media     # PlayoutBuffer for the audio task's jitter buffer
 )

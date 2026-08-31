@@ -595,7 +595,8 @@ extern "C" void app_main(void)
     // 5. SIP UAC, registered as a LAN extension.
     static TincanUac uac;
     if (!uac.init(wifi_local_ip(), POC_SIP_LOCAL_PORT, POC_RTP_LOCAL_PORT,
-                  POC_SIP_SERVER_IP, POC_SIP_SERVER_PORT, POC_SIP_EXT_SELF)) {
+                  POC_SIP_SERVER_IP, POC_SIP_SERVER_PORT, POC_SIP_EXT_SELF,
+                  POC_SIP_REG_EXPIRES)) {
         ESP_LOGE(TAG, "UAC init failed (socket bind?)");
         ui_render(POC_SIP_EXT_SELF, "SIP init fail", false);
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));

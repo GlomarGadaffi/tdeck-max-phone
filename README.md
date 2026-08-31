@@ -9,7 +9,9 @@
 
 A SIP phone proof-of-concept for the **LilyGO T-Deck MAX** (ESP32-S3 + E-Paper + TCA8418 keyboard + ES8311 audio codec). It registers as a plain SIP extension to a [drawbridge](https://github.com/GlomarGadaffi/drawbridge) PBX instance on the LAN, which owns all 3CX Call Control API integration -- this device never talks to 3CX directly, has no OAuth/HTTPS client of its own, and needs no 3CX credentials.
 
-Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incoming 3CX call rings this device (and any other registered extension) automatically. Note that keypad digit entry is not fully mapped yet ([#17](../../issues/17)), so outbound dialing currently needs a hardcoded number -- inbound and answer/hangup do not.
+Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incoming 3CX call rings this device (and any other registered extension) automatically. The full dialpad works (`0`-`9` `*` `#` `+`, ENT dials, ENT from idle redials the last number that connected — [#17](../../issues/17) landed 2026-08-13); during a call the dial keys send DTMF.
+
+The SIP/RTP engine (`TincanUac`, jitter buffer, digest client, DTMF, G.711) lives in the sibling [tincan-core](https://github.com/GlomarGadaffi/tincan-core) repo, shared with the [tincan](https://github.com/GlomarGadaffi/tincan) intercom. Clone it alongside this one (or set `TINCAN_CORE_PATH`) before building.
 
 ---
 
@@ -33,7 +35,7 @@ Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incomi
 > [docs/BENCH_TEST.md](docs/BENCH_TEST.md) for the per-step ledger.
 >
 > **Off-hardware checks** still run and still matter:
-> - **Host unit tests** (`ctest`, no board, no ESP-IDF) assert on generated SIP wire bytes -- this is what proves response formatting is correct, and it caught a real defect that compiled perfectly. See [Building & Testing](#building--testing).
+> - **Host unit tests** (`ctest`, no board, no ESP-IDF) assert on generated SIP wire bytes, the digest client (RFC 2617 vectors) and the jitter buffer -- this is what proves response formatting is correct, and it caught a real defect that compiled perfectly. They live with the engine in tincan-core; see [Building & Testing](#building--testing).
 > - **QEMU-xtensa** (native ESP-IDF v6.0.1, no WSL, no CI minutes) verifies the firmware builds clean and boots through peripheral init, the I2C scan, the e-paper task, and into Wi-Fi driver bring-up.
 >
 > **QEMU's ceiling is earlier than it looks.** Emulated time reaches ~754 ms at `phy_init`'s full-calibration fallback and then **stops advancing entirely** -- the emulator wedges there. It does not merely fail to associate. Measured by compiling the Wi-Fi timeout down to 2 s and waiting 200 s of wall clock: emulated time never moved and the timeout never fired. So **nothing downstream of Wi-Fi is reachable in QEMU at any timeout value** -- no registration, no SIP, no RTP, not even the Wi-Fi failure path. See [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
@@ -41,11 +43,9 @@ Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incomi
 > **Known limitations** (tracked as GitHub issues, not silently omitted):
 > - **The panel trails your fingers by 3.3 s.** A full refresh measures **3277 ms** and there is no partial refresh, so the dial buffer is always a beat or two behind what you typed. The depth-1 render queue discards superseded frames rather than replaying them, so it catches up rather than lagging cumulatively — but typing a long number is visibly laggy, and there is no input grace window yet on an incoming call ([#16](../../issues/16)).
 > - **No acoustic echo cancellation.** Speaker and mic sit centimetres apart on one PCB, so at usable volume the far end hears itself. Mitigated by *ducking* the mic while the far end talks (`POC_DUCK_DB`, ~24 dB, 200 ms hangover) — a deliberate half-duplex compromise, not AEC. You cannot interrupt the far end while ducking is on; set `POC_DUCK_DB` to 0 for true full duplex plus the echo. The `*777` echo service will still howl by design.
-> - `TincanUac::placeCall()` blocks while dialing out (bounded, ~120 s worst case); a genuinely new inbound call arriving in that window gets no SIP response until it resolves ([#18](../../issues/18)).
-> - No SIP digest authentication ([#28](../../issues/28)) -- a `401` challenge is treated as a flat rejection, so this works only against drawbridge's open registrar.
-> - No jitter buffer, no RTP sequence/reordering handling, and no packet-loss concealment -- one datagram in, one frame out. Fine on a clean LAN, will audibly suffer on a lossy or bursty link.
-> - No DTMF (RFC 2833 or SIP INFO), so far-end IVR menus cannot be navigated.
-> - E-paper renders `0`-`9` `*` `#` `+` and a simple active/idle pictogram only -- no alphabet font, so status text and alphanumeric caller IDs don't render, and no partial refresh, so every update is a full-screen flash ([#16](../../issues/16)). That flash is normal for this panel type, just visible. The phone also **rings silently** -- no ringer tone is generated, which is the single worst remaining gap.
+> - Jitter buffer (60 ms target / 200 ms ceiling) with comfort-noise fill, but **no packet-loss concealment** proper and no reordering -- a late packet plays in arrival order. Watch `lost=`/`under=` in the in-call census line on a bad link.
+> - Digest auth ([#28](../../issues/28)), non-blocking dial-out ([#18](../../issues/18)), DTMF (SIP INFO + in-band, or RFC 2833 via `POC_DTMF_RFC2833`) and the ringer are **implemented but not yet exercised on hardware** -- they landed with the tincan-core extraction and have host-test coverage only so far. See [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
+> - E-paper renders `0`-`9` `*` `#` `+` and a simple active/idle pictogram only -- no alphabet font, so status text and alphanumeric caller IDs don't render, and no partial refresh, so every update is a full-screen flash ([#16](../../issues/16)). That flash is normal for this panel type, just visible.
 > - LoRa, GPS, 4G/cellular, touch, IMU, and battery-gauge hardware exist on the board and have pin definitions in `board_tdeck_max.h`, but none of it is driven by this firmware (beyond parking the LoRa/SD chip-selects high so they can't corrupt the shared SPI bus). This PoC is Wi-Fi only.
 
 ---
@@ -55,7 +55,7 @@ Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incomi
 ```
    tdeck-max-phone                    drawbridge PBX                      3CX
 +---------------------+           +-----------------------+          +----------+
-| tincan_uac.cpp      |  SIP/LAN  | RequestsHandler       |  OAuth2  |          |
+| TincanUac (core)    |  SIP/LAN  | RequestsHandler       |  OAuth2  |          |
 | ES8311 codec        |<--------->|         +             |<-------->| 3CX PBX  |
 | TCA8418 keypad      | RTP G.711 | TelephonyAnchorClient |  WSS/REST|          |
 | GDEQ031T10 e-paper  |           +-----------------------+          +----------+
@@ -121,9 +121,10 @@ empirically on the bench and have moved more than once.
 | `POC_RX_GAIN_DB` | Software gain on decoded RTP only. | The boot beep and PSTN voice arrive ~18 dB apart. Codec volume lifts both; this lifts only the quiet one. |
 | `POC_DUCK_DB` / `POC_DUCK_THRESHOLD` / `POC_DUCK_HANGOVER_MS` | Attenuate the mic while the far end is talking. | **Not AEC.** The tradeoff is that you cannot interrupt the far end. Set `POC_DUCK_DB` to 0 for true full duplex plus the echo. |
 
-Real AEC (`esp-sr` / `esp_afe`) is out of PoC scope: it targets 16 kHz while this path is 8 kHz
-G.711 end to end, and it needs a time-aligned playback reference through the DMA and RTP chain.
-That is a workstream, not a setting.
+Real AEC (`esp-sr` / `esp_afe`) is the next audio workstream: it targets 16 kHz, so the capture
+path moves to 16 kHz with a 2:1 decimation to the 8 kHz G.711 wire, and it needs a time-aligned
+playback reference -- a ring buffer of played samples, since the codec driver exposes no DMA
+position. Ducking stays as the fallback.
 
 **`*777` howling is expected.** An echo service deliberately closes
 mic → RTP → PBX → RTP → speaker → mic, and on an open speakerphone that loop has gain above
@@ -136,23 +137,24 @@ unity. A call to a person does not do this. If it makes bench testing hard to ju
 
 ### Prerequisites
 - ESP-IDF v6.0 (native install, no WSL required) for firmware
+- [tincan-core](https://github.com/GlomarGadaffi/tincan-core) checked out as a sibling directory (`../tincan-core`), or `TINCAN_CORE_PATH` pointing at it -- the build stops with a clear error otherwise
 - Any C++17 compiler + CMake for the host tests -- no ESP-IDF, no board
 - A real Wi-Fi network and a [drawbridge](https://github.com/GlomarGadaffi/drawbridge) instance reachable on it, for anything past boot (see `main/include/poc_config.h`)
 
 ### Host unit tests (fastest loop -- no board, no ESP-IDF)
-`components/sip_core` is portable by construction, so the SIP layer's
-generated bytes can be asserted on directly. Run this before blaming the PBX
-for anything:
+The SIP engine's tests moved with it to tincan-core. Run them there before
+blaming the PBX for anything:
 ```bash
+cd ../tincan-core
 cmake -B build-host -S test
 cmake --build build-host
 ctest --test-dir build-host --output-on-failure
 ```
-`test/sip_wire_test.cpp` parses a realistic inbound INVITE with the real
-parser and checks the exact response bytes -- no doubled header field names,
-exactly one of each required header, response re-parses cleanly, BYE Call-ID
-matching works. This is what caught the malformed-response bug that compiled
-perfectly and would only ever have surfaced as "drawbridge ignores us".
+`sip_wire_test` parses a realistic inbound INVITE with the real parser and
+checks the exact response bytes (this is what caught the malformed-response
+bug that compiled perfectly and would only ever have surfaced as "drawbridge
+ignores us"); `sip_digest_test` checks the digest client against the RFC 2617
+worked example; `playout_buffer_test` covers the jitter buffer.
 
 ### Build & flash (real hardware)
 ```bash
@@ -185,11 +187,11 @@ Full bench-test procedure (what needs real hardware and why): [docs/BENCH_TEST.m
 
 ## Roadmap
 
-The telephony path is proven; **the UI is now the weak point.** The phone cannot dial a number
-it wasn't compiled with, and it rings silently. Next up, in dependency order: digit entry
-([#17](../../issues/17)) — now unblocked, since the keypad decode and press/release polarity
-were confirmed on hardware on 2026-08-13 — then the fonts, partial refresh and ringer that
-make it usable as a phone ([#16](../../issues/16)).
+The telephony path is proven and the phone now dials, rings, sends DTMF and can register to a
+locked-down PBX. Next, in dependency order: bench the new paths (digest against drawbridge in
+Secure mode, the ringer, INFO-DTMF star codes, jitter buffer on a lossy link), then AEC via
+`esp-sr` at 16 kHz, then codec negotiation + G.722 once drawbridge negotiates SDP instead of
+forcing G.711. The e-paper fonts and partial refresh ([#16](../../issues/16)) remain the UI gap.
 
 Full plan, including what is deliberately out of scope: **[docs/ROADMAP.md](docs/ROADMAP.md)**.
 
@@ -208,4 +210,4 @@ Full plan, including what is deliberately out of scope: **[docs/ROADMAP.md](docs
 
 ## License
 
-MIT. See [LICENSE](LICENSE) -- this project combines original work with a vendored SIP parser (`components/sip_core`, ported via the sibling `tincan` project from `pocket-dial`, also MIT).
+MIT. See [LICENSE](LICENSE). The SIP engine and its vendored parser (`sip_core`, from `pocket-dial`, MIT) live in [tincan-core](https://github.com/GlomarGadaffi/tincan-core), also MIT.

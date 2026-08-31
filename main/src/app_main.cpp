@@ -45,7 +45,7 @@ static const char *TAG = "APP_MAIN";
 // are UI-only distinctions -- TincanUac tracks its own Calling/Ringing/
 // InCall internally and this just decides what the keypad and e-paper do
 // in response.
-enum class UiState { Idle, Dialing, Incoming, InCall, ConfirmOff };
+enum class UiState { Idle, Dialing, Calling, Incoming, InCall, ConfirmOff };
 
 // ── boot-time hardware bring-up helpers ─────────────────────────────────────
 
@@ -652,27 +652,22 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "ENT from idle will redial %s", lastDialled.c_str());
     }
 
-    // Places a call and drives the UI through it. Shared by redial-from-idle
-    // and dial-from-buffer so the two can't drift apart -- they had already
-    // grown slightly different logging and teardown before this was factored.
+    // Starts a call; UiState::Calling below follows it through poll(). Shared
+    // by redial-from-idle and dial-from-buffer so the two can't drift apart.
+    // Non-blocking (#18): the main loop keeps running, so an inbound INVITE
+    // that arrives while we are dialling gets its 486 instead of silence.
+    std::string dialTarget;
+    bool dialRingingShown = false;
     auto placeCallTo = [&](const std::string &target) {
-        ui_render(target.c_str(), "Calling...", false);
         ESP_LOGI(TAG, "dialing %s", target.c_str());
-
-        if (uac.placeCall(target)) {
-            // Only remember numbers that actually connected. Persisting a
-            // failed attempt would make redial replay a typo.
-            if (target != lastDialled) {
-                lastDialled = target;
-                save_last_dialled(target);
-            }
-            ui = UiState::InCall;
-            audio_hardware_set_amp(true);
-            ui_render(target.c_str(), "In Call", true);
+        if (uac.placeCallBegin(target)) {
+            dialTarget = target;
+            dialRingingShown = false;
+            ui = UiState::Calling;
+            ui_render(target.c_str(), "Calling...", false);
         } else {
             ui = UiState::Idle;
             ui_render(target.c_str(), "Call Failed", false);
-            ESP_LOGW(TAG, "call to %s failed", target.c_str());
         }
     };
 
@@ -742,6 +737,33 @@ extern "C" void app_main(void)
                 std::string target = dialBuffer;
                 dialBuffer.clear();
                 placeCallTo(target);
+            }
+            break;
+
+        case UiState::Calling:
+            if (uac.inCall()) {
+                // Only remember numbers that actually connected. Persisting a
+                // failed attempt would make redial replay a typo.
+                if (dialTarget != lastDialled) {
+                    lastDialled = dialTarget;
+                    save_last_dialled(dialTarget);
+                }
+                ui = UiState::InCall;
+                audio_hardware_set_amp(true);
+                ui_render(dialTarget.c_str(), "In Call", true);
+            } else if (uac.callEnded() || !uac.dialing()) {
+                const int code = uac.lastDialCode();
+                ui = UiState::Idle;
+                ui_render(dialTarget.c_str(),
+                          code == 487 ? "Cancelled" : code == 486 ? "Busy" :
+                          code == -1  ? "No Answer" : "Call Failed", false);
+                ESP_LOGW(TAG, "call to %s ended before connect (%d)", dialTarget.c_str(), code);
+            } else if (key == '\b' || key == '\r') {
+                uac.hangup();   // CANCEL; the 487 lands us in the branch above
+                ui_render(dialTarget.c_str(), "Cancelling", false);
+            } else if (uac.dialRinging() && !dialRingingShown) {
+                dialRingingShown = true;
+                ui_render(dialTarget.c_str(), "Ringing", false);
             }
             break;
 

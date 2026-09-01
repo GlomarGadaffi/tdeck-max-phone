@@ -370,10 +370,15 @@ static void audio_task(void *)
             statFrames = 0;
             // mic~/rx~ are mean |sample| out of 32767. Anything under ~30 is
             // effectively digital silence; speech sits in the hundreds.
-            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu lost=%lu oo=%lu | jb=%u smp under=%llu"
+            // rej= counts RTP from an IP other than the negotiated peer's -- pumpRx()
+            // filters those where the old path accepted anything. A silent call
+            // with rx=0 and rej climbing means the far end is sending from an
+            // address we did not expect (check *11 reroute and the anchor first).
+            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu lost=%lu oo=%lu rej=%lu | jb=%u smp under=%llu"
                           " | mic~%ld peak %d | rx~%ld peak %d%s",
                      (unsigned long)s_uac->rtpTx(), (unsigned long)s_uac->rtpRx(),
                      (unsigned long)s_uac->rtpLost(), (unsigned long)s_uac->rtpOutOfOrder(),
+                     (unsigned long)s_uac->rtpRejected(),
                      (unsigned)jb.getLength(), (unsigned long long)jb.getUnderruns(),
                      (long)(statMicN ? statMicSum / statMicN : 0), (int)statMicPeak,
                      (long)(statRxN ? statRxSum / statRxN : 0), (int)statRxPeak,

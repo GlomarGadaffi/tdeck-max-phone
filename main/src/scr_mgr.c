@@ -63,10 +63,17 @@ static void activate(stack_entry_t *e)
     lv_disp_load_scr(e->obj);
 }
 
-// Tear an entry down. Only call once something ELSE is the loaded screen.
-static void teardown(stack_entry_t *e, bool was_active)
+// Leave a screen: its exit() runs BEFORE the incoming screen's entry(), so
+// whatever exit() resets (the keypad layout) can't clobber what entry()
+// just set. Deletion is separate (destroy(), below) and happens only once
+// something else is the loaded screen.
+static void leave(stack_entry_t *e)
 {
-    if (was_active && e->life->exit) e->life->exit();
+    if (e->life->exit) e->life->exit();
+}
+
+static void destroy(stack_entry_t *e)
+{
     if (e->life->destroy) e->life->destroy();
     if (e->obj) lv_obj_del(e->obj);
     if (e->group) lv_group_del(e->group);
@@ -105,12 +112,13 @@ bool scr_mgr_switch(int id)
     int old_depth = s_depth;
     for (int i = 0; i < old_depth; i++) old[i] = s_stack[i];
     s_depth = 0;
+    if (old_depth > 0) leave(&old[old_depth - 1]);
 
     if (!build(&s_stack[0], id, life)) return false;
     s_depth = 1;
     activate(&s_stack[0]);
 
-    for (int i = old_depth - 1; i >= 0; i--) teardown(&old[i], i == old_depth - 1);
+    for (int i = old_depth - 1; i >= 0; i--) destroy(&old[i]);
     return true;
 }
 
@@ -124,10 +132,7 @@ bool scr_mgr_push(int id)
         return false;
     }
 
-    if (s_depth > 0) {
-        stack_entry_t *top = &s_stack[s_depth - 1];
-        if (top->life->exit) top->life->exit();
-    }
+    if (s_depth > 0) leave(&s_stack[s_depth - 1]);
     if (!build(&s_stack[s_depth], id, life)) return false;
     s_depth++;
     activate(&s_stack[s_depth - 1]);
@@ -139,8 +144,9 @@ bool scr_mgr_pop(void)
     if (s_depth <= 1) return false;
     stack_entry_t gone = s_stack[s_depth - 1];
     s_depth--;
+    leave(&gone);
     activate(&s_stack[s_depth - 1]);
-    teardown(&gone, true);
+    destroy(&gone);
     return true;
 }
 
@@ -149,12 +155,13 @@ bool scr_mgr_replace_top(int id)
     const scr_lifecycle_t *life = find_life(id);
     if (!life || s_depth == 0) return false;
     stack_entry_t gone = s_stack[s_depth - 1];
+    leave(&gone);
     if (!build(&s_stack[s_depth - 1], id, life)) {
         s_stack[s_depth - 1] = gone;
         return false;
     }
     activate(&s_stack[s_depth - 1]);
-    teardown(&gone, true);
+    destroy(&gone);
     return true;
 }
 

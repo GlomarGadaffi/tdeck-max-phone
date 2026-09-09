@@ -181,14 +181,14 @@ lv_obj_t *app_nav_frame(lv_obj_t *screen, const char *title, const char *legend)
     lv_obj_t *t = lv_label_create(screen);
     lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
     lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(t, 116);
+    lv_obj_set_width(t, 108);
     lv_label_set_text(t, title ? title : "");
     lv_obj_align(t, LV_ALIGN_TOP_LEFT, APP_NAV_CONTENT_X, 3);
 
     lv_obj_t *s = lv_label_create(screen);
     lv_obj_set_style_text_font(s, &lv_font_montserrat_12, 0);
     lv_label_set_long_mode(s, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s, 112);
+    lv_obj_set_width(s, 120);
     lv_obj_set_style_text_align(s, LV_TEXT_ALIGN_RIGHT, 0);
     lv_label_set_text(s, s_status_text);
     lv_obj_align(s, LV_ALIGN_TOP_RIGHT, -APP_NAV_CONTENT_X, 5);
@@ -264,9 +264,10 @@ void app_nav_status_tick(void)
     }
 
     char text[sizeof(s_status_text)];
+    // "!WiFi !SIP 12:45p" is the widest form and must fit the 120 px label.
     snprintf(text, sizeof(text), "%s %s %s",
-             wifi_is_connected() ? "WiFi" : "noWiFi",
-             s_sip_registered ? "SIP" : "noSIP",
+             wifi_is_connected() ? "WiFi" : "!WiFi",
+             s_sip_registered ? "SIP" : "!SIP",
              clock);
     if (strcmp(text, s_status_text) == 0) return; // unchanged: no invalidation, no refresh
 

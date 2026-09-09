@@ -94,3 +94,7 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 
 # ── Status-bar clock: SNTP. NIST asks for long polling intervals.
 CONFIG_LWIP_SNTP_UPDATE_DELAY=3600000
+
+# Home + dialer + call + incoming can be live at once, plus a full contacts
+# list; the 32 KB default was never exercised under that load.
+CONFIG_LV_MEM_SIZE_KILOBYTES=64

@@ -1,18 +1,20 @@
-// Real GDEQ031T10 (240x320, 1bpp, UC8253-family controller) SPI command
-// sequence, ported from LilyGO's own T-Deck-MAX reference driver
-// (examples/Elink_paper/GDEQ031T10_Arduino/Display_EPD_W21.cpp) -- same
-// panel setting/power-on/refresh/deep-sleep command bytes, adapted from
-// Arduino SPI.transfer() + digitalWrite() to ESP-IDF's spi_master driver.
+// SPI/command layer ported from tdeck-max-phone (main/src/epaper_display.cpp):
+// same GDEQ031T10 (240x320, 1bpp, UC8253-family) command sequence, itself
+// ported from LilyGO's own reference (examples/Elink_paper/GDEQ031T10_Arduino/
+// Display_EPD_W21.cpp). One deliberate deviation carried over from that repo:
+// the vendor's busy-wait is an unbounded `while(1)`; epd_wait_busy() here is
+// bounded and returns instead of hanging forever.
 //
-// One deliberate deviation from the vendor reference: their busy-wait is an
-// unbounded `while(1)` with no timeout. That's a real hang risk (blocks
-// forever if the panel is ever unresponsive, e.g. under QEMU with no panel
-// attached at all), so epd_wait_busy() here is bounded and returns an error
-// instead of spinning forever.
+// NOT ported from the source file: the 5x7 dialpad font, glyph_index(),
+// draw_glyph()/draw_digit_string(), set_pixel()/fill_rect(), and
+// epaper_render_call_status() -- all phone-dialpad-specific. This project
+// renders through LVGL (lvgl_glue.c) instead and only needs the raw
+// full-refresh push, exported as epaper_flush().
 #include "epaper_display.h"
 #include "board_tdeck_max.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -21,12 +23,8 @@
 
 static const char *TAG = "EPAPER_DISPLAY";
 
-#define EPD_WIDTH        240
-#define EPD_HEIGHT       320
-#define EPD_BYTES_PER_ROW (EPD_WIDTH / 8)             // 30
-#define EPD_BUF_SIZE      (EPD_BYTES_PER_ROW * EPD_HEIGHT) // 9600, matches vendor's EPD_ARRAY
-
 #define EPD_BUSY_TIMEOUT_MS 5000
+#define EPD_FRONTLIGHT_DEFAULT_PCT 100 // 10-25 is plenty indoors; 100 = the old bare-GPIO behavior
 
 // GDEQ031T10 command bytes, from the vendor reference.
 #define EPD_CMD_PSR          0x00
@@ -38,102 +36,21 @@ static const char *TAG = "EPAPER_DISPLAY";
 #define EPD_CMD_REFRESH      0x12
 #define EPD_PSR_DEFAULT      0x1F
 #define EPD_DEEP_SLEEP_KEY   0xA5
+// Waveform-select registers used by the vendor's fast/partial init variants
+// (Display_EPD_W21.cpp: EPD_Init_Fast / EPD_Init_Part). Undocumented in the
+// UC8253 datasheet; values are the vendor's, verbatim.
+#define EPD_CMD_LUT_SEL_E0   0xE0
+#define EPD_CMD_LUT_SEL_E5   0xE5
+#define EPD_CMD_CDI          0x50   // VCOM and data interval setting
+#define EPD_E0_FAST_PART     0x02
+#define EPD_E5_FAST          0x5A   // vendor: ~1.0s
+#define EPD_E5_PARTIAL       0x79
+#define EPD_CDI_PARTIAL      0xD7
 
 #if !CONFIG_TDECK_MAX_SIM_MODE
-static spi_device_handle_t s_spi = NULL;   // unused (and undefined) in sim builds
+static spi_device_handle_t s_spi = NULL;
 #endif
-static uint8_t s_fb[EPD_BUF_SIZE];       // 1bpp framebuffer, 1=white 0=black, MSB-first per row
-static uint8_t s_old_fb[EPD_BUF_SIZE];   // panel's last-known contents, required by the OLD_DATA transfer
-
-static void set_pixel(int x, int y, bool black)
-{
-    if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT) return;
-    uint8_t *byte = &s_fb[y * EPD_BYTES_PER_ROW + (x / 8)];
-    uint8_t mask = 0x80 >> (x % 8);
-    if (black) *byte &= ~mask;
-    else *byte |= mask;
-}
-
-static void fill_rect(int x, int y, int w, int h, bool black)
-{
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++)
-            set_pixel(x + i, y + j, black);
-}
-
-// Compact 5x7 dialpad font, MSB of each row byte = leftmost column. Covers
-// exactly the characters a dial buffer can contain: 0-9 plus * # +. Indexed
-// through glyph_index() rather than `c - '0'`, because the set is no longer
-// contiguous. Status is drawn as a fixed pictogram per state (see
-// epaper_render_call_status) rather than a full alphabet font; a real
-// character set is UI-polish scope beyond this PoC (#16).
-//
-// * and # matter because they are dialable: *777 is the echo test, and star
-// codes are how most PBXes expose features. Before this they rendered as
-// blank gaps, so "*777" displayed as " 777". + is here only because it is the
-// printed legend on the O key and costs one glyph; neither drawbridge nor the
-// 3CX anchor consumes it today.
-#define GLYPH_COUNT 13
-static const uint8_t s_dial_font[GLYPH_COUNT][7] = {
-    {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70}, // 0
-    {0x20, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70}, // 1
-    {0x70, 0x88, 0x08, 0x10, 0x20, 0x40, 0xF8}, // 2
-    {0xF8, 0x10, 0x20, 0x10, 0x08, 0x88, 0x70}, // 3
-    {0x10, 0x30, 0x50, 0x90, 0xF8, 0x10, 0x10}, // 4
-    {0xF8, 0x80, 0xF0, 0x08, 0x08, 0x88, 0x70}, // 5
-    {0x30, 0x40, 0x80, 0xF0, 0x88, 0x88, 0x70}, // 6
-    {0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x40}, // 7
-    {0x70, 0x88, 0x88, 0x70, 0x88, 0x88, 0x70}, // 8
-    {0x70, 0x88, 0x88, 0x78, 0x08, 0x10, 0x60}, // 9
-    // '*' -- a six-point asterisk sitting high in the cell, the way a
-    // typographic asterisk does. Rows 5-6 blank so it never reads as a plus.
-    {0x20, 0xA8, 0x70, 0xF8, 0x70, 0xA8, 0x20}, // *
-    // '#' -- two verticals crossed by two horizontals, full cell width.
-    {0x50, 0x50, 0xF8, 0x50, 0xF8, 0x50, 0x50}, // #
-    // '+' -- centred, deliberately shorter than '#' so the two don't confuse.
-    {0x00, 0x20, 0x20, 0xF8, 0x20, 0x20, 0x00}, // +
-};
-
-// Map a dialable character to its row in s_dial_font, or -1 if we can't draw
-// it. Keep this in sync with s_keymap in tca8418_keypad.cpp: anything the
-// keypad can put in the dial buffer must be drawable here, or the user types
-// a character and sees nothing appear.
-static int glyph_index(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    switch (c) {
-        case '*': return 10;
-        case '#': return 11;
-        case '+': return 12;
-        default:  return -1;
-    }
-}
-
-static void draw_glyph(int x, int y, int idx, int scale)
-{
-    if (idx < 0 || idx >= GLYPH_COUNT) return;
-    for (int row = 0; row < 7; row++) {
-        uint8_t bits = s_dial_font[idx][row];
-        for (int col = 0; col < 5; col++) {
-            if (bits & (0x80 >> col)) {
-                fill_rect(x + col * scale, y + row * scale, scale, scale, true);
-            }
-        }
-    }
-}
-
-// Draws 0-9 * # +; anything else (letters in a caller name, spaces) still
-// renders as a blank gap, which is correct -- the gap preserves position so a
-// partially-drawable string doesn't silently shift left.
-static void draw_digit_string(int x, int y, const char *s, int scale, int spacing)
-{
-    int cx = x;
-    for (const char *p = s; p && *p; p++) {
-        draw_glyph(cx, y, glyph_index(*p), scale);
-        cx += 5 * scale + spacing;
-        if (cx > EPD_WIDTH - 5 * scale) break; // clip to panel width
-    }
-}
+static uint8_t s_old_fb[EPD_BUF_SIZE]; // panel's last-known contents, required by the OLD_DATA transfer
 
 #if !CONFIG_TDECK_MAX_SIM_MODE
 static void epd_write_byte(uint8_t val, bool is_data)
@@ -149,10 +66,8 @@ static inline void epd_write_cmd(uint8_t cmd) { epd_write_byte(cmd, false); }
 static inline void epd_write_data(uint8_t data) { epd_write_byte(data, true); }
 
 // Push a whole framebuffer as ONE transaction rather than 9,600 single-byte
-// ones. The naive per-byte loop costs a driver round-trip per byte (~300 ms
-// of pure overhead per refresh, twice per screen); this is a single DMA
-// burst. D/C is a level held across the payload, so it only needs setting
-// once.
+// ones -- a single DMA burst instead of a driver round-trip per byte. D/C is
+// a level held across the payload, so it only needs setting once.
 static void epd_write_data_bulk(const uint8_t *buf, size_t len)
 {
     gpio_set_level(BOARD_EPD_DC, 1); // data
@@ -178,7 +93,7 @@ static bool epd_wait_busy(void)
     return true;
 }
 
-static bool epd_panel_init(void)
+static bool epd_panel_init(epd_refresh_mode_t mode)
 {
     gpio_set_level(BOARD_EPD_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -189,7 +104,21 @@ static bool epd_panel_init(void)
     epd_write_data(EPD_PSR_DEFAULT);
 
     epd_write_cmd(EPD_CMD_POWER_ON);
-    return epd_wait_busy();
+    if (!epd_wait_busy()) return false;
+
+    // Vendor's EPD_Init_Fast / EPD_Init_Part: same as EPD_Init, then select
+    // the faster waveform. Order (after POWER_ON's busy wait) is the vendor's.
+    if (mode == EPD_REFRESH_FAST || mode == EPD_REFRESH_PARTIAL) {
+        epd_write_cmd(EPD_CMD_LUT_SEL_E0);
+        epd_write_data(EPD_E0_FAST_PART);
+        epd_write_cmd(EPD_CMD_LUT_SEL_E5);
+        epd_write_data(mode == EPD_REFRESH_FAST ? EPD_E5_FAST : EPD_E5_PARTIAL);
+        if (mode == EPD_REFRESH_PARTIAL) {
+            epd_write_cmd(EPD_CMD_CDI);
+            epd_write_data(EPD_CDI_PARTIAL);
+        }
+    }
+    return true;
 }
 
 static void epd_power_off_and_sleep(void)
@@ -201,24 +130,36 @@ static void epd_power_off_and_sleep(void)
     epd_write_data(EPD_DEEP_SLEEP_KEY);
 }
 
-// Full-screen refresh: panel needs both its last-known contents (OLD_DATA)
-// and the new frame (NEW_DATA) to compute the waveform, then a REFRESH
-// pulse. This always full-refreshes (no partial-refresh support here --
-// GDEQ031T10 supports it per the vendor reference, but that needs the
-// base-map RAM dance in EPD_SetRAMValue_BaseMap/EPD_Dis_Part, deferred as
-// UI-polish scope). Re-initializes the panel every call per the vendor's
-// own guidance ("Re-initialization is required for every full screen
-// update"), and deep-sleeps afterward to protect panel lifespan.
-static void epd_full_refresh(const uint8_t *new_fb)
+// Whole-screen refresh in the requested waveform: panel needs both its
+// last-known contents (OLD_DATA) and the new frame (NEW_DATA) to compute
+// the waveform, then a REFRESH pulse. The data path is identical for all
+// three modes (vendor's EPD_WhiteScreen_ALL vs EPD_Dis_PartAll differ only
+// in the init variant). Re-initializes the panel every call per the
+// vendor's own guidance, and deep-sleeps afterward to protect panel
+// lifespan -- safe for PARTIAL too, since the RST pulse in init wakes it
+// and OLD data is re-sent rather than relying on retained RAM.
+// Panel power state. While the user is interacting, consecutive refreshes
+// skip the reset/PSR/POWER_ON re-init (63ms) and the POWER_OFF + 100ms +
+// deep-sleep tail (142ms): the controller stays powered with its LUT
+// selection intact, and only the RAM writes + DRF happen -- the same
+// "power on once, refresh many, hibernate later" flow GxEPD2 uses for this
+// panel. epaper_sleep() (called by the flush task after an idle timeout)
+// powers off and deep-sleeps; the next refresh re-inits from cold. A mode
+// change (partial <-> full) always re-inits, since the waveform registers
+// are written in init.
+static bool s_awake = false;
+static epd_refresh_mode_t s_awake_mode = EPD_REFRESH_FULL;
+
+static void epd_refresh(const uint8_t *new_fb, epd_refresh_mode_t mode)
 {
-    // Timed because the whole partial-refresh design (UI_DESIGN 5.5/5.6 --
-    // the ghost budget, the coalescing window, the no-live-timer verdict) is
-    // currently reasoning from an UNMEASURED baseline: the README's "2-3 s"
-    // is an estimate nobody in-tree ever checked (U7). This is the control
-    // number that the partial path gets compared against.
     int64_t t_start = esp_timer_get_time();
 
-    if (!epd_panel_init()) return;
+    if (!s_awake || s_awake_mode != mode) {
+        if (!epd_panel_init(mode)) return;
+        s_awake = true;
+        s_awake_mode = mode;
+    }
+    int64_t t_init = esp_timer_get_time();
 
     epd_write_cmd(EPD_CMD_OLD_DATA);
     epd_write_data_bulk(s_old_fb, EPD_BUF_SIZE);
@@ -226,14 +167,22 @@ static void epd_full_refresh(const uint8_t *new_fb)
     epd_write_cmd(EPD_CMD_NEW_DATA);
     epd_write_data_bulk(new_fb, EPD_BUF_SIZE);
     memcpy(s_old_fb, new_fb, EPD_BUF_SIZE);
+    int64_t t_data = esp_timer_get_time();
 
     epd_write_cmd(EPD_CMD_REFRESH);
     vTaskDelay(pdMS_TO_TICKS(1));
     epd_wait_busy();
+    int64_t t_refr = esp_timer_get_time();
 
-    epd_power_off_and_sleep();
+    // No POWER_OFF/deep-sleep here any more -- see s_awake / epaper_sleep().
+    int64_t t_end = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "full refresh: %lld ms", (esp_timer_get_time() - t_start) / 1000);
+    // Phase breakdown so the per-refresh overhead (init / data / waveform /
+    // power-off) can be attacked with numbers rather than guesses.
+    static const char *const names[] = {"full", "fast", "partial"};
+    ESP_LOGI(TAG, "%s refresh: %lld ms (init %lld, data %lld, waveform %lld, off %lld)",
+             names[mode], (t_end - t_start) / 1000, (t_init - t_start) / 1000,
+             (t_data - t_init) / 1000, (t_refr - t_data) / 1000, (t_end - t_refr) / 1000);
 }
 #endif // !CONFIG_TDECK_MAX_SIM_MODE
 
@@ -250,13 +199,31 @@ esp_err_t epaper_display_init(void)
     gpio_config(&io_conf);
 
     gpio_set_level(BOARD_EPD_CS, 1);
-    gpio_set_level(BOARD_EPD_BACKLIGHT, 1); // Turn front-light on by default
+
+    // Front-light on an LEDC PWM channel rather than a bare GPIO, so it can
+    // be dimmed: an e-paper front-light is a glare source on a matte panel
+    // and 10-25% is usually plenty indoors. Default duty kept at 100% for
+    // now (unchanged behavior); EPD_FRONTLIGHT_DEFAULT_PCT / the setter below.
+    ledc_timer_config_t lt = {};
+    lt.speed_mode = LEDC_LOW_SPEED_MODE;
+    lt.duty_resolution = LEDC_TIMER_10_BIT;
+    lt.timer_num = LEDC_TIMER_0;
+    lt.freq_hz = 5000;
+    lt.clk_cfg = LEDC_AUTO_CLK;
+    ledc_timer_config(&lt);
+    ledc_channel_config_t lc = {};
+    lc.gpio_num = BOARD_EPD_BACKLIGHT;
+    lc.speed_mode = LEDC_LOW_SPEED_MODE;
+    lc.channel = LEDC_CHANNEL_0;
+    lc.timer_sel = LEDC_TIMER_0;
+    lc.duty = 0;
+    lc.hpoint = 0;
+    ledc_channel_config(&lc);
+    epaper_set_frontlight_pct(EPD_FRONTLIGHT_DEFAULT_PCT);
 
     // SPI2 is shared with the LoRa radio and the SD card. Park their CS
     // lines HIGH (deselected) before any transaction, or an undriven CS can
-    // float low and corrupt e-paper traffic. Called out as a bench
-    // verification item in docs/HARDWARE_CAVEATS.md; doing it in code costs
-    // nothing and removes the failure mode.
+    // float low and corrupt e-paper traffic.
     gpio_config_t cs_conf = {};
     cs_conf.intr_type = GPIO_INTR_DISABLE;
     cs_conf.mode = GPIO_MODE_OUTPUT;
@@ -270,7 +237,6 @@ esp_err_t epaper_display_init(void)
     io_conf.pin_bit_mask = (1ULL << BOARD_EPD_BUSY);
     gpio_config(&io_conf);
 
-    memset(s_fb, 0xFF, sizeof(s_fb));
     memset(s_old_fb, 0xFF, sizeof(s_old_fb));
 
 #if CONFIG_TDECK_MAX_SIM_MODE
@@ -281,15 +247,13 @@ esp_err_t epaper_display_init(void)
     bus_cfg.mosi_io_num = BOARD_SPI_MOSI;
     // MISO is wired even though the e-paper never drives it: this is the
     // SHARED SPI2 bus (e-paper CS 34, LoRa CS 3, SD CS 48). Whoever
-    // initializes the bus first fixes its pin set for everyone, so leaving
-    // MISO at -1 here would silently make the SX1262 and the SD card
-    // unusable the moment either is added.
+    // initializes the bus first fixes its pin set for everyone.
     bus_cfg.miso_io_num = BOARD_SPI_MISO;
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = EPD_BUF_SIZE;
     esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) { // ALREADY shared with LoRa/SD on real hardware
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) { // ALREADY shared, e.g. by another initializer
         ESP_LOGE(TAG, "spi_bus_initialize failed: %d", ret);
         return ret;
     }
@@ -310,42 +274,46 @@ esp_err_t epaper_display_init(void)
     return ESP_OK;
 }
 
-void epaper_set_backlight(bool enable)
+static uint8_t s_frontlight_pct = EPD_FRONTLIGHT_DEFAULT_PCT;
+
+void epaper_set_frontlight_pct(uint8_t pct)
 {
-    gpio_set_level(BOARD_EPD_BACKLIGHT, enable ? 1 : 0);
+    if (pct > 100) pct = 100;
+    s_frontlight_pct = pct;
+    uint32_t duty = (1023u * pct) / 100u;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-void epaper_render_call_status(const char *caller_id, const char *status, bool ptt_active)
+void epaper_set_backlight(bool enable)
 {
-    ESP_LOGI(TAG, "[EPD RENDER] Caller: %s | Status: %s | PTT: %s",
-             caller_id ? caller_id : "None",
-             status ? status : "Idle",
-             ptt_active ? "TALKING" : "LISTENING");
+    uint32_t duty = enable ? (1023u * s_frontlight_pct) / 100u : 0;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
 
-    memset(s_fb, 0xFF, sizeof(s_fb));
-
-    // Caller ID / extension, large digits centered near the top.
-    if (caller_id && caller_id[0]) {
-        draw_digit_string(20, 40, caller_id, 6, 10);
-    }
-
-    // Status pictogram: a placeholder visual state indicator (filled =
-    // active/ringing, outline = idle) rather than rendered status text --
-    // a real icon set / font is UI-polish scope beyond this PoC.
-    bool active = ptt_active || (status && strstr(status, "Call") != NULL) ||
-                  (status && strstr(status, "Ring") != NULL);
-    if (active) {
-        fill_rect(EPD_WIDTH / 2 - 30, 140, 60, 60, true);
-    } else {
-        fill_rect(EPD_WIDTH / 2 - 30, 140, 60, 4, true);
-        fill_rect(EPD_WIDTH / 2 - 30, 196, 60, 4, true);
-        fill_rect(EPD_WIDTH / 2 - 30, 140, 4, 60, true);
-        fill_rect(EPD_WIDTH / 2 + 26, 140, 4, 60, true);
-    }
-
+void epaper_flush_mode(const uint8_t *fb, epd_refresh_mode_t mode)
+{
 #if CONFIG_TDECK_MAX_SIM_MODE
-    ESP_LOGD(TAG, "[sim] full refresh skipped");
+    ESP_LOGD(TAG, "[sim] refresh (mode %d) skipped", (int)mode);
+    (void)fb;
 #else
-    epd_full_refresh(s_fb);
+    epd_refresh(fb, mode);
+#endif
+}
+
+void epaper_flush(const uint8_t *fb)
+{
+    epaper_flush_mode(fb, EPD_REFRESH_FULL);
+}
+
+void epaper_sleep(void)
+{
+#if !CONFIG_TDECK_MAX_SIM_MODE
+    if (!s_awake) return;
+    int64_t t0 = esp_timer_get_time();
+    epd_power_off_and_sleep(); // bistable: image holds with zero static drain
+    s_awake = false;
+    ESP_LOGI(TAG, "panel deep sleep after idle (%lld ms)", (esp_timer_get_time() - t0) / 1000);
 #endif
 }

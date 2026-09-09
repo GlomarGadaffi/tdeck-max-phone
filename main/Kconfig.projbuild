@@ -57,4 +57,27 @@ menu "T-Deck MAX Phone"
             NAKed, which is the least debuggable outcome on a board with
             six devices sharing one I2C bus.
 
+    config TDECK_MAX_TOUCH_DEBUG
+        bool "Log raw CST3530 touch points"
+        default n
+        help
+            Log the raw x/y/pressure/event of touch reports (rate-limited to
+            ~5/s while a finger is down). Enable to establish the touch
+            layer's orientation relative to the display (TOUCH_SWAP_XY /
+            TOUCH_MIRROR_X / TOUCH_MIRROR_Y in touch_cst3530.c), then turn
+            back off.
+
+    config TDECK_MAX_TZ
+        string "Local time zone (POSIX TZ string)"
+        default "EST5EDT,M3.2.0,M11.1.0"
+        help
+            Default only -- Settings can change it at runtime (persisted in
+            NVS). Applied with setenv("TZ")+tzset() so the status-bar clock
+            (SNTP) shows local time with DST handled. Examples:
+            "CST6CDT,M3.2.0,M11.1.0", "PST8PDT,M3.2.0,M11.1.0", "UTC0".
+
+    config TDECK_MAX_SNTP_SERVER
+        string "SNTP server for the status-bar clock"
+        default "time.nist.gov"
+
 endmenu

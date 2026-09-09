@@ -1,59 +1,58 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  tdeck-max-phone  —  app_main.cpp
-//  SIP Phone Firmware for LilyGO T-Deck MAX, registered as a LAN extension
-//  to a drawbridge PBX instance (which owns all 3CX integration).
+//  SIP phone firmware for the LilyGO T-Deck MAX, registered as a LAN
+//  extension to a drawbridge PBX instance (which owns all 3CX integration).
 //
 //  Task layout (three tasks, deliberately):
-//    main       - SIP control, keypad, UI state machine. Never does slow I/O.
+//    main       - SIP control, the LVGL pump (keypad + touch + e-paper
+//                 render), the phone state machine. Never does slow I/O
+//                 once the loop starts. The ONLY task that touches LVGL.
 //    audio pump - RTP<->I2S, paced ONLY by the blocking i2s_channel_read().
-//    e-paper    - the 2-3 s panel refresh, off the control path entirely.
+//    epd_flush  - the 0.7-3 s panel refresh, off the control path entirely
+//                 (lvgl_glue.c).
 //
-//  Audio and display each used to run inline on the main loop, which made a
-//  call sound choppy (~20 pkt/s instead of 50, with latency that grew for the
-//  whole call) and blacked audio out for seconds on every screen change.
+//  Boot: peripherals -> LVGL -> screens registered -> Wi-Fi (saved creds
+//  or the on-device wizard) -> home grid -> SIP. A phone with no network
+//  still boots to the home screen; SIP starts when Wi-Fi arrives.
 // ─────────────────────────────────────────────────────────────────────────────
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "nvs_flash.h"
-#include "nvs.h"
 #include "esp_log.h"
-#include "esp_timer.h"
-#include "esp_sleep.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "esp_netif_sntp.h"
 #include "driver/i2c.h"
-#include <cctype>
-#include <cstring>
 #include <cmath>
-#include <string>
+#include <cstdlib>
+#include <ctime>
 
 #include "board_tdeck_max.h"
 #include "poc_config.h"
 #include "net_wifi.h"
 #include "xl9555.h"
-#include "pmu_sy6970.h"
 #include "es8311_audio.h"
 #include "tca8418_keypad.h"
+#include "touch_cst3530.h"
 #include "epaper_display.h"
-#include "tincan_uac.hpp"
-#include "playout_buffer.hpp"
-#include "tone_gen.h"
+#include "lvgl_glue.h"
+#include "scr_mgr.h"
+#include "app_nav.h"
+#include "wifi_wizard.h"
+#include "view_settings.h"
+#include "view_contacts.h"
+#include "contacts.h"
+#include "call_log.h"
+#include "phone_app.h"
 
 static const char *TAG = "APP_MAIN";
-
-// Keypad-driven call state, layered on top of TincanUac's own SIP state
-// (uac.hasIncomingCall()/inCall()/callEnded()). Idle/Dialing/Ringing-out
-// are UI-only distinctions -- TincanUac tracks its own Calling/Ringing/
-// InCall internally and this just decides what the keypad and e-paper do
-// in response.
-enum class UiState { Idle, Dialing, Calling, Incoming, InCall, ConfirmOff };
 
 // ── boot-time hardware bring-up helpers ─────────────────────────────────────
 
 // Log-and-continue instead of ESP_ERROR_CHECK. On a board with six devices
 // sharing one I2C bus, aborting on the first NAK gives a panic-reboot loop
-// with no UI and no indication of WHICH device failed -- the least
-// debuggable outcome possible. Continuing lets the boot log report every
-// failure at once and still reach the I2C scan below. Set
+// with no UI and no indication of WHICH device failed. Continuing lets the
+// boot log report every failure at once and still reach the I2C scan. Set
 // CONFIG_TDECK_MAX_HALT_ON_INIT_FAIL=y to get fail-fast back.
 static bool s_init_failed = false;
 static void try_init(const char *what, esp_err_t err)
@@ -84,9 +83,7 @@ static esp_err_t i2c_master_init(void)
 }
 
 // Probe every 7-bit address and name the ones this board is supposed to
-// have. This is the single most useful line of boot output during bring-up:
-// it answers "is the bus even alive, and which chip is missing" before any
-// driver-level debugging starts.
+// have: "is the bus even alive, and which chip is missing".
 static void i2c_bus_scan(void)
 {
 #if CONFIG_TDECK_MAX_SIM_MODE
@@ -94,7 +91,7 @@ static void i2c_bus_scan(void)
 #else
     struct { uint8_t addr; const char *name; } expected[] = {
         {0x18, "ES8311 audio codec"},
-        {0x1A, "CST328 touch"},
+        {0x1A, "CST3530 touch"},
         {0x20, "XL9555 I/O expander"},
         {0x28, "BHI260AP IMU"},
         {0x34, "TCA8418 keypad"},
@@ -132,349 +129,17 @@ static void i2c_bus_scan(void)
 #endif
 }
 
-// ── e-paper render task ─────────────────────────────────────────────────────
-// A full-screen refresh on this panel is ~2-3 s of panel time plus SPI. Doing
-// that inline meant every dialled digit and every call-state change stalled
-// SIP and audio for seconds. The main loop now just posts a request.
-
-struct RenderRequest {
-    char caller[24];
-    char status[24];
-    bool active;
-};
-
-static QueueHandle_t s_render_q = nullptr;
-
-static void ui_render(const char *caller, const char *status, bool active)
-{
-    if (!s_render_q) return;
-    RenderRequest r{};
-    std::strncpy(r.caller, caller ? caller : "", sizeof(r.caller) - 1);
-    std::strncpy(r.status, status ? status : "", sizeof(r.status) - 1);
-    r.active = active;
-    // Depth-1 queue with overwrite: only the newest screen matters, and this
-    // must never block the control path even if the panel is mid-refresh.
-    xQueueOverwrite(s_render_q, &r);
-}
-
-// Real power off, the way the board is built to do it.
-//
-// This mirrors LilyGO's factory ui_shutdown_on(): put the touch controller in
-// reset, then force the SY6970's battery FET open (REG09 bit 5, BATFET_DIS) --
-// what XPowersLib exposes as PPM.shutdown(). That genuinely disconnects the
-// battery rather than idling the CPU, and the PWR button on the top right
-// brings it back, because that button is wired to the PMU's power-on pin and
-// not to any ESP32 GPIO. Which is why it works as an on/off switch at all.
-//
-// Deep sleep is the fallback, not the plan: BATFET_DIS gates only the battery
-// path, so on USB the board keeps running from VBUS. LilyGO's own UI refuses
-// to shut down in that case ("cannot be shut down when connected to USB").
-// Rather than refuse, we sleep instead and say so -- on the bench the board is
-// nearly always on USB, and "nothing happened" would be the worst answer.
-//
-// The e-paper holds its image with no power at all, so the final screen stays
-// readable while the board is off. The panel keeps telling the truth.
-// ── Dial buffer + last-number redial ────────────────────────────────────────
-
-// Characters the dial buffer accepts. Must stay in sync with s_keymap
-// (tca8418_keypad.cpp) on the input side and glyph_index() (epaper_display.cpp)
-// on the output side -- a character the keypad can produce but the display
-// can't draw looks like a dropped keypress.
-static bool is_dial_char(char c)
-{
-    return (c >= '0' && c <= '9') || c == '*' || c == '#' || c == '+';
-}
-
-// A dial buffer longer than this is a mistake, not a number. Further presses
-// are ignored rather than beeped (there is no beep path) -- the buffer simply
-// stops growing, which is visible on the panel.
-#define DIAL_BUFFER_MAX 20
-
-// Last dialled number, persisted so ENT-from-idle survives a reboot. This is
-// what replaced the POC_TEST_DIAL bench hack: it keeps the muscle memory that
-// ENT from the idle screen places a call, but the target is now something the
-// user actually dialled rather than a compile-time constant.
-static const char *NVS_NS_PHONE   = "phone";
-static const char *NVS_KEY_LASTNO = "lastno";
-
-static std::string load_last_dialled(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS_PHONE, NVS_READONLY, &h) != ESP_OK) return {};
-
-    char   buf[DIAL_BUFFER_MAX + 1] = {0};
-    size_t len = sizeof(buf);
-    esp_err_t err = nvs_get_str(h, NVS_KEY_LASTNO, buf, &len);
-    nvs_close(h);
-
-    if (err != ESP_OK) return {};
-    return std::string(buf);
-}
-
-static void save_last_dialled(const std::string &number)
-{
-    if (number.empty() || number.size() > DIAL_BUFFER_MAX) return;
-
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS_PHONE, NVS_READWRITE, &h) != ESP_OK) return;
-    if (nvs_set_str(h, NVS_KEY_LASTNO, number.c_str()) == ESP_OK) nvs_commit(h);
-    nvs_close(h);
-}
-
-static void power_off(TincanUac &uac)
-{
-    ESP_LOGW(TAG, "powering off");
-
-    // Don't leave the far end talking to a corpse.
-    if (uac.inCall()) {
-        uac.hangup();
-        vTaskDelay(pdMS_TO_TICKS(150));   // let the BYE actually get out
-    }
-    audio_hardware_set_amp(false);
-
-    bool onUsb = false;
-    if (pmu_sy6970_vbus_present(&onUsb) != ESP_OK) {
-        ESP_LOGW(TAG, "could not read VBUS state; assuming battery");
-        onUsb = false;
-    }
-
-    // Posted through the queue, not rendered inline: epaper_task owns the SPI
-    // bus and driving it from here would race a refresh already in flight.
-    // The panel needs roughly two seconds for a full refresh.
-    ui_render("", onUsb ? "Sleeping (USB)" : "Powered Off", false);
-    vTaskDelay(pdMS_TO_TICKS(2500));
-
-    // Touch controller into reset before the rails move. The vendor does this
-    // with the comment that it can otherwise come up in an undefined state.
-    xl9555_reset_touch();
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // Drop every rail xl9555_init() brought up -- 4G modem, LoRa, GPS,
-    // haptics, speaker amp, 1V8. On the USB path especially, these would
-    // otherwise stay powered for the entire "off" period.
-    xl9555_write_port0(0x00);
-    xl9555_write_port1(0x00);
-
-    if (!onUsb) {
-        pmu_sy6970_shutdown();
-        vTaskDelay(pdMS_TO_TICKS(500));   // the FET should open well inside this
-        // Still here: the write landed but something is still feeding the
-        // system rail. Fall through to sleep rather than sit in a dead loop.
-        ESP_LOGW(TAG, "still running after BATFET_DIS -- sleeping instead");
-    } else {
-        ESP_LOGW(TAG, "on USB: BATFET_DIS cannot cut VBUS, deep sleeping instead. "
-                      "Unplug USB and use the PWR button for a true power off.");
-    }
-
-    // BOOT (GPIO0) wakes it from sleep -- a real physical switch, documented
-    // by the vendor for download mode, and active-low. Not the keypad: waking
-    // on the TCA8418's INT would be nicer but needs the controller left
-    // powered and configured to assert INT while asleep, which is unverified.
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-    esp_deep_sleep_start();
-    // Not reached: deep sleep exits through a reset, so the board comes back
-    // through app_main() and re-registers from scratch.
-}
-
-static void epaper_task(void *)
-{
-    RenderRequest r;
-    for (;;) {
-        if (xQueueReceive(s_render_q, &r, portMAX_DELAY) == pdTRUE) {
-            epaper_render_call_status(r.caller, r.status, r.active);
-        }
-    }
-}
-
-// ── audio pump task ─────────────────────────────────────────────────────────
-// Paced solely by the blocking i2s_channel_read() -- one 20 ms frame in, one
-// out, 50 frames/sec. Adding any vTaskDelay here (as the old inline version
-// effectively did) directly reduces packet rate and grows one-way latency for
-// the whole call.
-
-static TincanUac *s_uac = nullptr;
-
-static void audio_task(void *)
-{
-    int16_t pcm[POC_FRAME_SAMPLES];
-    int16_t micbuf[POC_FRAME_SAMPLES];
-    bool pumping = false;
-
-    // Jitter buffer between RTP arrival and the speaker. pumpRx() drains the
-    // socket into it every tick; read() always yields a full frame (real
-    // audio, or low-level comfort noise on underrun) so the DMA never
-    // replays stale samples and a late packet no longer costs a 20 ms hole.
-    static PlayoutBuffer jb(POC_JITTER_MAX_MS * POC_SAMPLE_RATE_HZ / 1000,
-                            POC_JITTER_TARGET_MS * POC_SAMPLE_RATE_HZ / 1000);
-
-    // Ringer state (idle branch below).
-    tone_gen_t ringTone{};
-    int ringFrame = 0;
-
-    // Q8 fixed point so the per-sample work is a multiply and a shift.
-    const int32_t rxGainQ8 = (int32_t)(powf(10.0f, POC_RX_GAIN_DB / 20.0f) * 256.0f);
-    const int32_t duckQ8   = (POC_DUCK_DB == 0.0f)
-                             ? 256
-                             : (int32_t)(powf(10.0f, POC_DUCK_DB / 20.0f) * 256.0f);
-    const int hangoverFrames = POC_DUCK_HANGOVER_MS / 20;   // frames are 20 ms
-    int duckFrames = 0;
-    int statFrames = 0;
-    // Mean |sample| accumulators for the census. Packet counts alone can't
-    // tell "RTP is flowing" from "RTP is flowing and every frame is silence",
-    // which is the difference between a codec fault here and a media fault
-    // upstream. 64-bit because 250 frames * 160 samples * 32767 overflows 32.
-    int64_t statMicSum = 0, statRxSum = 0;
-    int32_t statMicN = 0, statRxN = 0;
-    int16_t statMicPeak = 0, statRxPeak = 0;
-
-    for (;;) {
-        if (!s_uac || !s_uac->inCall()) {
-            pumping = false;
-            duckFrames = 0;
-            if (s_uac && s_uac->hasIncomingCall()) {
-                // Ringer. The main loop turned the amp on when the INVITE
-                // arrived; this just paces the cadence off the blocking
-                // speaker write -- 300 frames = 6 s, first 100 = 2 s on.
-                const bool on = (ringFrame % 300) < 100;
-                if (on) {
-                    tone_gen_fill(&ringTone, 440.0f, 480.0f, POC_RING_AMPL,
-                                  POC_SAMPLE_RATE_HZ, pcm, POC_FRAME_SAMPLES);
-                } else {
-                    memset(pcm, 0, sizeof(pcm));
-                }
-                audio_hardware_write_spk(pcm, POC_FRAME_SAMPLES);
-                ringFrame++;
-                continue;
-            }
-            // Not in a call: nothing to pace against, so idle politely.
-            ringFrame = 0;
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        if (!pumping) {
-            // Entering a call -- drop anything the far end queued before we
-            // started pumping, so we don't inherit that as permanent latency.
-            s_uac->flushRtpBacklog();
-            jb.clear();
-            pumping = true;
-            statFrames = 0;
-        }
-
-        // Periodic RTP census. "No audio" has three causes that are
-        // indistinguishable from the outside -- we never sent, they never
-        // sent, or both flowed and the codec path is at fault -- and this is
-        // the cheapest way to tell them apart without a packet capture.
-        // 250 frames * 20 ms = 5 s.
-        if (++statFrames >= 250) {
-            statFrames = 0;
-            // mic~/rx~ are mean |sample| out of 32767. Anything under ~30 is
-            // effectively digital silence; speech sits in the hundreds.
-            // rej= counts RTP from an IP other than the negotiated peer's -- pumpRx()
-            // filters those where the old path accepted anything. A silent call
-            // with rx=0 and rej climbing means the far end is sending from an
-            // address we did not expect (check *11 reroute and the anchor first).
-            ESP_LOGI(TAG, "rtp census: tx=%lu rx=%lu lost=%lu oo=%lu rej=%lu | jb=%u smp under=%llu"
-                          " | mic~%ld peak %d | rx~%ld peak %d%s",
-                     (unsigned long)s_uac->rtpTx(), (unsigned long)s_uac->rtpRx(),
-                     (unsigned long)s_uac->rtpLost(), (unsigned long)s_uac->rtpOutOfOrder(),
-                     (unsigned long)s_uac->rtpRejected(),
-                     (unsigned)jb.getLength(), (unsigned long long)jb.getUnderruns(),
-                     (long)(statMicN ? statMicSum / statMicN : 0), (int)statMicPeak,
-                     (long)(statRxN ? statRxSum / statRxN : 0), (int)statRxPeak,
-                     s_uac->lastTxErrno() ? " TX FAILING" : "");
-            if (s_uac->lastTxErrno()) {
-                ESP_LOGE(TAG, "  sendto() errno %d -- RTP is not leaving the board",
-                         s_uac->lastTxErrno());
-            }
-            statMicSum = statRxSum = 0;
-            statMicN = statRxN = 0;
-            statMicPeak = statRxPeak = 0;
-        }
-
-        // Blocking read IS the clock for this loop.
-        size_t got = audio_hardware_read_mic(micbuf, POC_FRAME_SAMPLES);
-        if (got > 0) {
-            // Duck the mic if the far end was talking on the previous frame.
-            // Reading the mic before writing the speaker is what makes this
-            // the right frame to attenuate: it was captured while their audio
-            // was coming out of the speaker.
-            if (duckFrames > 0) {
-                for (size_t i = 0; i < got; i++) {
-                    micbuf[i] = (int16_t)((micbuf[i] * duckQ8) >> 8);
-                }
-                duckFrames--;
-            }
-            // Census: measure what we are ACTUALLY transmitting, i.e. after
-            // ducking, since that is what the far end receives.
-            for (size_t i = 0; i < got; i++) {
-                int16_t a = micbuf[i] < 0 ? (int16_t)-micbuf[i] : micbuf[i];
-                statMicSum += a;
-                if (a > statMicPeak) statMicPeak = a;
-            }
-            statMicN += (int32_t)got;
-            s_uac->sendAudioFrame(micbuf, got);
-        }
-
-        // Everything queued since the last tick goes into the jitter buffer;
-        // one frame comes back out. `real` is false on underrun, in which
-        // case pcm holds comfort noise -- play it, but don't let it drive
-        // ducking or the census.
-        s_uac->pumpRx(jb);
-        const size_t rx = POC_FRAME_SAMPLES;
-        const bool real = jb.read(pcm, rx);
-        if (real) {
-            // Decide "is the far end talking" on the RAW decoded frame, before
-            // the gain below. Measuring post-gain would mean the threshold
-            // silently retunes itself every time POC_RX_GAIN_DB changes.
-            int32_t sumAbs = 0;
-            int16_t framePeak = 0;
-            for (size_t i = 0; i < rx; i++) {
-                int16_t a = pcm[i] < 0 ? (int16_t)-pcm[i] : pcm[i];
-                sumAbs += a;
-                if (a > framePeak) framePeak = a;
-            }
-            // Census on the RAW decoded frame, before rx gain -- this is what
-            // actually arrived from the bridge.
-            statRxSum += sumAbs;
-            statRxN += (int32_t)rx;
-            if (framePeak > statRxPeak) statRxPeak = framePeak;
-
-            if ((sumAbs / (int32_t)rx) > POC_DUCK_THRESHOLD && duckQ8 != 256) {
-                duckFrames = hangoverFrames;
-            }
-
-            if (rxGainQ8 != 256) {
-                for (size_t i = 0; i < rx; i++) {
-                    int32_t v = ((int32_t)pcm[i] * rxGainQ8) >> 8;
-                    if (v >  32767) v =  32767;
-                    if (v < -32768) v = -32768;
-                    pcm[i] = (int16_t)v;
-                }
-            }
-        }
-        audio_hardware_write_spk(pcm, rx);
-    }
-}
-
 #if CONFIG_TDECK_MAX_AUDIO_SELFTEST
 // Speaker and microphone failures are indistinguishable during a call --
 // both yield silence. This separates them: an audible tone proves the
-// DAC/I2S/amp path, and a non-zero mic level proves the ADC path without
-// anyone having to hear anything.
-// One pass of "play a tone, then listen". Returns the mic peak; logs the
-// speaker result. `label` identifies which pin orientation is under test.
+// DAC/I2S/amp path, and a non-zero mic level proves the ADC path.
 static int32_t audio_pass(const char *label)
 {
-    // Derive everything from the rate the codec was ACTUALLY opened at.
-    // Generating a tone for 8 kHz and playing it at 16 kHz halves its
-    // duration and doubles its pitch, which is what made a "2 second" tone
-    // finish in 428 ms and sent us chasing the wrong fault.
     const uint32_t sr = audio_hardware_sample_rate();
     const int frames = (int)((sr * 2) / POC_FRAME_SAMPLES);
 
     audio_hardware_set_amp(true);
-    vTaskDelay(pdMS_TO_TICKS(50));   // let the amp settle before driving it
+    vTaskDelay(pdMS_TO_TICKS(50));
     ESP_LOGW(TAG, "[%s] playing 1 kHz tone for 2 s @ %lu Hz -- LISTEN NOW", label, sr);
 
     int16_t tone[POC_FRAME_SAMPLES];
@@ -484,8 +149,6 @@ static int32_t audio_pass(const char *label)
     int64_t t0 = esp_timer_get_time();
     for (int f = 0; f < frames; f++) {
         for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
-            // Amplitude is POC_SELFTEST_TONE_AMPL -- see poc_config.h for why
-            // it is a knob and not a literal. It has been turned down twice.
             tone[i] = (int16_t)(POC_SELFTEST_TONE_AMPL * sinf(phase));
             phase += step;
             if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
@@ -502,11 +165,6 @@ static int32_t audio_pass(const char *label)
         ESP_LOGE(TAG, "[%s] TX ran at the wrong rate -- sample-rate/channel mismatch", label);
     }
 
-    // Amp off before capturing. Speaker and mic are centimetres apart with no
-    // isolation, so leaving the amp powered lets speaker output couple back
-    // into the mic and inflate the level we are trying to measure -- which is
-    // exactly what it looked like the first time the DAC ceiling was raised.
-    // The capture measures the mic, so the speaker has no business being live.
     audio_hardware_set_amp(false);
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -550,30 +208,51 @@ static int32_t audio_pass(const char *label)
 static void audio_selftest(void)
 {
     ESP_LOGW(TAG, "=== AUDIO SELF-TEST ===");
-
-    // Prove the codec is actually configured before blaming the wiring:
-    // "never configured", "configured but muted" and "configured, wired
-    // wrong" all sound identical from the speaker.
     int reg_fails = audio_hardware_check_codec_regs();
     audio_hardware_probe_asdout_activity();
     audio_hardware_probe_pin_drive();
-
     if (reg_fails > 0) {
         ESP_LOGE(TAG, "%d codec register(s) wrong -- fix those before trusting "
                       "anything below", reg_fails);
     }
-
     audio_pass("audio");
-
     ESP_LOGW(TAG, "=== SELF-TEST COMPLETE ===");
 }
 #endif // CONFIG_TDECK_MAX_AUDIO_SELFTEST
+
+// A one-line splash while a blocking boot step (saved-credential Wi-Fi
+// connect, up to 30 s) runs before the shell exists.
+static lv_obj_t *splash(const char *text)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_t *content = app_nav_frame(scr, "T-Deck Phone", "");
+    lv_obj_t *l = lv_label_create(content);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_label_set_text(l, text);
+    lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, 8);
+    lvgl_glue_request_full_refresh();
+    lv_disp_load_scr(scr);
+    lvgl_glue_flush_now();
+    return scr;
+}
 
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "==================================================");
     ESP_LOGI(TAG, "  LilyGO T-Deck MAX SIP Phone (via drawbridge PBX) ");
     ESP_LOGI(TAG, "==================================================");
+    {
+        static const char *const reasons[] = {
+            "unknown", "power-on", "external pin", "software reset", "PANIC",
+            "interrupt watchdog", "TASK WATCHDOG", "other watchdog", "deep sleep wake",
+            "brownout", "SDIO", "USB", "JTAG", "efuse", "power glitch", "CPU lockup",
+        };
+        int r = (int)esp_reset_reason();
+        ESP_LOGW(TAG, "reset reason: %d (%s)", r,
+                 (r >= 0 && r < (int)(sizeof(reasons) / sizeof(reasons[0]))) ? reasons[r] : "?");
+    }
 
     try_init("nvs_flash", nvs_flash_init());
 
@@ -581,29 +260,20 @@ extern "C" void app_main(void)
     try_init("i2c bus", i2c_master_init());
     i2c_bus_scan();
 
-    // 2. Peripherals. Every one is log-and-continue so a single NAK doesn't
-    //    hide the state of the other five.
+    // 2. Peripherals. Every one is log-and-continue.
     try_init("XL9555 expander", xl9555_init());
     // 8 kHz: G.711 is the only codec drawbridge will carry, and nothing in
-    // this firmware resamples. The bring-up ran at 16 kHz for a while to rule
-    // out the unusually low 2.048 MHz MCLK that 8 k implies; that turned out
-    // not to be the problem (the data pins were swapped), so we are back on
-    // the rate the SIP path actually uses.
+    // this firmware resamples.
     try_init("ES8311 codec", audio_hardware_init(POC_SAMPLE_RATE_HZ));
-
-    // xl9555_init() brings the speaker amp up enabled. Nothing should be
-    // playing at boot, and an idle-but-powered amp both draws current and
-    // can hiss/click on DMA underrun -- the sibling tincan project turns
-    // it off for exactly this reason. It's re-enabled per call.
+    // xl9555_init() brings the speaker amp up enabled; nothing should be
+    // playing at boot. Re-enabled per call.
     audio_hardware_set_amp(false);
-
-    // xl9555_init() also asserts P1_0, which powers the A7682E 4G modem.
-    // This firmware never uses the modem (Wi-Fi only), so that is pure
-    // battery drain -- left as-is deliberately rather than changed blind,
-    // since the power-sequencing side effects on real hardware are
-    // unverified. See docs/HARDWARE_CAVEATS.md.
     try_init("TCA8418 keypad", tca8418_init());
     try_init("GDEQ031T10 e-paper", epaper_display_init());
+    // Optional: a unit without a working touch layer is still fully usable
+    // from the keypad.
+    if (touch_cst3530_init() == ESP_OK) ESP_LOGI(TAG, "init OK   : CST3530 touch");
+    else                                ESP_LOGW(TAG, "init SKIP : CST3530 touch (keypad only)");
 
     if (s_init_failed) {
         ESP_LOGW(TAG, "*** one or more peripherals failed to init (see above) ***");
@@ -614,215 +284,72 @@ extern "C" void app_main(void)
     audio_selftest();   // before Wi-Fi, so nothing else competes for the bus
 #endif
 
-    // 3. Display task first, so failures after this point can be shown.
-    s_render_q = xQueueCreate(1, sizeof(RenderRequest));
-    xTaskCreate(epaper_task, "epaper", 4096, nullptr, 3, nullptr);
-    ui_render(POC_SIP_EXT_SELF, "Booting", false);
-
-    // 4. Wi-Fi (bounded; won't hang forever on a bad SSID).
-    esp_err_t wifi_err = wifi_sta_connect(POC_WIFI_SSID, POC_WIFI_PASS);
-    if (wifi_err != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi did not come up; phone cannot register");
-        ui_render(POC_SIP_EXT_SELF, "No WiFi", false);
-        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    // 3. LVGL + the shell. From here on this task is the only LVGL owner.
+    lv_group_t *group = lvgl_glue_init();
+    if (!group) {
+        ESP_LOGE(TAG, "LVGL init failed (draw buffer allocation) -- halting");
+        vTaskDelete(NULL);
+        return;
     }
-    ESP_LOGI(TAG, "Wi-Fi up, local IP %s", wifi_local_ip());
+    scr_mgr_init();
+    try_init("contacts", contacts_init());
+    try_init("call log", call_log_init());
 
-    // 5. SIP UAC, registered as a LAN extension.
-    static TincanUac uac;
-    if (!uac.init(wifi_local_ip(), POC_SIP_LOCAL_PORT, POC_RTP_LOCAL_PORT,
-                  POC_SIP_SERVER_IP, POC_SIP_SERVER_PORT, POC_SIP_EXT_SELF,
-                  POC_SIP_REG_EXPIRES)) {
-        ESP_LOGE(TAG, "UAC init failed (socket bind?)");
-        ui_render(POC_SIP_EXT_SELF, "SIP init fail", false);
-        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    uac.setCredentials("", POC_SIP_SECRET);   // only used if the registrar challenges (#28)
-    uac.setDtmfMode(POC_DTMF_RFC2833 ? TincanUac::DtmfMode::Rfc2833
-                                     : TincanUac::DtmfMode::Inband);
-    bool registered = uac.registerExt();
-    s_uac = &uac;
+    phone_app_register_screens();
+    view_contacts_register();
+    view_settings_register();
+    app_nav_register("Phone",    LV_SYMBOL_CALL,     SCR_PHONE);
+    app_nav_register("Contacts", LV_SYMBOL_LIST,     SCR_CONTACTS);
+    app_nav_register("Settings", LV_SYMBOL_SETTINGS, SCR_SETTINGS);
+    app_nav_init();
 
-    // 6. Audio pump. Priority above the main loop: starving it is audible,
-    //    starving the UI is not. Pinned to core 1 to keep it away from the
-    //    Wi-Fi/lwIP stack on core 0.
-    xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 6, nullptr, 1);
+    settings_apply_at_boot(); // static-IP config, TZ, front-light -- before the STA netif exists
 
-    UiState ui = UiState::Idle;
-    std::string dialBuffer;
-    std::string lastDialled = load_last_dialled();
-    ui_render(POC_SIP_EXT_SELF, registered ? "Idle" : "Register failed", false);
-    ESP_LOGI(TAG, "System operational (registered=%d).", registered);
-    if (!lastDialled.empty()) {
-        ESP_LOGI(TAG, "ENT from idle will redial %s", lastDialled.c_str());
-    }
-
-    // Starts a call; UiState::Calling below follows it through poll(). Shared
-    // by redial-from-idle and dial-from-buffer so the two can't drift apart.
-    // Non-blocking (#18): the main loop keeps running, so an inbound INVITE
-    // that arrives while we are dialling gets its 486 instead of silence.
-    std::string dialTarget;
-    bool dialRingingShown = false;
-    auto placeCallTo = [&](const std::string &target) {
-        ESP_LOGI(TAG, "dialing %s", target.c_str());
-        if (uac.placeCallBegin(target)) {
-            dialTarget = target;
-            dialRingingShown = false;
-            ui = UiState::Calling;
-            ui_render(target.c_str(), "Calling...", false);
-        } else {
-            ui = UiState::Idle;
-            ui_render(target.c_str(), "Call Failed", false);
+    // 4. Wi-Fi. Saved credentials (from the wizard or Settings) win; the
+    //    first boot runs the on-device wizard. A failed saved connect still
+    //    reaches the home screen -- net_wifi keeps retrying in the
+    //    background and SIP starts when the link arrives.
+    lv_obj_t *boot_scr = NULL;
+    if (wifi_wizard_has_saved_credentials()) {
+        boot_scr = splash("Connecting to Wi-Fi...");
+        esp_err_t err = wifi_wizard_connect_saved();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "saved Wi-Fi credentials didn't connect (%s); continuing without",
+                     esp_err_to_name(err));
         }
-    };
+    } else {
+        wifi_wizard_run(group); // blocks until connected; persists credentials
+    }
+    if (wifi_is_connected()) ESP_LOGI(TAG, "Wi-Fi up, local IP %s", wifi_local_ip());
 
+    // Local clock for the status bar: TZ default from Kconfig (Settings
+    // overrides via NVS, applied above), time via SNTP once the network is up.
+    if (!getenv("TZ")) setenv("TZ", CONFIG_TDECK_MAX_TZ, 1);
+    tzset();
+    {
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(CONFIG_TDECK_MAX_SNTP_SERVER);
+        esp_err_t err = esp_netif_sntp_init(&sntp_cfg);
+        if (err != ESP_OK) ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(err));
+    }
+
+    // 5. Home grid, then SIP (registerExt() blocks up to ~6 s -- before the
+    //    watchdog is armed).
+    app_nav_show_home();
+    if (boot_scr) lv_obj_del(boot_scr);
+    if (wifi_is_connected()) {
+        if (phone_app_start() != ESP_OK) ESP_LOGE(TAG, "SIP did not start; will retry from the loop");
+    }
+    ESP_LOGI(TAG, "System operational (wifi=%d sip=%d registered=%d).",
+             (int)wifi_is_connected(), (int)phone_app_started(), (int)phone_app_registered());
+
+    // 6. Steady state. Nothing in this loop may block for long; the task
+    //    watchdog turns a silent hang into a panic + core dump.
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
     for (;;) {
-        uac.poll();
-
-        // Keep the registration alive; without this the binding lapses at
-        // POC_SIP_REG_EXPIRES and the phone silently stops taking calls.
-        if (uac.maintainRegistration() && ui == UiState::Idle) {
-            ui_render(POC_SIP_EXT_SELF, "Reg failed", false);
-        }
-
-        // Single GPIO read unless the controller actually has events.
-        char key = tca8418_key_pending() ? tca8418_get_key() : 0;
-
-        if (uac.hasIncomingCall() && ui != UiState::InCall && ui != UiState::Incoming) {
-            ui = UiState::Incoming;
-            ESP_LOGI(TAG, "incoming call from %s", uac.incomingCallerId().c_str());
-            audio_hardware_set_amp(true);   // audio_task rings while hasIncomingCall()
-            ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
-        }
-
-        switch (ui) {
-        case UiState::Idle:
-            // DEL from Idle asks to power down. Two single taps rather than a
-            // long press: long-press needs both key edges, and
-            // tca8418_get_key() discards the release edge, so a hold is not
-            // representable against today's API (UI_DESIGN 9.2). A confirm
-            // step also stops a stray DEL from switching the phone off
-            // mid-shift.
-            if (key == '\b') {
-                ui = UiState::ConfirmOff;
-                ui_render("Power off?", "ENT=yes DEL=no", false);
-                break;
-            }
-            // ENT on an empty buffer redials the last number that connected.
-            // Inert when there is nothing stored -- a phone that dials
-            // something unpredictable on an idle keypress is worse than one
-            // that does nothing.
-            if (key == '\r') {
-                if (!lastDialled.empty()) placeCallTo(lastDialled);
-                else ESP_LOGI(TAG, "ENT from idle: nothing to redial yet");
-                break;
-            }
-            if (is_dial_char(key)) {
-                dialBuffer.clear();
-                dialBuffer += key;
-                ui = UiState::Dialing;
-                ui_render(dialBuffer.c_str(), "Dialing", false);
-            }
-            break;
-
-        case UiState::Dialing:
-            if (key == '\b') {
-                if (!dialBuffer.empty()) dialBuffer.pop_back();
-                else ui = UiState::Idle;
-                ui_render(dialBuffer.c_str(), ui == UiState::Idle ? "Idle" : "Dialing", false);
-            } else if (is_dial_char(key)) {
-                // Silently stop growing at the cap rather than wrapping or
-                // truncating on dial -- the user can see the number isn't
-                // getting longer.
-                if (dialBuffer.size() < DIAL_BUFFER_MAX) {
-                    dialBuffer += key;
-                    ui_render(dialBuffer.c_str(), "Dialing", false);
-                }
-            } else if (key == '\r' && !dialBuffer.empty()) {
-                std::string target = dialBuffer;
-                dialBuffer.clear();
-                placeCallTo(target);
-            }
-            break;
-
-        case UiState::Calling:
-            if (uac.inCall()) {
-                // Only remember numbers that actually connected. Persisting a
-                // failed attempt would make redial replay a typo.
-                if (dialTarget != lastDialled) {
-                    lastDialled = dialTarget;
-                    save_last_dialled(dialTarget);
-                }
-                ui = UiState::InCall;
-                audio_hardware_set_amp(true);
-                ui_render(dialTarget.c_str(), "In Call", true);
-            } else if (uac.callEnded() || !uac.dialing()) {
-                const int code = uac.lastDialCode();
-                ui = UiState::Idle;
-                ui_render(dialTarget.c_str(),
-                          code == 487 ? "Cancelled" : code == 486 ? "Busy" :
-                          code == -1  ? "No Answer" : "Call Failed", false);
-                ESP_LOGW(TAG, "call to %s ended before connect (%d)", dialTarget.c_str(), code);
-            } else if (key == '\b' || key == '\r') {
-                uac.hangup();   // CANCEL; the 487 lands us in the branch above
-                ui_render(dialTarget.c_str(), "Cancelling", false);
-            } else if (uac.dialRinging() && !dialRingingShown) {
-                dialRingingShown = true;
-                ui_render(dialTarget.c_str(), "Ringing", false);
-            }
-            break;
-
-        case UiState::Incoming:
-            if (key == '\r') {
-                uac.answer();
-                ui = UiState::InCall;
-                audio_hardware_set_amp(true);
-                ui_render(uac.incomingCallerId().c_str(), "In Call", true);
-            } else if (key == '\b') {
-                uac.reject();
-                ui = UiState::Idle;
-                audio_hardware_set_amp(false);
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
-            } else if (!uac.hasIncomingCall()) {
-                // Caller gave up (CANCEL) before we answered/rejected.
-                ui = UiState::Idle;
-                audio_hardware_set_amp(false);
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
-            }
-            break;
-
-        case UiState::ConfirmOff:
-            if (key == '\r') {
-                power_off(uac);             // does not return
-            } else if (key != 0) {
-                // Any other key cancels, not just DEL -- if you are unsure
-                // enough to press something random, you did not mean to shut
-                // the phone down.
-                ui = UiState::Idle;
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
-            } else if (uac.hasIncomingCall()) {
-                // An incoming call outranks a pending power-off prompt; the
-                // hasIncomingCall() check above the switch has already moved
-                // us on, this just avoids leaving the prompt on screen.
-                ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
-            }
-            break;
-
-        case UiState::InCall:
-            // Media is handled entirely by audio_task. Dial keys become DTMF
-            // (SIP INFO for drawbridge's star codes + in-band/RFC 2833 on the
-            // media path); DEL/ENT hang up.
-            if (is_dial_char(key)) uac.sendDtmf(key);
-            if (key == '\b' || key == '\r') uac.hangup();
-            if (uac.callEnded() || !uac.inCall()) {
-                ui = UiState::Idle;
-                audio_hardware_set_amp(false);
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
-            }
-            break;
-        }
-
-        // Control-loop cadence only -- audio is no longer paced by this.
+        phone_app_tick();
+        lvgl_glue_pump();
+        app_nav_status_tick();
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

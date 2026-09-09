@@ -1,3 +1,7 @@
+// Ported verbatim from tdeck-max-phone (main/include/board_tdeck_max.h),
+// which established every fact in this file via real hardware bring-up on
+// 2026-08-13. Do not "correct" anything here against vendor docs -- see the
+// I2S comment below, which is exactly that lesson.
 #ifndef BOARD_TDECK_MAX_H
 #define BOARD_TDECK_MAX_H
 
@@ -19,7 +23,9 @@ extern "C" {
 #define BOARD_SPI_MISO          GPIO_NUM_47
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ES8311 Audio Codec & I2S Pins
+//  ES8311 Audio Codec & I2S Pins (unused by this project -- no audio here --
+//  but kept for fidelity with the hardware-verified source and in case a
+//  later phase wants them.)
 // ─────────────────────────────────────────────────────────────────────────────
 #define BOARD_ES8311_I2C_ADDR   0x18
 #define BOARD_I2S_NUM           I2S_NUM_0
@@ -31,7 +37,7 @@ extern "C" {
 // TDeckMaxBoard.h defines BOARD_ES8311_ASDOUT = 40 and BOARD_ES8311_DSDIN = 17,
 // which by ES8311 datasheet naming would mean GPIO40 is the codec's ADC output
 // (ESP32's DIN) and GPIO17 its DAC input (ESP32's DOUT). On real hardware it is
-// the other way round. Measured on 2026-08-13, COM5:
+// the other way round. Measured on 2026-08-13 by tdeck-max-phone, COM5:
 //
 //   * pull probe: GPIO40 followed an internal pull-up (1000/1000 high) and a
 //     pull-down (0/1000) -- nothing drives it, so it cannot be a codec output.
@@ -39,14 +45,7 @@ extern "C" {
 //   * A/B capture: with din=GPIO40 the mic was bit-exact zero across 200/200
 //     frames; with din=GPIO17 it read peak 7513 / rms 1276 and 0 silent frames.
 //
-// LilyGO's own working playWAV.ino calls
-//   codec.setPins(MCLK, SCLK, LRCK, ASDOUT, DSDIN)
-// i.e. its 4th/5th arguments are (dout, din) from the ESP32's point of view --
-// consistent with the measurement, inconsistent with the #define names.
-//
-// Named from the ESP32's perspective here so it can't be misread again. Cost:
-// several bench sessions of "codec answers on I2C, every register correct,
-// total silence in both directions".
+// Named from the ESP32's perspective here so it can't be misread again.
 #define BOARD_I2S_DOUT          GPIO_NUM_40 // ESP32 -> codec (codec's DAC input)
 #define BOARD_I2S_DIN           GPIO_NUM_17 // codec -> ESP32 (codec's ADC output)
 
@@ -60,7 +59,7 @@ extern "C" {
 #define BOARD_EPD_BACKLIGHT     GPIO_NUM_41
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Capacitive Touch (CST328 / CST3530)
+//  Capacitive Touch (CST328 / CST3530) -- unused, this project is keypad-only
 // ─────────────────────────────────────────────────────────────────────────────
 #define BOARD_TOUCH_INT         GPIO_NUM_12
 
@@ -72,7 +71,7 @@ extern "C" {
 #define BOARD_KEYBOARD_LED      GPIO_NUM_42
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  A7682E 4G LTE Cellular Modem
+//  A7682E 4G LTE Cellular Modem -- unused
 // ─────────────────────────────────────────────────────────────────────────────
 #define BOARD_4G_UART_PORT      UART_NUM_1
 #define BOARD_4G_RXD            GPIO_NUM_10 // ESP32 RX <- Modem TX
@@ -81,7 +80,7 @@ extern "C" {
 #define BOARD_4G_ITR            GPIO_NUM_8
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Semtech SX1262 LoRa Radio
+//  Semtech SX1262 LoRa Radio -- unused, pins only parked defensively
 // ─────────────────────────────────────────────────────────────────────────────
 #define BOARD_LORA_CS           GPIO_NUM_3
 #define BOARD_LORA_BUSY         GPIO_NUM_6
@@ -89,12 +88,12 @@ extern "C" {
 #define BOARD_LORA_INT          GPIO_NUM_5
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SD Card (SPI Mode)
+//  SD Card (SPI Mode) -- unused, pins only parked defensively
 // ─────────────────────────────────────────────────────────────────────────────
 #define BOARD_SD_CS             GPIO_NUM_48
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  u-blox MIA-M10Q GPS
+//  u-blox MIA-M10Q GPS -- unused in this phase (see project plan Phase 3)
 // ─────────────────────────────────────────────────────────────────────────────
 #define BOARD_GPS_UART_PORT     UART_NUM_2
 #define BOARD_GPS_RXD           GPIO_NUM_2
@@ -102,7 +101,7 @@ extern "C" {
 #define BOARD_GPS_PPS           GPIO_NUM_1
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Bosch BHI260AP Gyroscope / IMU
+//  Bosch BHI260AP Gyroscope / IMU -- unused
 // ─────────────────────────────────────────────────────────────────────────────
 #define BOARD_GYRO_INT          GPIO_NUM_21
 
@@ -142,7 +141,7 @@ extern "C" {
                                  XL9555_P0_LORA_SEL | XL9555_P0_DRV2605_EN | \
                                  XL9555_P0_SPK_AMP_EN | XL9555_P0_TOUCH_RST)
 #define XL9555_P1_BRINGUP_ALL   (XL9555_P1_4G_PWR | XL9555_P1_KEYBOARD_RST | \
-                                 XL9555_P1_AUDIO_ROUTE)
+                                 XL9555_P1_AUDIO_ROUTE | XL9555_P1_ANT_SWITCH)
 
 #ifdef __cplusplus
 }

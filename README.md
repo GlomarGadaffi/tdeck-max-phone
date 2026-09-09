@@ -15,6 +15,21 @@ The SIP/RTP engine (`TincanUac`, jitter buffer, digest client, DTMF, G.711) live
 
 ---
 
+> [!IMPORTANT]
+> ### `feat/lvgl-shell` — the LVGL touch/keypad UI (2026-09-09, builds, **not yet flashed**)
+>
+> This branch replaces the digits-only e-paper pictogram with a real UI: an LVGL 8.3 home
+> grid (Phone / Contacts / Settings), a dialer with an on-screen touch pad and recent calls,
+> calling / in-call / incoming screens, an NVS phonebook with caller-ID name lookup, and the
+> Settings app (Wi-Fi wizard, static IP, timezone, front-light, confirmed power off). All
+> ESP-IDF, no Arduino. Wi-Fi credentials now come from the on-device wizard (NVS), not
+> `poc_secrets.h`; SIP settings still do. The shell is a snapshot of the sibling
+> `tdeck-glopanel` project's hardware-verified e-paper/keypad/touch layer — provenance,
+> screen model and re-sync notes are in [docs/UI_SHELL.md](docs/UI_SHELL.md). Verified so
+> far: clean build and a QEMU boot to the Wi-Fi wizard. Nothing below this box has been
+> re-run on hardware with the new UI yet. Music and Messages are deliberately not on the
+> home screen: the SD card is undriven and the SIP engine has no MESSAGE support.
+
 > [!NOTE]
 > ### Project Status & Caveats
 >

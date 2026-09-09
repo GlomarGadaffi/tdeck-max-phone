@@ -1,3 +1,9 @@
+// Ported verbatim from tdeck-max-phone (main/src/xl9555.c). This brings up
+// EVERY XL9555 rail (including ones this project never uses -- LoRa, GPS,
+// 4G, haptics) because partial rail assertion has already bitten that
+// project once: 4 of 11 pins left a codec answering on I2C with a dead
+// ADC/DAC and an IMU that never appeared on the bus at all. Don't "trim"
+// this to only the rails this project needs without measuring first.
 #include "xl9555.h"
 #include "board_tdeck_max.h"
 #include "driver/i2c.h"
@@ -29,6 +35,27 @@ static esp_err_t write_reg(uint8_t reg, uint8_t val)
     i2c_master_write_byte(cmd, (XL9555_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, reg, true);
     i2c_master_write_byte(cmd, val, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(BOARD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+#endif
+}
+
+static esp_err_t read_reg(uint8_t reg, uint8_t *val)
+{
+#if CONFIG_TDECK_MAX_SIM_MODE
+    ESP_LOGD(TAG, "[sim] read_reg(0x%02x) skipped", reg);
+    *val = 0;
+    return ESP_OK;
+#else
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (XL9555_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_start(cmd); // repeated start
+    i2c_master_write_byte(cmd, (XL9555_I2C_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(cmd, val, I2C_MASTER_NACK);
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(BOARD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
@@ -71,18 +98,37 @@ esp_err_t xl9555_init(void)
     };
     static const uint8_t p1_seq[] = {
         XL9555_P1_4G_PWR, XL9555_P1_KEYBOARD_RST, XL9555_P1_AUDIO_ROUTE,
+        XL9555_P1_ANT_SWITCH,
     };
+
+    // Every write below is checked and logged (not fire-and-forget): a
+    // silent NAK here is exactly the "answers on I2C but half-powered"
+    // failure mode the comment above describes, and it must not be masked
+    // by an unconditional ESP_OK.
+    esp_err_t bringup_ret = ESP_OK;
 
     s_p0_out = 0;
     for (size_t i = 0; i < sizeof(p0_seq) / sizeof(p0_seq[0]); i++) {
         s_p0_out |= p0_seq[i];
-        write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+        esp_err_t r = write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "Port 0 bring-up write %u/%u failed (mask 0x%02x): %s",
+                     (unsigned)i + 1, (unsigned)(sizeof(p0_seq) / sizeof(p0_seq[0])),
+                     s_p0_out, esp_err_to_name(r));
+            bringup_ret = r;
+        }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     s_p1_out = 0;
     for (size_t i = 0; i < sizeof(p1_seq) / sizeof(p1_seq[0]); i++) {
         s_p1_out |= p1_seq[i];
-        write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
+        esp_err_t r = write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "Port 1 bring-up write %u/%u failed (mask 0x%02x): %s",
+                     (unsigned)i + 1, (unsigned)(sizeof(p1_seq) / sizeof(p1_seq[0])),
+                     s_p1_out, esp_err_to_name(r));
+            bringup_ret = r;
+        }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 
@@ -90,21 +136,54 @@ esp_err_t xl9555_init(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // AUDIO_SEL comes up HIGH with the rest, but HIGH routes audio to the
-    // A7682E. This firmware uses the local ES8311, so drop it back LOW --
-    // matching LilyGO's playWAV example, which sets it LOW explicitly.
+    // A7682E. This project has no audio path at all, but we still drop it
+    // back LOW to match the hardware-verified source exactly rather than
+    // leave an unverified state behind.
     s_p1_out &= ~XL9555_P1_AUDIO_ROUTE;
-    write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
+    esp_err_t r = write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to drop AUDIO_ROUTE back low: %s", esp_err_to_name(r));
+        bringup_ret = r;
+    }
 
     // Deterministic touch reset pulse, as the vendor does, so the controller
     // can't sit half-powered after a warm reset.
     s_p0_out &= ~XL9555_P0_TOUCH_RST;
-    write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+    r = write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "Touch reset (assert) write failed: %s", esp_err_to_name(r));
+        bringup_ret = r;
+    }
     vTaskDelay(pdMS_TO_TICKS(20));
     s_p0_out |= XL9555_P0_TOUCH_RST;
-    write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+    r = write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "Touch reset (release) write failed: %s", esp_err_to_name(r));
+        bringup_ret = r;
+    }
     vTaskDelay(pdMS_TO_TICKS(60));
 
-    ESP_LOGI(TAG, "XL9555 expander initialized successfully");
+    if (bringup_ret == ESP_OK) {
+        ESP_LOGI(TAG, "XL9555 expander initialized successfully");
+    } else {
+        ESP_LOGE(TAG, "XL9555 expander initialized with at least one failed write "
+                       "-- a rail may be left half-powered, see errors above");
+    }
+    return bringup_ret;
+}
+
+esp_err_t xl9555_read_ports(uint8_t *p0_val, uint8_t *p1_val)
+{
+    esp_err_t r0 = read_reg(XL9555_REG_INPUT_P0, p0_val);
+    if (r0 != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read Port 0 input: %s", esp_err_to_name(r0));
+        return r0;
+    }
+    esp_err_t r1 = read_reg(XL9555_REG_INPUT_P1, p1_val);
+    if (r1 != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read Port 1 input: %s", esp_err_to_name(r1));
+        return r1;
+    }
     return ESP_OK;
 }
 

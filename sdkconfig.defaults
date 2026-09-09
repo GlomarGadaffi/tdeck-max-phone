@@ -46,7 +46,7 @@ CONFIG_FREERTOS_NUMBER_OF_CORES=2
 # 8192 matches what the sibling tincan project already sets for the same
 # code -- the buffers were ported from there, this setting was not.
 # The audio and e-paper tasks size their own stacks in app_main.cpp.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 
 # LWIP Socket & Networking
 CONFIG_LWIP_MAX_SOCKETS=16
@@ -64,3 +64,33 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # ported from tincan) uses them.
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=y
+
+# ── LVGL 8.3.x (managed component), configured through Kconfig rather than
+# a checked-in lv_conf.h -- the convention of the sibling tdeck-glopanel /
+# glopanel projects, whose e-paper flush design lvgl_glue.c carries over.
+CONFIG_LV_CONF_SKIP=y
+# Monochrome: 1 byte/pixel in LVGL's software buffer, packed to the panel's
+# 1 bit/pixel in the flush callback; pulls in LV_USE_THEME_MONO.
+CONFIG_LV_COLOR_DEPTH_1=y
+CONFIG_LV_TICK_CUSTOM=n
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_32=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_16=y
+CONFIG_LV_INDEV_DEF_READ_PERIOD=30
+CONFIG_LV_DISP_DEF_REFR_PERIOD=30
+
+# ── Crash forensics. The main task (SIP control + LVGL pump) is under the
+# task watchdog; a trip becomes a panic + core dump to the "coredump"
+# partition (partitions.csv) instead of a silent hang.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# ── Status-bar clock: SNTP. NIST asks for long polling intervals.
+CONFIG_LWIP_SNTP_UPDATE_DELAY=3600000

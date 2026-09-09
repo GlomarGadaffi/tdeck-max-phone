@@ -1,3 +1,4 @@
+// Ported verbatim from tdeck-max-phone (main/include/xl9555.h).
 #ifndef XL9555_H
 #define XL9555_H
 

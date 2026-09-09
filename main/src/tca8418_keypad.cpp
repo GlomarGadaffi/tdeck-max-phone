@@ -1,3 +1,8 @@
+// Driver core ported verbatim from tdeck-max-phone (main/src/tca8418_keypad.cpp):
+// register access, init sequence, the FIFO drain, and -- most importantly --
+// two hardware-measured decode facts that must never be "corrected" back to
+// vendor docs (see tca8418_get_key() below). Only the keymap and the
+// press-event dispatch in tca8418_get_key() are new for this project.
 #include "tca8418_keypad.h"
 #include "board_tdeck_max.h"
 #include "xl9555.h"
@@ -24,51 +29,77 @@ static const char *TAG = "TCA8418_KEYPAD";
 #define TCA8418_INT_STAT_K_INT    (1 << 0) // key-event interrupt flag (write 1 to clear)
 #define TCA8418_KEY_LCK_EC_MASK   0x0F     // event-count nibble in KEY_LCK_EC
 
-// This board wires a 4-row x 10-col QWERTY matrix (see LilyGO's
-// examples/keypad/keypad.ino reference for T-Deck-MAX). We only care about
-// dialing/call-control here, so most letter keys map to NUL (ignored by
-// callers) and only what a phone UI needs is given a real ASCII code.
 #define KEYPAD_ROWS 4
 #define KEYPAD_COLS 10
 
-// There is a telephone keypad already sitting inside this QWERTY matrix, on
-// the keycaps' own printed alt legends. Overlaying LilyGO's base map
-// (examples/keypad/keypad.ino:17-22) with its symbol layer
-// (examples/factory/ui_deckpro.cpp:1415-1420, wifi_password_chat_map) gives:
+// This board wires a 4-row x 10-col QWERTY matrix (per tdeck-max-phone's
+// hardware bring-up, itself sourced from LilyGO's examples/keypad/keypad.ino
+// and examples/factory/ui_deckpro.cpp:1415-1420, and confirmed on real
+// hardware 2026-08-13: column decode correct, r3c6 really is '0').
+//
+// Physical layout (both layers share the same physical position):
 //
 //      Q  W  E  R  T  Y  U  I  O  P         #  1  2  3  (  )  _  -  +  @
 //      A  S  D  F  G  H  J  K  L DEL   -->  *  4  5  6  /  :  ;  '  " DEL
 //     ALT Z  X  C  V  B  N  M  $ ENT       ALT 7  8  9  ?  !  ,  .  -  ENT
 //      .  .  .  .  . UP  0 SPC SYM UP       .  .  .  .  . UP  0 SPC SYM UP
 //
-// 1-9 form a contiguous 3x3 block on W E R / S D F / Z X C, 0 is a dedicated
-// physical key, and * and # are stacked on A and Q at the left edge.
+// tdeck-max-phone (a phone, digits-first) binds the RIGHT-hand table as its
+// default layer and leaves ALT/SYM inert. This project is text-entry-first
+// (WiFi SSID/password, and general list navigation), so it adopts the
+// modifier scheme LilyGO's own factory firmware uses for its WiFi password
+// screen (examples/factory/ui_deckpro.cpp, wifi_password_process_event):
 //
-// These are bound as the DEFAULT layer, not behind ALT/SYM. A phone's primary
-// input is digits, and making the user hold a modifier for every digit of an
-// 11-digit number is bad on any device -- but specifically here, a held
-// modifier is the exact mechanism that broke LilyGO's own factory firmware
-// (its shift layer latched on after one tap; see docs/UI_DESIGN.md 9.1). ALT
-// (r2c0) and SYM (r3c8) are therefore left deliberately INERT and reserved:
-// alpha entry will want them one day, and re-teaching a key is worse than
-// leaving it dead. Everything unmapped here is consumed silently -- a stray
-// letter must never reach the dial buffer or end a call.
+//   ALT tap   -> toggles abc/ABC (latching case toggle; letters only)
+//   UP hold   -> digit/symbol layer (right-hand table) while held, either
+//                UP key; momentary, released with the key
+//   UP tap    -> list navigation (TCA8418_KEY_NAV_A/B), emitted on RELEASE
+//                and only if no other key was pressed during the hold
+//   SYM       -> ESC/back (TCA8418_KEY_ESC). The factory firmware uses it
+//                for show/hide password; this project needs a back key more.
 //
-// Verified on hardware 2026-08-13: the column decode is correct (Q -> r0c0,
-// P -> r0c9), and r3c6 really is the '0' key -- see the U6 entry in
-// docs/UI_DESIGN.md for the argument from the vendor's own key-count constant.
-static const char s_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
-    //  c0    c1   c2   c3   c4   c5   c6   c7   c8   c9
-    {  '#',  '1', '2', '3',  0,   0,   0,   0,  '+',  0   }, // Q W E R . . . . O P
-    {  '*',  '4', '5', '6',  0,   0,   0,   0,   0,  '\b' }, // A S D F . . . . L DEL
-    {   0,   '7', '8', '9',  0,   0,   0,   0,   0,  '\r' }, // ALT Z X C . . . . $ ENT
-    {   0,    0,   0,   0,   0,   0,  '0',  0,   0,   0   }, // . . . . . UP 0 SPC SYM UP
+// Two keys are therefore tracked across both edges (the two UP keys) and
+// ALT acts on its press edge only; every other key keeps the original
+// press-only contract. A latching CASE toggle is fine (it's visible in the
+// wizard's hint and in what you type); the factory-firmware bug this repo's
+// notes warn about was the SYMBOL layer latching, which stays momentary.
+//
+// r3c0..r3c4 are NOT physical keys (confirmed from vendor source,
+// tdeck-max-phone docs U5) and stay NUL in both layers.
+// Base layer emits LOWERCASE. The keycaps are printed uppercase (as on any
+// keyboard), but WiFi passwords and SSIDs are overwhelmingly lowercase-heavy
+// and the first bring-up build, which emitted 'Q','W',... literally, could
+// not join a network at all. There is no shift/caps key on this matrix, so
+// uppercase is currently not typeable -- a known gap, see README.
+static const char s_keymap_base[KEYPAD_ROWS][KEYPAD_COLS] = {
+    //   c0    c1   c2   c3   c4   c5              c6   c7        c8              c9
+    {   'q',  'w', 'e', 'r', 't', 'y',            'u', 'i',      'o',            'p'   }, // r0
+    {   'a',  's', 'd', 'f', 'g', 'h',            'j', 'k',      'l',            '\b'  }, // r1: ...DEL
+    {    0,   'z', 'x', 'c', 'v', 'b',            'n', 'm',      '$',            '\r'  }, // r2: ALT...ENT
+    {    0,    0,   0,   0,   0, TCA8418_KEY_NAV_A,'0', ' ', TCA8418_KEY_ESC, TCA8418_KEY_NAV_B }, // r3  gitleaks:allow (keymap, not a key)
 };
 
-// Read path is defined only for real-hardware builds -- its only caller
-// (read_raw_event) short-circuits in sim mode, so defining it there would
-// just produce -Wunused-function noise. write_reg stays unconditional
-// because tca8418_init() calls it on both paths.
+// Digit/symbol layer, verbatim from the factory firmware's
+// wifi_password_chat_map (ui_deckpro.cpp) -- the legends printed on the keys.
+static const char s_keymap_sym[KEYPAD_ROWS][KEYPAD_COLS] = {
+    //   c0    c1   c2   c3   c4   c5              c6   c7        c8              c9
+    {   '#',  '1', '2', '3', '(', ')',            '_', '-',      '+',            '@'   }, // r0
+    {   '*',  '4', '5', '6', '/', ':',            ';', '\'',     '"',            '\b'  }, // r1
+    {    0,   '7', '8', '9', '?', '!',            ',', '.',       0,             '\r'  }, // r2
+    {    0,    0,   0,   0,   0, TCA8418_KEY_NAV_A,'0', ' ', TCA8418_KEY_ESC, TCA8418_KEY_NAV_B }, // r3  gitleaks:allow (keymap, not a key)
+};
+
+// Modifier bookkeeping (see the layering comment above).
+#define ALT_ROW 2
+#define ALT_COL 0
+#define UP_ROW  3
+#define UP_COL_A 5
+#define UP_COL_B 9
+static bool s_caps = false;
+static tca8418_layout_t s_layout = TCA8418_LAYOUT_QWERTY;
+static bool s_up_held[2] = {false, false}; // [0]=r3c5 (NAV_A), [1]=r3c9 (NAV_B)
+static bool s_up_used = false;              // another key was pressed during an UP hold
+
 #if !CONFIG_TDECK_MAX_SIM_MODE
 static esp_err_t read_reg(uint8_t reg, uint8_t *val)
 {
@@ -105,16 +136,15 @@ static esp_err_t write_reg(uint8_t reg, uint8_t val)
 }
 
 // Consume exactly one FIFO entry and return its raw event byte (0 if the
-// FIFO is empty or I2C failed). Kept separate from tca8418_get_key() so the
-// startup drain can empty the FIFO regardless of whether each key maps to a
-// printable character.
+// FIFO is empty or I2C failed).
 static uint8_t read_raw_event(void)
 {
 #if CONFIG_TDECK_MAX_SIM_MODE
     return 0;
 #else
     uint8_t event_count = 0;
-    if (read_reg(TCA8418_REG_KEY_LCK_EC, &event_count) != ESP_OK) return 0;
+    esp_err_t r = read_reg(TCA8418_REG_KEY_LCK_EC, &event_count);
+    if (r != ESP_OK) return 0;
     if ((event_count & TCA8418_KEY_LCK_EC_MASK) == 0) return 0;
 
     uint8_t raw = 0;
@@ -145,8 +175,14 @@ esp_err_t tca8418_init(void)
     gpio_config(&io_conf);
     gpio_set_level(BOARD_KEYBOARD_LED, 1); // Enable backlight by default
 
-    // Configure Keyboard Interrupt Pin
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;
+    // Configure Keyboard Interrupt Pin. Despite the name, this project never
+    // installs a GPIO ISR for it -- tca8418_key_pending() below just polls
+    // the level directly (INT is active-low and stays asserted while events
+    // are queued, so one GPIO read stands in for an I2C status check).
+    // GPIO_INTR_DISABLE reflects that actual usage; edge-triggering an
+    // interrupt vector that nothing ever services was live in the ported
+    // source too, but was misleading about how this pin is really consumed.
+    io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << BOARD_KEYBOARD_INT);
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
@@ -167,13 +203,16 @@ esp_err_t tca8418_init(void)
     if (ret != ESP_OK) { ESP_LOGE(TAG, "Failed to configure CFG register"); return ret; }
 
     // Drain stale events left in the FIFO from before reset settled. Uses
-    // the RAW reader, not tca8418_get_key(): most keys in s_keymap map to
-    // NUL, and a drain loop keyed on get_key()'s return value stops at the
-    // first such key, leaving the FIFO partly full.
+    // the RAW reader, not tca8418_get_key(): most keys map to NUL, and a
+    // drain loop keyed on get_key()'s return value stops at the first such
+    // key, leaving the FIFO partly full.
     int drained = 0;
     while (read_raw_event() != 0 && ++drained < 32) {}
     if (drained) ESP_LOGI(TAG, "drained %d stale key event(s)", drained);
 
+    s_caps = false;
+    s_up_held[0] = s_up_held[1] = false;
+    s_up_used = false;
     ESP_LOGI(TAG, "TCA8418 keypad initialized successfully");
     return ESP_OK;
 }
@@ -184,9 +223,7 @@ bool tca8418_key_pending(void)
     return false;
 #else
     // INT is active-low and stays asserted while events are queued, so this
-    // is a single GPIO read standing in for 2-3 I2C transactions. Without
-    // it we'd hammer the shared I2C bus every tick -- including mid-call,
-    // contending with the ES8311.
+    // is a single GPIO read standing in for 2-3 I2C transactions.
     return gpio_get_level(BOARD_KEYBOARD_INT) == 0;
 #endif
 }
@@ -199,67 +236,92 @@ char tca8418_get_key(void)
     uint8_t raw = read_raw_event();
     if (raw == 0) return 0;
 
-    // bit 7 SET = PRESS. MEASURED on real hardware 2026-08-13 -- do NOT "fix"
-    // this to match the Adafruit driver's comment, which claims the opposite.
-    // Held one key for 4.58 s with CONFIG_TDECK_MAX_KEYPAD_DEBUG=y:
+    // bit 7 SET = PRESS. MEASURED on real hardware 2026-08-13 by
+    // tdeck-max-phone -- do NOT "fix" this to match the Adafruit driver's
+    // comment, which claims the opposite. Held one key for 4.58 s with
+    // CONFIG_TDECK_MAX_KEYPAD_DEBUG=y:
     //
     //   key[1] t=29144ms raw=0x8a bit7=1   <- press  (first event of the hold)
     //   key[2] t=33728ms raw=0x0a bit7=0   <- release, 4584 ms later
     //
-    // The first event of a hold is the press by definition, and it carries
-    // bit 7 set. Two vendor sources say otherwise and both are wrong for this
-    // board: `lib/Adafruit TCA8418/Adafruit_TCA8418.cpp:156-158` documents
-    // 0x01..0x50 as press / 0x81..0xD0 as release, and
-    // `examples/factory/peri_keypad.cpp:8-14` repeats that claim while citing
-    // it. `examples/keypad/keypad.ino:86` -- which cites "datasheet page 15 -
-    // Table 1" -- agrees with the measurement. Tracked and closed as invalid
-    // in #35; docs/UI_DESIGN.md U2 / 9.1 were wrong on this point.
+    // Two vendor sources say otherwise and both are wrong for this board;
+    // tracked and closed as invalid in tdeck-max-phone#35.
     bool pressed = (raw & 0x80) != 0;
 
     int key_num = (raw & 0x7F) - 1; // 1-based on the wire
     if (key_num < 0 || key_num >= KEYPAD_ROWS * KEYPAD_COLS) return 0;
 
-    // Column reversal also MEASURED in the same session (U1): the controller
+    // Column reversal also MEASURED in the same session: the controller
     // numbers this matrix right-to-left, so Q is key_num 9 and P is key_num 0.
-    //
-    //   Q -> raw 0x8a -> key_num 9 -> r0c0    P -> raw 0x81 -> key_num 0 -> r0c9
-    //
-    // which is what the QWERTY map expects. Both vendor files use this same
-    // formula. Note press and release decode to the SAME key_num, so the
-    // `!pressed` filter below drops exactly one of each pair -- no key can be
-    // entered twice.
     int row = key_num / KEYPAD_COLS;
     int col = (KEYPAD_COLS - 1) - (key_num % KEYPAD_COLS);
 
 #if CONFIG_TDECK_MAX_KEYPAD_DEBUG
-    // Deliberately NEUTRAL about what bit 7 means -- that is the thing under
-    // test (#35 / UI_DESIGN U2), so labelling the event PRESS or RELEASE here
-    // would just restate the assumption instead of measuring it. What settles
-    // it is the timestamp: hold ONE key for ~2 s and release it. Two events
-    // log, and the first one is the press by definition. Read its bit7.
-    //
-    // The bracketed reading at the end is what the CURRENT code believes, kept
-    // so you can see at a glance whether the code agrees with the measurement.
-    //
-    // Column decode (U1): press Q then P -- they must read r0c0 and r0c9. If
-    // they come out swapped, the `col = 9 - (key_num % 10)` reversal below is
-    // wrong. Also confirm r3c6 really is the '0' key (U6): the vendor's base
-    // map says '0' but all three of its text layers say NONE, and 0 matters.
     static uint32_t s_evt_seq = 0;
     ESP_LOGI(TAG,
-             "key[%3lu] t=%7lums raw=0x%02x bit7=%d key_num=%2d -> r%dc%d "
-             "map='%c'(0x%02x)  [code reads this as %s]",
+             "key[%3lu] t=%7lums raw=0x%02x bit7=%d key_num=%2d -> r%dc%d  [%s]",
              (unsigned long)++s_evt_seq,
              (unsigned long)(esp_timer_get_time() / 1000),
              raw, (raw & 0x80) ? 1 : 0, key_num, row, col,
-             s_keymap[row][col] ? s_keymap[row][col] : '.',
-             (unsigned)s_keymap[row][col],
              pressed ? "PRESS" : "RELEASE");
 #endif
 
-    if (!pressed) return 0; // only report presses, matching this function's existing contract
-    return s_keymap[row][col];
+    // UP keys: tracked across both edges. Held -> symbol layer for other
+    // keys; tapped alone -> navigation, emitted on release.
+    if (row == UP_ROW && (col == UP_COL_A || col == UP_COL_B)) {
+        int idx = (col == UP_COL_A) ? 0 : 1;
+        if (pressed) {
+            s_up_held[idx] = true;
+            return 0;
+        }
+        bool was_held = s_up_held[idx];
+        s_up_held[idx] = false;
+        bool tap = was_held && !s_up_used;
+        if (!s_up_held[0] && !s_up_held[1]) s_up_used = false;
+        return tap ? (idx == 0 ? TCA8418_KEY_NAV_A : TCA8418_KEY_NAV_B) : 0;
+    }
+
+    // ALT: case toggle on the press edge only; never produces a character.
+    if (row == ALT_ROW && col == ALT_COL) {
+        if (pressed) s_caps = !s_caps;
+        return 0;
+    }
+
+    if (!pressed) return 0; // every other key stays press-only, matching the original contract
+
+    if (s_layout == TCA8418_LAYOUT_DIALPAD) {
+        // Digits-first: the printed alt legends ARE the layer, no modifier
+        // needed (holding UP is harmless). Letters and space are swallowed
+        // so a stray key can never reach a dial buffer.
+        char d = s_keymap_sym[row][col];
+        bool dial = (d >= '0' && d <= '9') || d == '*' || d == '#' || d == '+';
+        bool ctrl = d == '\b' || d == '\r' || d == TCA8418_KEY_ESC;
+        return (dial || ctrl) ? d : 0;
+    }
+
+    if (s_up_held[0] || s_up_held[1]) {
+        s_up_used = true;
+        return s_keymap_sym[row][col];
+    }
+    char c = s_keymap_base[row][col];
+    if (s_caps && c >= 'a' && c <= 'z') c = (char)(c - ('a' - 'A'));
+    return c;
 #endif
+}
+
+void tca8418_set_layout(tca8418_layout_t layout)
+{
+    s_layout = layout;
+}
+
+tca8418_layout_t tca8418_get_layout(void)
+{
+    return s_layout;
+}
+
+bool tca8418_caps_enabled(void)
+{
+    return s_caps;
 }
 
 void tca8418_set_backlight(bool enable)

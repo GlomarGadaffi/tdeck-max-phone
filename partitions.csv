@@ -4,4 +4,8 @@ phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, 0x10000, 0x380000,
 ota_0,    app,  ota_0,   0x390000,0x380000,
 ota_1,    app,  ota_1,   0x710000,0x380000,
-storage,  data, fat,     0xa90000,0x570000,
+storage,  data, fat,     0xa90000,0x560000,
+# Core dump to flash: a panic over USB-Serial/JTAG usually loses its
+# backtrace when the chip resets and the port re-enumerates. Read back with
+# `idf.py -p COM5 coredump-info` (needs the matching .elf in build/).
+coredump, data, coredump, 0xff0000, 0x10000,

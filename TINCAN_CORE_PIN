@@ -1,0 +1,4 @@
+# Last tincan-core commit this build was verified against. Not enforced --
+# CMakeLists.txt only warns on a mismatch. Bump after verifying against a
+# newer tincan-core HEAD.
+418419c7f291899e356eb2f471361143670d45e9

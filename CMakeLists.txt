@@ -28,6 +28,26 @@ if(NOT EXISTS "${TINCAN_CORE_PATH}/components/tincan_uac/CMakeLists.txt")
         "clone github.com/GlomarGadaffi/tincan-core alongside this repo or "
         "set TINCAN_CORE_PATH")
 endif()
+
+# Advisory only: warn (don't fail) if the sibling checkout doesn't match the
+# commit this build was last verified against. See TINCAN_CORE_PIN.
+set(TINCAN_CORE_PIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/TINCAN_CORE_PIN")
+if(EXISTS "${TINCAN_CORE_PIN_FILE}")
+    file(STRINGS "${TINCAN_CORE_PIN_FILE}" TINCAN_CORE_PIN_LINES REGEX "^[^#]")
+    list(GET TINCAN_CORE_PIN_LINES 0 TINCAN_CORE_PINNED_COMMIT)
+    execute_process(
+        COMMAND git -C "${TINCAN_CORE_PATH}" rev-parse HEAD
+        OUTPUT_VARIABLE TINCAN_CORE_ACTUAL_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if(TINCAN_CORE_ACTUAL_COMMIT AND
+       NOT TINCAN_CORE_ACTUAL_COMMIT STREQUAL TINCAN_CORE_PINNED_COMMIT)
+        message(WARNING "tincan-core at ${TINCAN_CORE_PATH} is at "
+            "${TINCAN_CORE_ACTUAL_COMMIT} but this build was last verified "
+            "against ${TINCAN_CORE_PINNED_COMMIT} -- see TINCAN_CORE_PIN")
+    endif()
+endif()
+
 set(EXTRA_COMPONENT_DIRS "${TINCAN_CORE_PATH}/components")
 
 project(tdeck-max-phone)

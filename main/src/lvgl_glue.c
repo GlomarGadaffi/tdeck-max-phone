@@ -249,6 +249,8 @@ static void keypad_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
         // list navigation would silently freeze on the first entry.
         case TCA8418_KEY_NAV_A:   lv_key = LV_KEY_PREV;      break; // list-up
         case TCA8418_KEY_NAV_B:   lv_key = LV_KEY_NEXT;      break; // list-down
+        case TCA8418_KEY_LEFT:    lv_key = LV_KEY_LEFT;      break; // text-entry mode: cursor
+        case TCA8418_KEY_RIGHT:   lv_key = LV_KEY_RIGHT;     break;
         default:                  lv_key = (uint32_t)(unsigned char)c; break; // literal char -> forwarded to focused widget (e.g. textarea)
     }
 
@@ -339,6 +341,10 @@ lv_group_t *lvgl_glue_init(void)
     s_indev_drv.read_cb = keypad_read_cb;
     s_keypad_indev = lv_indev_drv_register(&s_indev_drv);
     lv_indev_set_group(s_keypad_indev, s_group);
+    // One-shot Shift/Sym/Alt everywhere in the QWERTY layout (Meshtastic's scheme, tdeck_kbl.h):
+    // UP taps arm Shift instead of navigating; lists are navigated with ALT+E / ALT+X. The
+    // DIALPAD layout ignores this and stays digits-first with UP-tap navigation.
+    tca8418_set_text_entry(true);
 
     if (touch_cst3530_present()) {
         lv_indev_drv_init(&s_touch_drv);

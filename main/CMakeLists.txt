@@ -20,6 +20,7 @@ idf_component_register(
         "src/pmu_sy6970.c"
         "src/es8311_audio.c"
         "src/tca8418_keypad.cpp"
+        "src/tdeck_kbl.c"
         "src/touch_cst3530.c"
         "src/epaper_display.cpp"
         # LVGL shell, snapshot of tdeck-glopanel (see docs/UI_SHELL.md)

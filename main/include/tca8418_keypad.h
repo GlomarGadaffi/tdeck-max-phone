@@ -57,7 +57,24 @@ typedef enum {
 void tca8418_set_layout(tca8418_layout_t layout);
 tca8418_layout_t tca8418_get_layout(void);
 
-// Current ALT case-toggle state (true = letters emit uppercase). For hints.
+// Text-entry mode (default OFF: nothing above changes until a caller opts in;
+// only meaningful in the QWERTY layout, the DIALPAD layout ignores it).
+// When on, tca8418_get_key() resolves keys through tdeck_kbl.h -- the one-shot
+// scheme Meshtastic's T-Deck-MAX keyboard uses: tap an UP key for Shift, SYM
+// for the digit/punctuation legends, ALT for the arrow/ESC layer; each applies
+// to the NEXT key only and lapses after 1.5 s, so nothing latches and nothing
+// depends on a modifier's release edge. UP taps then no longer navigate:
+// ALT+E / ALT+X report NAV_A / NAV_B, ALT+S / ALT+F report KEY_LEFT / KEY_RIGHT
+// (cursor moves) and ALT+Q reports ESC. lvgl_glue switches this on for its
+// keypad indev, so in the QWERTY layout UP taps no longer navigate lists: use
+// ALT+E / ALT+X (or touch). The DIALPAD layout keeps UP-tap navigation.
+void tca8418_set_text_entry(bool on);
+bool tca8418_text_entry(void);
+#define TCA8418_KEY_LEFT  ((char)0x04)
+#define TCA8418_KEY_RIGHT ((char)0x05)
+
+// Shift state for hints: the ALT case toggle, or in text-entry mode whether a
+// Shift tap is armed for the next key.
 bool tca8418_caps_enabled(void);
 
 // Turn keyboard backlight LED on/off

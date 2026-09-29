@@ -4,6 +4,7 @@
 // vendor docs (see tca8418_get_key() below). Only the keymap and the
 // press-event dispatch in tca8418_get_key() are new for this project.
 #include "tca8418_keypad.h"
+#include "tdeck_kbl.h"
 #include "board_tdeck_max.h"
 #include "xl9555.h"
 #include "driver/gpio.h"
@@ -69,8 +70,10 @@ static const char *TAG = "TCA8418_KEYPAD";
 // Base layer emits LOWERCASE. The keycaps are printed uppercase (as on any
 // keyboard), but WiFi passwords and SSIDs are overwhelmingly lowercase-heavy
 // and the first bring-up build, which emitted 'Q','W',... literally, could
-// not join a network at all. There is no shift/caps key on this matrix, so
-// uppercase is currently not typeable -- a known gap, see README.
+// not join a network at all. (The two bottom-row "UP" keys ARE Shift keys --
+// Meshtastic's driver treats them so -- but this legacy scheme spends them on
+// the symbol layer and list navigation, so uppercase here is only reachable
+// through the ALT case toggle. Text-entry mode, tdeck_kbl.h, uses them as Shift.)
 static const char s_keymap_base[KEYPAD_ROWS][KEYPAD_COLS] = {
     //   c0    c1   c2   c3   c4   c5              c6   c7        c8              c9
     {   'q',  'w', 'e', 'r', 't', 'y',            'u', 'i',      'o',            'p'   }, // r0
@@ -99,6 +102,8 @@ static bool s_caps = false;
 static tca8418_layout_t s_layout = TCA8418_LAYOUT_QWERTY;
 static bool s_up_held[2] = {false, false}; // [0]=r3c5 (NAV_A), [1]=r3c9 (NAV_B)
 static bool s_up_used = false;              // another key was pressed during an UP hold
+static bool s_text_entry = false;           // tca8418_set_text_entry()
+static tdeck_kbl_t s_kbl;                   // one-shot modifier state for text-entry mode
 
 #if !CONFIG_TDECK_MAX_SIM_MODE
 static esp_err_t read_reg(uint8_t reg, uint8_t *val)
@@ -213,6 +218,7 @@ esp_err_t tca8418_init(void)
     s_caps = false;
     s_up_held[0] = s_up_held[1] = false;
     s_up_used = false;
+    tdeck_kbl_init(&s_kbl);
     ESP_LOGI(TAG, "TCA8418 keypad initialized successfully");
     return ESP_OK;
 }
@@ -265,6 +271,24 @@ char tca8418_get_key(void)
              raw, (raw & 0x80) ? 1 : 0, key_num, row, col,
              pressed ? "PRESS" : "RELEASE");
 #endif
+
+    // Text-entry mode (QWERTY layout only): one-shot Shift/Sym/Alt, press edges
+    // only (tdeck_kbl.h).
+    if (s_text_entry && s_layout == TCA8418_LAYOUT_QWERTY) {
+        if (!pressed) return 0;
+        const tdeck_kbl_event_t ev = tdeck_kbl_press(&s_kbl, row, col, (uint32_t)(esp_timer_get_time() / 1000));
+        switch (ev.kind) {
+        case TDECK_KBL_CHAR:  return ev.ch;
+        case TDECK_KBL_DEL:   return '\b';
+        case TDECK_KBL_ENT:   return '\r';
+        case TDECK_KBL_ESC:   return TCA8418_KEY_ESC;
+        case TDECK_KBL_UP:    return TCA8418_KEY_NAV_A;
+        case TDECK_KBL_DOWN:  return TCA8418_KEY_NAV_B;
+        case TDECK_KBL_LEFT:  return TCA8418_KEY_LEFT;
+        case TDECK_KBL_RIGHT: return TCA8418_KEY_RIGHT;
+        default:              return 0; // a modifier was toggled, or the key means nothing here
+        }
+    }
 
     // UP keys: tracked across both edges. Held -> symbol layer for other
     // keys; tapped alone -> navigation, emitted on release.
@@ -319,8 +343,27 @@ tca8418_layout_t tca8418_get_layout(void)
     return s_layout;
 }
 
+void tca8418_set_text_entry(bool on)
+{
+    if (on == s_text_entry) return;
+    s_text_entry = on;
+    // Start the other mode from a clean slate: a modifier armed in one must not leak into
+    // the other, and UP edges seen in text mode were never tracked by the legacy path.
+    tdeck_kbl_init(&s_kbl);
+    s_up_held[0] = s_up_held[1] = false;
+    s_up_used = false;
+}
+
+bool tca8418_text_entry(void)
+{
+    return s_text_entry;
+}
+
 bool tca8418_caps_enabled(void)
 {
+    if (s_text_entry && s_layout == TCA8418_LAYOUT_QWERTY) {
+        return (tdeck_kbl_mods(&s_kbl, (uint32_t)(esp_timer_get_time() / 1000)) & TDECK_KBL_SHIFT) != 0;
+    }
     return s_caps;
 }
 

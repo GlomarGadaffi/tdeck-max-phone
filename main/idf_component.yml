@@ -15,3 +15,10 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/esp_codec_dev: ^1.3.4
+  # ADF libraries, taken straight from the registry rather than via the
+  # esp-adf pipeline framework (whose audio_board/dispatcher/HTTP-stream
+  # chain is the IDF v6 hazard): AEC (esp-sr AFE, VC_8K mode), the howling
+  # suppressor + resampler, and the G.722 codec.
+  espressif/esp-sr: ^2.5.2
+  espressif/esp_audio_effects: ^1.4.2
+  espressif/esp_audio_codec: ^2.6.2

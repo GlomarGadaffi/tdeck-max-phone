@@ -190,6 +190,12 @@ whichever comes first). This needs a render-completion signal — see
 [§9.8](#98-p8--render-generation-acknowledgement). Applies to: ⇒INCOMING, ⇒IN CALL,
 ⇒CALLING.
 
+> **Implemented 2026-10-01 (#40)** with the principled version, not a fixed delay: the main
+> loop holds the sequence number `ui_post()` returned for the INCOMING (or IN CALL) screen and
+> ignores keys until the render task reports that model drawn, capped at 3 s, then drains
+> the FIFO with `tca8418_flush()`. ⇒CALLING needs nothing extra: `placeCall()` blocks the loop,
+> and the FIFO is drained when it returns (§2.3).
+
 ---
 
 ## 3. Key map
@@ -329,6 +335,22 @@ failed, which is the single most likely next action.
 ---
 
 ## 4. Screen layouts (240 x 320, 1-bit)
+
+> **Implemented 2026-10-01 (#39)** in `ui_render.cpp` (`ui_compose()`), checked on the
+> host by `test/ui_render_test.cpp` (every screen keeps the inter-band margins blank, every
+> 1–13 digit edit stays inside `B_NUMBER`, 13 → 14 digits also changes `B_SUB`). Where the
+> code differs from the mockups below, on purpose:
+>
+> - **Hints advertise only bindings that exist.** Mute, volume and hold-`DEL` are not built
+>   (#45, #46), so no hint mentions them; IDLE's `DEL` says **power off**, which is what it
+>   does today, not "clear"; IN CALL says only "DEL end call".
+> - **IDLE reads NO SERVICE** instead of READY while unregistered, so the label never
+>   contradicts the `NOREG` in the status bar.
+> - **F_NUM spacing is 1 px tighter** than the 4.2 table (pitches 28/23/17 instead of
+>   30/24/18): the table left no room for the caret on a full line.
+> - **ENDED's `B_NUMBER` is what `ENT` will dial**: the last connected number, or after a
+>   failure the number that just failed (3.3). The failed number is held only while the
+>   ENDED screen is up and is never written to NVS.
 
 **Reading the mockups.** Each box is exactly **30 characters wide x 20 rows tall** at
 **8 px per character column and 16 px per row** — i.e. 240 x 320 true proportions. The

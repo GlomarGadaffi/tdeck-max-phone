@@ -2,6 +2,7 @@
 // headers on purpose: test/ compiles this file on the host.
 #include "ui_render.h"
 #include "font_ui_8x16.h"
+#include <stdio.h>
 #include <string.h>
 
 void ui_clear(uint8_t *fb)
@@ -182,7 +183,7 @@ static bool all_num_glyphs(const char *s)
     return true;
 }
 
-// B_STATUS: fixed pixel columns (UI_DESIGN 4.6), F_UI 1x, 2 px rule.
+// ── B_STATUS: fixed pixel columns (UI_DESIGN 4.6), F_UI 1x, 2 px rule ────
 static void draw_status(uint8_t *fb, const ui_model_t *m)
 {
     const int y = 6;
@@ -200,9 +201,13 @@ static void draw_status(uint8_t *fb, const ui_model_t *m)
     ui_fill_rect(fb, 0, 28, UI_W, 2, true);
 }
 
+// ── B_LABEL ──────────────────────────────────────────────────────────────
 static const char *screen_label(const ui_model_t *m)
 {
     switch (m->screen) {
+        // NO SERVICE is not in the 4.1 mockup, which only shows READY. An
+        // unregistered phone cannot take calls, and READY over a NOREG
+        // status bar would be the one place the screen contradicts itself.
         case UI_IDLE:     return m->registered ? "READY" : "NO SERVICE";
         case UI_DIALLING: return "DIAL";
         case UI_CALLING:  return "CALLING";
@@ -214,35 +219,184 @@ static const char *screen_label(const ui_model_t *m)
     return "";
 }
 
-// B_NUMBER: F_NUM when every character has a glyph, F_UI 2x otherwise (an
-// alphanumeric caller ID). Centred in the 72-row band.
-static void draw_number(uint8_t *fb, const char *num)
+// ── B_NUMBER (UI_DESIGN 4.2) ─────────────────────────────────────────────
+// F_NUM, scaled by length. The 4.2 table gives pitches of 30/24/18 px; those
+// leave no room for the 4 px caret on a full line (8 x 30 = 240), so the
+// spacing is 1 px tighter here and every row of the table still fits with
+// the caret: 8 x 28, 10 x 23, 13 x 17.
+#define NUM_SHOWN_MAX 13
+
+static void num_layout(size_t len, int *scale, int *spacing)
 {
-    if (!num || !*num) return;
-    if (all_num_glyphs(num)) {
-        const int scale = 4, spacing = 4, pitch = 5 * scale + spacing;
-        int w = (int)strlen(num) * pitch - spacing;
-        int x = (UI_W - w) / 2;
-        if (x < 0) x = 0;
-        ui_draw_num(fb, x, 88 + (72 - 7 * scale) / 2, num, scale, spacing);
+    if (len <= 8)       { *scale = 5; *spacing = 3; }
+    else if (len <= 10) { *scale = 4; *spacing = 3; }
+    else                { *scale = 3; *spacing = 2; }
+}
+
+static void draw_number(uint8_t *fb, const ui_model_t *m)
+{
+    const char *num = m->number;
+    if (!*num) return;
+    const int band_y = 88, band_h = 72;
+
+    if (!all_num_glyphs(num)) {
+        // An alphanumeric caller ID (a SIP display name): F_UI 2x, centred.
+        ui_draw_text_centred(fb, band_y + (band_h - 32) / 2, num, 2);
+        return;
+    }
+
+    size_t len = strlen(num);
+    const char *shown = num;
+    if (len > NUM_SHOWN_MAX) {           // rightmost 13; B_SUB says so
+        shown = num + (len - NUM_SHOWN_MAX);
+        len = NUM_SHOWN_MAX;
+    }
+    int scale, spacing;
+    num_layout(len, &scale, &spacing);
+    const int pitch = 5 * scale + spacing;
+    const int w = (int)len * pitch - spacing;
+    const int h = 7 * scale;
+    const int y = band_y + (band_h - h) / 2;
+
+    if (m->screen == UI_DIALLING) {
+        // Right-aligned like a calculator, so the caret stays put and the
+        // digit just typed appears in the same place every time.
+        const int caret_x = UI_W - 4 - 4;          // 4 px wide, 4 px margin
+        const int x = caret_x - 4 - w;             // 4 px gap before the caret
+        ui_draw_num(fb, x, y, shown, scale, spacing);
+        ui_fill_rect(fb, caret_x, y, 4, h, true);
     } else {
-        ui_draw_text_centred(fb, 88 + (72 - 32) / 2, num, 2);
+        ui_draw_num(fb, (UI_W - w) / 2, y, shown, scale, spacing);
     }
 }
 
-// B_BODY: filled block = a call is ringing or up, hollow ring = otherwise.
+// ── B_SUB ────────────────────────────────────────────────────────────────
+static void format_duration(char *out, size_t n, uint32_t secs)
+{
+    uint32_t mm = secs / 60, ss = secs % 60;
+    if (mm > 99) mm = 99;
+    snprintf(out, n, "%02u:%02u", (unsigned)mm, (unsigned)ss);
+}
+
+static void draw_sub(uint8_t *fb, const ui_model_t *m)
+{
+    char line[UI_TEXT_COLS + 1] = "";
+    char dur[8];
+    switch (m->screen) {
+        case UI_IDLE:
+            if (m->last_call_secs) {
+                format_duration(dur, sizeof(dur), m->last_call_secs);
+                snprintf(line, sizeof(line), "LAST CALL   %s", dur);
+            }
+            break;
+        case UI_ENDED:
+            if (m->last_call_failed) {
+                snprintf(line, sizeof(line), "COULD NOT CONNECT");
+            } else {
+                format_duration(dur, sizeof(dur), m->last_call_secs);
+                snprintf(line, sizeof(line), "%s", dur);
+            }
+            break;
+        case UI_DIALLING: {
+            // The only thing B_SUB ever says while dialling: that B_NUMBER
+            // is no longer showing the whole buffer (UI_DESIGN 4.2).
+            size_t len = strlen(m->number);   // < sizeof(m->number) = 24
+            if (len > NUM_SHOWN_MAX)
+                snprintf(line, sizeof(line), "%u DIGITS - SHOWING LAST %d",
+                         (unsigned)(len % 100), NUM_SHOWN_MAX);
+            break;
+        }
+        case UI_INCALL:
+            if (m->muted) snprintf(line, sizeof(line), "MUTED");
+            break;
+        case UI_NOTICE:
+            snprintf(line, sizeof(line), "%s", m->notice_sub);
+            break;
+        default:
+            break;
+    }
+    if (line[0]) ui_draw_text_centred(fb, 176, line, 1);
+}
+
+// ── B_BODY ───────────────────────────────────────────────────────────────
+// Rings and blocks drawn with fill_rect only (UI_DESIGN 7): solid black at
+// maximum contrast, strokes 8 px, no glyph data.
+static void ring(uint8_t *fb, int x, int y, int w, int h, int t)
+{
+    ui_fill_rect(fb, x, y, w, t, true);
+    ui_fill_rect(fb, x, y + h - t, w, t, true);
+    ui_fill_rect(fb, x, y, t, h, true);
+    ui_fill_rect(fb, x + w - t, y, t, h, true);
+}
+
 static void draw_body(uint8_t *fb, const ui_model_t *m)
 {
-    if (m->screen == UI_NOTICE) return;
-    const int x = UI_W / 2 - 30, y = 206, w = 60, h = 60;
-    if (m->screen == UI_INCOMING || m->screen == UI_INCALL) {
-        ui_fill_rect(fb, x, y, w, h, true);
-    } else {
-        ui_fill_rect(fb, x, y, w, 4, true);
-        ui_fill_rect(fb, x, y + h - 4, w, 4, true);
-        ui_fill_rect(fb, x, y, 4, h, true);
-        ui_fill_rect(fb, x + w - 4, y, 4, h, true);
+    switch (m->screen) {
+        case UI_IDLE:
+        case UI_ENDED:
+        case UI_DIALLING: {
+            // The keypad cheat-sheet: free to keep on e-paper, and the only
+            // thing teaching the digit layer if the alt legends are not
+            // printed on the keycaps (UI_DESIGN U3, still open).
+            static const char *const sheet[4] = {
+                "1=W   2=E   3=R",
+                "4=S   5=D   6=F",
+                "7=Z   8=X   9=C",
+                "*=A   0=0   #=Q",
+            };
+            for (int i = 0; i < 4; i++) ui_draw_text(fb, 24, 204 + 16 * i, sheet[i], 1);
+            break;
+        }
+        case UI_CALLING:   // hollow ring: waiting
+            ring(fb, (UI_W - 96) / 2, 208, 96, 56, 8);
+            break;
+        case UI_INCOMING:  // solid block: maximum black, readable across a desk
+            ui_fill_rect(fb, (UI_W - 128) / 2, 208, 128, 56, true);
+            break;
+        case UI_INCALL:    // the same ring with a filled centre bar: connected
+            ring(fb, (UI_W - 96) / 2, 208, 96, 56, 8);
+            ui_fill_rect(fb, (UI_W - 96) / 2 + 16, 208 + 24, 96 - 32, 8, true);
+            break;
+        case UI_NOTICE:
+            break;
     }
+}
+
+// ── B_HINT: what ENT and DEL do right now (UI_DESIGN 1.5) ────────────────
+// Only bindings that exist are advertised. Mute, volume and hold-DEL are in
+// the design but not built (#45, #46), so no hint mentions them, and IDLE's
+// DEL says what it really does today -- the power-off prompt.
+static void draw_hint(uint8_t *fb, const ui_model_t *m)
+{
+    const char *l1 = "", *l2 = "";
+    switch (m->screen) {
+        case UI_IDLE:
+        case UI_ENDED:
+            l1 = m->number[0] ? "ENT redial    DEL power off" : "DEL power off";
+            l2 = "type a number to dial";
+            break;
+        case UI_DIALLING:
+            l1 = "ENT call      DEL erase";
+            l2 = "9 + number = outside line";
+            break;
+        case UI_CALLING:
+            l1 = "connecting - please wait";
+            l2 = "keys are ignored until answer";
+            break;
+        case UI_INCOMING:
+            l1 = "ENT answer    DEL reject";
+            break;
+        case UI_INCALL:
+            l1 = "DEL end call";
+            break;
+        case UI_NOTICE:
+            l1 = m->notice_hint[0];
+            l2 = m->notice_hint[1];
+            break;
+    }
+    ui_fill_rect(fb, 0, 272, UI_W, 2, true);
+    ui_draw_text(fb, 4, 280, l1, 1);
+    ui_draw_text(fb, 4, 298, l2, 1);
 }
 
 void ui_compose(uint8_t *fb, const ui_model_t *m)
@@ -250,12 +404,8 @@ void ui_compose(uint8_t *fb, const ui_model_t *m)
     ui_clear(fb);
     draw_status(fb, m);
     ui_draw_text_centred(fb, 44, screen_label(m), 2);
-    draw_number(fb, m->number);
-    if (m->screen == UI_NOTICE) ui_draw_text_centred(fb, 176, m->notice_sub, 1);
+    draw_number(fb, m);
+    draw_sub(fb, m);
     draw_body(fb, m);
-    ui_fill_rect(fb, 0, 272, UI_W, 2, true);
-    if (m->screen == UI_NOTICE) {
-        ui_draw_text(fb, 0, 280, m->notice_hint[0], 1);
-        ui_draw_text(fb, 0, 298, m->notice_hint[1], 1);
-    }
+    draw_hint(fb, m);
 }

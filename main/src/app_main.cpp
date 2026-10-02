@@ -373,6 +373,15 @@ static void epaper_task(void *)
         }
         epaper_render(&job.model, job.band);
         s_render_drawn = job.seq;
+
+        // Stack is sized by measurement, not guesswork: report the
+        // high-water mark once the deepest path (compose + refresh) has run.
+        static bool s_stack_logged = false;
+        if (!s_stack_logged) {
+            s_stack_logged = true;
+            ESP_LOGI(TAG, "epaper task stack: %u bytes never used of 4096",
+                     (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+        }
     }
 }
 
@@ -537,16 +546,22 @@ static void ui_bench(void)
     }
     ui_wait(seq);
 
-    // Slow typing: every edit is its own partial until the ghost cap
-    // promotes one to a full refresh (#43). Also 8 consecutive partials on
-    // the glass, which is what the ghosting threshold has to be judged on.
-    ESP_LOGW(TAG, "ui bench: 9 slow edits -> expect partials until the ghost cap, then FULL");
+    // Slow typing up to 13 digits: every edit is its own partial until the
+    // ghost cap promotes one to a full refresh (#43). That is also 8
+    // consecutive partials on the glass -- what the ghosting threshold has
+    // to be judged on by eye.
+    ESP_LOGW(TAG, "ui bench: 8 slow edits -> expect partials until the ghost cap, then FULL");
     std::string num = "9*777";
-    for (int i = 1; i <= 9; i++) {
+    for (int i = 1; i <= 8; i++) {
         num += (char)('0' + i % 10);
         ui_wait(ui_post(ui_model(UI_DIALLING, num), B_NUMBER));
         vTaskDelay(pdMS_TO_TICKS(400));
     }
+
+    // 13 -> 14 digits changes B_SUB too ("14 DIGITS - SHOWING LAST 13").
+    ESP_LOGW(TAG, "ui bench: 14th digit -> B_NUMBER request, expect FULL (spans bands)");
+    num += '9';
+    ui_wait(ui_post(ui_model(UI_DIALLING, num), B_NUMBER));
 
     // A band request whose frame changes two bands must be promoted to FULL.
     ESP_LOGW(TAG, "ui bench: B_NUMBER request that also changes the label -> expect FULL");
@@ -555,6 +570,25 @@ static void ui_bench(void)
     // Nothing changed: must not touch the panel at all.
     ESP_LOGW(TAG, "ui bench: identical frame -> expect SKIP");
     ui_wait(ui_post(ui_model(UI_CALLING, num), B_ALL));
+
+    // Gallery of the UI_DESIGN 4 screens, 3 s each, for whoever is watching.
+    ESP_LOGW(TAG, "ui bench: screen gallery");
+    ui_model_t g = ui_model(UI_CALLING, "777");
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g = ui_model(UI_INCOMING, "1001");
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g = ui_model(UI_INCALL, "1001");
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g = ui_model(UI_ENDED, "777");
+    g.last_call_secs = 151;
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g.last_call_failed = true;
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     ESP_LOGW(TAG, "=== UI RENDER BENCH COMPLETE ===");
 }
@@ -757,7 +791,50 @@ extern "C" void app_main(void)
     UiState ui = UiState::Idle;
     std::string dialBuffer;
     std::string lastDialled = load_last_dialled();
-    ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+
+    // ENDED is the IDLE screen with the result of the call that just ended
+    // (UI_DESIGN 2.4): no timer, it stays until a key moves the phone on.
+    // Its B_NUMBER is always what ENT will dial. After a FAILED call that is
+    // the number that failed (3.3: "the single most likely next action"),
+    // held here only while the ENDED screen is up -- it is never written to
+    // NVS, so a typo is still never persisted as the redial target.
+    bool showEnded = false;
+    bool lastCallFailed = false;
+    uint32_t lastCallSecs = 0;          // last CONNECTED call; IDLE shows it as LAST CALL
+    std::string failedTarget;
+    int64_t callStartUs = 0;
+
+    auto redialTarget = [&]() -> const std::string & {
+        return (showEnded && lastCallFailed && !failedTarget.empty()) ? failedTarget
+                                                                      : lastDialled;
+    };
+    auto idleModel = [&]() {
+        ui_model_t m = ui_model(showEnded ? UI_ENDED : UI_IDLE, redialTarget());
+        m.last_call_secs = lastCallSecs;
+        m.last_call_failed = showEnded && lastCallFailed;
+        return m;
+    };
+    auto leaveEnded = [&]() {
+        showEnded = false;
+        failedTarget.clear();
+    };
+
+    // Input grace window (#40, UI_DESIGN 2.5). On a transition that changes
+    // what ENT and DEL mean, keys are ignored until the new screen is
+    // actually on the glass (or 3 s, whichever is first), then anything
+    // pressed blind is drained rather than replayed. Without it, a user
+    // mid-dial with a finger on ENT answers a call they cannot see yet, and
+    // a double-tapped ENT answers and then hangs up.
+    uint32_t graceSeq = 0;
+    int64_t graceStartUs = 0;
+    int graceSwallowed = 0;
+    auto startGrace = [&](uint32_t seq) {
+        graceSeq = seq;
+        graceStartUs = esp_timer_get_time();
+        graceSwallowed = 0;
+    };
+
+    ui_post(idleModel(), B_ALL);
     bool shownRegistered = uac.registered(), shownWifi = wifi_is_connected();
     ESP_LOGI(TAG, "System operational (registered=%d).", registered);
     if (!lastDialled.empty()) {
@@ -768,10 +845,20 @@ extern "C" void app_main(void)
     // and dial-from-buffer so the two can't drift apart -- they had already
     // grown slightly different logging and teardown before this was factored.
     auto placeCallTo = [&](const std::string &target) {
+        leaveEnded();
         ui_post(ui_model(UI_CALLING, target), B_ALL);
         ESP_LOGI(TAG, "dialing %s", target.c_str());
 
-        if (uac.placeCall(target)) {
+        bool connected = uac.placeCall(target);
+
+        // placeCall() blocks the loop for as long as it rings (#18), so the
+        // keypad was never read meanwhile: whatever a frustrated user mashed
+        // during the wait is in the FIFO. Drop it rather than replay it into
+        // the call that just connected (UI_DESIGN 2.3, "cheap and required").
+        int dropped = tca8418_flush();
+        if (dropped) ESP_LOGI(TAG, "dropped %d key event(s) pressed while calling", dropped);
+
+        if (connected) {
             // Only remember numbers that actually connected. Persisting a
             // failed attempt would make redial replay a typo.
             if (target != lastDialled) {
@@ -780,12 +867,14 @@ extern "C" void app_main(void)
             }
             ui = UiState::InCall;
             audio_hardware_set_amp(true);
-            ui_post(ui_model(UI_INCALL, target), B_ALL);
+            callStartUs = esp_timer_get_time();
+            startGrace(ui_post(ui_model(UI_INCALL, target), B_ALL));
         } else {
             ui = UiState::Idle;
-            ui_model_t m = ui_model(UI_ENDED, target);
-            m.last_call_failed = true;
-            ui_post(m, B_ALL);
+            showEnded = true;
+            lastCallFailed = true;
+            failedTarget = target;
+            ui_post(idleModel(), B_ALL);
             ESP_LOGW(TAG, "call to %s failed", target.c_str());
         }
     };
@@ -808,16 +897,31 @@ extern "C" void app_main(void)
             shownWifi = wifiNow;
             ESP_LOGI(TAG, "link state: %s, %s", regNow ? "registered" : "NOT registered",
                      wifiNow ? "Wi-Fi up" : "Wi-Fi DOWN");
-            if (ui == UiState::Idle) ui_post(ui_model(UI_IDLE, lastDialled), B_STATUS);
+            if (ui == UiState::Idle) ui_post(idleModel(), B_STATUS);
         }
 
         // Single GPIO read unless the controller actually has events.
         char key = tca8418_key_pending() ? tca8418_get_key() : 0;
 
+        if (graceStartUs) {
+            const int64_t heldMs = (esp_timer_get_time() - graceStartUs) / 1000;
+            if (ui_drawn(graceSeq) || heldMs >= 3000) {
+                graceSwallowed += tca8418_flush();
+                ESP_LOGI(TAG, "input grace over after %lld ms (%s), %d key event(s) discarded",
+                         (long long)heldMs, ui_drawn(graceSeq) ? "screen visible" : "timeout",
+                         graceSwallowed);
+                graceStartUs = 0;
+            } else if (key) {
+                graceSwallowed++;
+            }
+            key = 0;
+        }
+
         if (uac.hasIncomingCall() && ui != UiState::InCall && ui != UiState::Incoming) {
             ui = UiState::Incoming;
+            leaveEnded();
             ESP_LOGI(TAG, "incoming call from %s", uac.incomingCallerId().c_str());
-            ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL);
+            startGrace(ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL));
         }
 
         switch (ui) {
@@ -829,22 +933,26 @@ extern "C" void app_main(void)
             // step also stops a stray DEL from switching the phone off
             // mid-shift.
             if (key == '\b') {
+                leaveEnded();
                 ui = UiState::ConfirmOff;
                 ui_post(ui_notice("POWER OFF?", "",
                                   "ENT  power off",
                                   "any other key cancels"), B_ALL);
                 break;
             }
-            // ENT on an empty buffer redials the last number that connected.
-            // Inert when there is nothing stored -- a phone that dials
-            // something unpredictable on an idle keypress is worse than one
-            // that does nothing.
+            // ENT on an empty buffer redials the number on the screen: the
+            // last number that connected, or on the CALL FAILED screen the
+            // one that just failed. Inert when there is nothing -- a phone
+            // that dials something unpredictable on an idle keypress is worse
+            // than one that does nothing.
             if (key == '\r') {
-                if (!lastDialled.empty()) placeCallTo(lastDialled);
+                const std::string target = redialTarget();   // copy: placeCallTo clears it
+                if (!target.empty()) placeCallTo(target);
                 else ESP_LOGI(TAG, "ENT from idle: nothing to redial yet");
                 break;
             }
             if (is_dial_char(key)) {
+                leaveEnded();
                 dialBuffer.clear();
                 dialBuffer += key;
                 ui = UiState::Dialing;
@@ -856,7 +964,7 @@ extern "C" void app_main(void)
             if (key == '\b') {
                 if (!dialBuffer.empty()) dialBuffer.pop_back();
                 else ui = UiState::Idle;
-                if (ui == UiState::Idle) ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+                if (ui == UiState::Idle) ui_post(idleModel(), B_ALL);
                 else ui_post(ui_model(UI_DIALLING, dialBuffer), B_NUMBER);
             } else if (is_dial_char(key)) {
                 // Silently stop growing at the cap rather than wrapping or
@@ -878,15 +986,16 @@ extern "C" void app_main(void)
                 uac.answer();
                 ui = UiState::InCall;
                 audio_hardware_set_amp(true);
-                ui_post(ui_model(UI_INCALL, uac.incomingCallerId()), B_ALL);
+                callStartUs = esp_timer_get_time();
+                startGrace(ui_post(ui_model(UI_INCALL, uac.incomingCallerId()), B_ALL));
             } else if (key == '\b') {
                 uac.reject();
                 ui = UiState::Idle;
-                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+                ui_post(idleModel(), B_ALL);
             } else if (!uac.hasIncomingCall()) {
                 // Caller gave up (CANCEL) before we answered/rejected.
                 ui = UiState::Idle;
-                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+                ui_post(idleModel(), B_ALL);
             }
             break;
 
@@ -898,7 +1007,7 @@ extern "C" void app_main(void)
                 // enough to press something random, you did not mean to shut
                 // the phone down.
                 ui = UiState::Idle;
-                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+                ui_post(idleModel(), B_ALL);
             } else if (uac.hasIncomingCall()) {
                 // An incoming call outranks a pending power-off prompt; the
                 // hasIncomingCall() check above the switch has already moved
@@ -914,7 +1023,15 @@ extern "C" void app_main(void)
             if (uac.callEnded() || !uac.inCall()) {
                 ui = UiState::Idle;
                 audio_hardware_set_amp(false);
-                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+                // Duration is shown once, on the ENDED screen -- a full
+                // refresh that was happening anyway -- never as a live timer
+                // (UI_DESIGN 5.5). Rounded up so a short call never reads 00:00.
+                lastCallSecs = (uint32_t)((esp_timer_get_time() - callStartUs + 999999) / 1000000);
+                lastCallFailed = false;
+                failedTarget.clear();
+                showEnded = true;
+                ESP_LOGI(TAG, "call ended after %lu s", (unsigned long)lastCallSecs);
+                ui_post(idleModel(), B_ALL);
             }
             break;
         }

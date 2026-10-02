@@ -216,12 +216,111 @@ static void test_band_grid()
     check(std::memcmp(fa.data(), fbb.data(), 30 * UI_STRIDE) != 0, "REG vs NOREG changes B_STATUS");
 }
 
+// Rows where two frames differ, as [first, last]; first = -1 if identical.
+static void diff_rows(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b, int *y0, int *y1)
+{
+    *y0 = *y1 = -1;
+    for (int y = 0; y < UI_H; y++) {
+        if (std::memcmp(&a[y * UI_STRIDE], &b[y * UI_STRIDE], UI_STRIDE) != 0) {
+            if (*y0 < 0) *y0 = y;
+            *y1 = y;
+        }
+    }
+}
+
+// The property partial refresh depends on (UI_DESIGN 5.2): typing a digit
+// changes B_NUMBER and nothing else, so the driver can send a one-band
+// partial. Crossing 13 -> 14 digits also changes B_SUB, so it must not.
+static void test_dialling_edits()
+{
+    std::cout << "dialling edits\n";
+    std::vector<uint8_t> a(UI_FB_SIZE), b(UI_FB_SIZE);
+    int y0, y1;
+    bool all_in_band = true;
+    std::string num;
+    for (int i = 0; i < 13; i++) {
+        ui_model_t m1 = model(UI_DIALLING, num.c_str());
+        num += (char)('0' + (i * 7) % 10);
+        ui_model_t m2 = model(UI_DIALLING, num.c_str());
+        ui_compose(a.data(), &m1);
+        ui_compose(b.data(), &m2);
+        diff_rows(a, b, &y0, &y1);
+        if (i > 0 && (y0 < 88 || y1 > 159)) all_in_band = false;
+    }
+    check(all_in_band, "every edit from 1 to 13 digits stays inside B_NUMBER");
+
+    ui_model_t m13 = model(UI_DIALLING, "9074123456789");
+    ui_model_t m14 = model(UI_DIALLING, "90741234567890");
+    ui_compose(a.data(), &m13);
+    ui_compose(b.data(), &m14);
+    diff_rows(a, b, &y0, &y1);
+    check(y0 >= 88 && y1 > 159 && y1 <= 199, "13 -> 14 digits also changes B_SUB (a FULL, by 5.2)");
+    dump(b.data(), "dialling_14");
+
+    // Right-aligned with a caret: the rightmost ink in B_NUMBER is the caret
+    // at x=232..235 whatever the length.
+    for (const char *n : {"9", "9*777", "9074123456"}) {
+        ui_model_t m = model(UI_DIALLING, n);
+        ui_compose(a.data(), &m);
+        int maxx = -1;
+        for (int y = 88; y <= 159; y++)
+            for (int x = 0; x < UI_W; x++)
+                if (black(a.data(), x, y) && x > maxx) maxx = x;
+        check(maxx == 235, std::string("caret is the right edge for '") + n + "'");
+    }
+
+    // Nothing in any screen may run past the right edge of the panel; the
+    // longest strings are the hint lines and the >13-digit note.
+    ui_model_t m = model(UI_DIALLING, "90741234567890123456");
+    ui_compose(a.data(), &m);
+    bool left_ok = true;
+    for (int y = 0; y < UI_H; y++) left_ok &= !black(a.data(), 0, y) || y == 28 || y == 29 || y == 272 || y == 273;
+    check(left_ok, "20-digit buffer: nothing but the rules touches x=0");
+    dump(a.data(), "dialling_20");
+}
+
+static void test_screens_text()
+{
+    std::cout << "screen text\n";
+    std::vector<uint8_t> a(UI_FB_SIZE), b(UI_FB_SIZE);
+    int y0, y1;
+
+    ui_model_t idle = model(UI_IDLE, "777"), ended = idle;
+    ended.screen = UI_ENDED;
+    ended.last_call_secs = 151;   // 02:31
+    ui_compose(a.data(), &idle);
+    ui_compose(b.data(), &ended);
+    diff_rows(a, b, &y0, &y1);
+    check(y0 >= 40 && y1 <= 199, "ENDED differs from IDLE only in label and sub (UI_DESIGN 2.4)");
+    dump(b.data(), "ended_0231");
+
+    ui_model_t failed = ended;
+    failed.last_call_failed = true;
+    ui_compose(b.data(), &failed);
+    dump(b.data(), "ended_failed");
+    check(ink_in_rows(b.data(), 168, 199) > 0, "FAILED says so in B_SUB");
+
+    ui_model_t idle_after = idle;
+    idle_after.last_call_secs = 151;
+    ui_compose(b.data(), &idle_after);
+    check(ink_in_rows(b.data(), 168, 199) > 0, "IDLE keeps a LAST CALL line once there was a call");
+
+    // The redial hint is only offered when there is something to redial.
+    ui_model_t empty = model(UI_IDLE, "");
+    ui_compose(a.data(), &empty);
+    ui_compose(b.data(), &idle);
+    diff_rows(a, b, &y0, &y1);
+    check(y0 >= 88 && y1 >= 272, "IDLE with no redial target drops the ENT hint");
+}
+
 int main()
 {
     test_font_table();
     test_text();
     test_num();
     test_band_grid();
+    test_dialling_edits();
+    test_screens_text();
     std::cout << "\n" << (g_checks - g_failures) << "/" << g_checks << " checks passed\n";
     return g_failures ? 1 : 0;
 }

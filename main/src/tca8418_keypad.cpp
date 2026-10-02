@@ -285,6 +285,15 @@ char tca8418_get_key(void)
 #endif
 }
 
+int tca8418_flush(void)
+{
+    // Raw reader, as in tca8418_init(): drains every event, mapped or not,
+    // press or release. Bounded by the 10-deep FIFO (plus margin).
+    int drained = 0;
+    while (read_raw_event() != 0 && ++drained < 32) {}
+    return drained;
+}
+
 void tca8418_set_backlight(bool enable)
 {
     gpio_set_level(BOARD_KEYBOARD_LED, enable ? 1 : 0);

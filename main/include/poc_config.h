@@ -163,6 +163,19 @@
 #define POC_SELFTEST_TONE_AMPL 500.0f
 #endif
 
+// Ringer and ringback amplitude (#36), same scale as the self-test tone.
+// The ringer has to be heard across a room, so it sits 6 dB above the
+// self-test beep; ringback plays while you are holding the phone, so it sits
+// below it. Both are first guesses by arithmetic, not by ear -- tune them on
+// the bench, and remember POC_SPK_MAX_DB lifts both.
+//   peak 1000 ~= -30 dBFS,  400 ~= -38 dBFS
+#ifndef POC_RING_AMPL
+#define POC_RING_AMPL        1000.0f
+#endif
+#ifndef POC_RINGBACK_AMPL
+#define POC_RINGBACK_AMPL    400.0f
+#endif
+
 // ── Half-duplex ducking (poor man's echo control) ────────────────────────
 //
 // Speaker and mic are centimetres apart on the same PCB with no acoustic
@@ -188,4 +201,16 @@
 #endif
 #ifndef POC_DUCK_HANGOVER_MS
 #define POC_DUCK_HANGOVER_MS 200              // keep ducking this long after they stop
+#endif
+
+// ── E-paper render coalescing (#41, UI_DESIGN 5.6) ───────────────────────
+// The render task waits until no new screen has been posted for
+// POC_UI_SETTLE_MS before drawing, so a burst of keypresses costs one panel
+// refresh instead of one each. POC_UI_SETTLE_MAX_MS bounds the wait for a
+// user who never pauses, so the screen still moves while they type.
+#ifndef POC_UI_SETTLE_MS
+#define POC_UI_SETTLE_MS     250
+#endif
+#ifndef POC_UI_SETTLE_MAX_MS
+#define POC_UI_SETTLE_MAX_MS 1000
 #endif

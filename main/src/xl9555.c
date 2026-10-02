@@ -157,11 +157,15 @@ esp_err_t xl9555_reset_touch(void)
     return write_reg(XL9555_REG_OUTPUT_P0, s_p0_out);
 }
 
+// 20 ms low, then the caller waits 60 ms before touching the TCA8418: the
+// pulse the Meshtastic t-deck-max build uses on this board
+// (variants/esp32s3/t-deck-max/variant.cpp earlyInitVariant():
+// pulseExpandPinLow(EXPANDS_KB_RST, 20, 60)). Was 10 ms low / 10 ms settle.
 esp_err_t xl9555_reset_keyboard(void)
 {
     s_p1_out &= ~XL9555_P1_KEYBOARD_RST;
     write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(20));
     s_p1_out |= XL9555_P1_KEYBOARD_RST;
     return write_reg(XL9555_REG_OUTPUT_P1, s_p1_out);
 }

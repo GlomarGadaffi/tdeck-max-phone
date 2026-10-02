@@ -11,7 +11,8 @@ extern "C" {
 // after a timeout, so callers may continue and poll wifi_is_connected().
 esp_err_t wifi_sta_connect(const char *ssid, const char *pass);
 
-// True once a DHCP lease has been obtained.
+// True while the station holds a DHCP lease: set on GOT_IP, cleared on
+// disconnect (and set again when the background retry gets a new lease).
 bool wifi_is_connected(void);
 
 // Our DHCP-assigned address as a dotted string. Valid after wifi_sta_connect().

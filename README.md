@@ -39,13 +39,13 @@ Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incomi
 > **QEMU's ceiling is earlier than it looks.** Emulated time reaches ~754 ms at `phy_init`'s full-calibration fallback and then **stops advancing entirely** -- the emulator wedges there. It does not merely fail to associate. Measured by compiling the Wi-Fi timeout down to 2 s and waiting 200 s of wall clock: emulated time never moved and the timeout never fired. So **nothing downstream of Wi-Fi is reachable in QEMU at any timeout value** -- no registration, no SIP, no RTP, not even the Wi-Fi failure path. See [docs/BENCH_TEST.md](docs/BENCH_TEST.md).
 >
 > **Known limitations** (tracked as GitHub issues, not silently omitted):
-> - **The panel trails your fingers by 3.3 s.** A full refresh measures **3277 ms** and there is no partial refresh, so the dial buffer is always a beat or two behind what you typed. The depth-1 render queue discards superseded frames rather than replaying them, so it catches up rather than lagging cumulatively — but typing a long number is visibly laggy, and there is no input grace window yet on an incoming call ([#16](../../issues/16)).
+> - **The panel trails your fingers by about a second.** A full refresh measures **1253 ms** (it was 3277 ms until the driver adopted the Meshtastic build's fast waveform, UI_DESIGN §5.1); dial-buffer edits are a flash-free partial refresh of the number band (862 ms), and a burst of keypresses is coalesced into one refresh. Keys are ignored from the moment a call arrives until the INCOMING screen is actually on the glass, so nobody answers or rejects a call they cannot see yet (#40).
 > - **No acoustic echo cancellation.** Speaker and mic sit centimetres apart on one PCB, so at usable volume the far end hears itself. Mitigated by *ducking* the mic while the far end talks (`POC_DUCK_DB`, ~24 dB, 200 ms hangover) — a deliberate half-duplex compromise, not AEC. You cannot interrupt the far end while ducking is on; set `POC_DUCK_DB` to 0 for true full duplex plus the echo. The `*777` echo service will still howl by design.
 > - `TincanUac::placeCall()` blocks while dialing out (bounded, ~120 s worst case); a genuinely new inbound call arriving in that window gets no SIP response until it resolves ([#18](../../issues/18)).
 > - No SIP digest authentication ([#28](../../issues/28)) -- a `401` challenge is treated as a flat rejection, so this works only against drawbridge's open registrar.
 > - No jitter buffer, no RTP sequence/reordering handling, and no packet-loss concealment -- one datagram in, one frame out. Fine on a clean LAN, will audibly suffer on a lossy or bursty link.
 > - No DTMF (RFC 2833 or SIP INFO), so far-end IVR menus cannot be navigated.
-> - E-paper renders `0`-`9` `*` `#` `+` and a simple active/idle pictogram only -- no alphabet font, so status text and alphanumeric caller IDs don't render, and no partial refresh, so every update is a full-screen flash ([#16](../../issues/16)). That flash is normal for this panel type, just visible. The phone also **rings silently** -- no ringer tone is generated, which is the single worst remaining gap.
+> - The e-paper shows the six UI_DESIGN §4 screens (status bar, state, number, result, keypad cheat-sheet, key hints), but no battery or signal indicator: neither the fuel gauge nor RSSI is read. State changes are still a full-screen flash, which is normal for this panel type. Incoming calls ring (a warbled double ring, with the keyboard backlight blinking) and outgoing calls play ringback, at amplitudes chosen by arithmetic rather than by ear (`POC_RING_AMPL`, `POC_RINGBACK_AMPL`).
 > - LoRa, GPS, 4G/cellular, touch, IMU, and battery-gauge hardware exist on the board and have pin definitions in `board_tdeck_max.h`, but none of it is driven by this firmware (beyond parking the LoRa/SD chip-selects high so they can't corrupt the shared SPI bus). This PoC is Wi-Fi only.
 
 ---
@@ -154,6 +154,12 @@ exactly one of each required header, response re-parses cleanly, BYE Call-ID
 matching works. This is what caught the malformed-response bug that compiled
 perfectly and would only ever have surfaced as "drawbridge ignores us".
 
+`test/ui_render_test.cpp` compiles the real e-paper renderer
+(`main/src/ui_render.cpp`, no ESP-IDF headers) and checks the font table, text
+placement and clipping. Set `UI_DUMP_DIR=<dir>` before running
+`build-host/ui_render_test` to also get every test frame as a PBM image -- the
+cheapest way to look at a screen without flashing the board.
+
 ### Build & flash (real hardware)
 ```bash
 idf.py set-target esp32s3
@@ -209,3 +215,5 @@ Full plan, including what is deliberately out of scope: **[docs/ROADMAP.md](docs
 ## License
 
 MIT. See [LICENSE](LICENSE) -- this project combines original work with a vendored SIP parser (`components/sip_core`, ported via the sibling `tincan` project from `pocket-dial`, also MIT).
+
+Third-party: the e-paper UI font (`main/src/font_ui_8x16.c`) is generated from **Spleen 8x16** by Frederic Cambus, Copyright (c) 2018-2026, under the **BSD 2-Clause** license; the full license text is reproduced at the top of that file and must accompany binary redistributions. The e-paper register sequence follows GxEPD2 / the Meshtastic t-deck-max build (hardware facts only; no GPL code is included).

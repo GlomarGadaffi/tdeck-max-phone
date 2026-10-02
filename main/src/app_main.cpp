@@ -6,7 +6,7 @@
 //  Task layout (three tasks, deliberately):
 //    main       - SIP control, keypad, UI state machine. Never does slow I/O.
 //    audio pump - RTP<->I2S, paced ONLY by the blocking i2s_channel_read().
-//    e-paper    - the 2-3 s panel refresh, off the control path entirely.
+//    e-paper    - the ~1 s panel refresh, off the control path entirely.
 //
 //  Audio and display each used to run inline on the main loop, which made a
 //  call sound choppy (~20 pkt/s instead of 50, with latency that grew for the
@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "driver/i2c.h"
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <cmath>
@@ -131,28 +132,97 @@ static void i2c_bus_scan(void)
 }
 
 // ── e-paper render task ─────────────────────────────────────────────────────
-// A full-screen refresh on this panel is ~2-3 s of panel time plus SPI. Doing
-// that inline meant every dialled digit and every call-state change stalled
-// SIP and audio for seconds. The main loop now just posts a request.
+// A refresh is ~1.25 s of panel time (UI_DESIGN 5.7). Doing that inline meant
+// every dialled digit and every call-state change stalled SIP and audio for
+// the whole refresh. The main loop now just posts the UI model (#38).
+//
+// Depth-1 mailbox: only the newest model matters, and posting must never
+// block the control path even while the panel is mid-refresh. It replaces
+// the old xQueueOverwrite queue because coalescing has to MERGE the band as
+// well as replace the model: if a transition (B_ALL) is still waiting when a
+// one-band edit arrives, the edit must not downgrade it to a partial of a
+// screen that was never drawn. Different bands merge to B_ALL.
 
-struct RenderRequest {
-    char caller[24];
-    char status[24];
-    bool active;
+struct RenderJob {
+    ui_model_t model;
+    ui_band_t  band;
+    uint32_t   seq;     // ui_post() sequence number of this model
 };
 
-static QueueHandle_t s_render_q = nullptr;
+static portMUX_TYPE      s_render_mux = portMUX_INITIALIZER_UNLOCKED;
+static RenderJob         s_render_job;
+static bool              s_render_pending = false;
+static uint32_t          s_render_absorbed = 0; // posts merged into the pending job
+static uint32_t          s_render_posted = 0;   // last seq handed out
+static volatile uint32_t s_render_drawn = 0;    // last seq on the glass
+static TaskHandle_t      s_epaper_task = nullptr;
 
-static void ui_render(const char *caller, const char *status, bool active)
+static ui_band_t merge_band(ui_band_t a, ui_band_t b)
 {
-    if (!s_render_q) return;
-    RenderRequest r{};
-    std::strncpy(r.caller, caller ? caller : "", sizeof(r.caller) - 1);
-    std::strncpy(r.status, status ? status : "", sizeof(r.status) - 1);
-    r.active = active;
-    // Depth-1 queue with overwrite: only the newest screen matters, and this
-    // must never block the control path even if the panel is mid-refresh.
-    xQueueOverwrite(s_render_q, &r);
+    return (a == b) ? a : B_ALL;
+}
+
+// Returns the sequence number of this model, for ui_drawn().
+static uint32_t ui_post(const ui_model_t &m, ui_band_t band)
+{
+    taskENTER_CRITICAL(&s_render_mux);
+    if (s_render_pending) {
+        band = merge_band(s_render_job.band, band);
+        s_render_absorbed++;
+    }
+    s_render_job.model = m;
+    s_render_job.band = band;
+    s_render_job.seq = ++s_render_posted;
+    s_render_pending = true;
+    uint32_t seq = s_render_posted;
+    taskEXIT_CRITICAL(&s_render_mux);
+    if (s_epaper_task) xTaskNotifyGive(s_epaper_task);
+    return seq;
+}
+
+// True once the model posted as `seq` (or a newer one) is on the glass.
+static bool ui_drawn(uint32_t seq)
+{
+    return (int32_t)(s_render_drawn - seq) >= 0;
+}
+
+// ── UI model ────────────────────────────────────────────────────────────────
+
+static TincanUac *s_uac = nullptr;
+
+static ui_model_t ui_model(ui_screen_t screen, const std::string &number)
+{
+    ui_model_t m{};
+    m.screen = screen;
+    std::strncpy(m.number, number.c_str(), sizeof(m.number) - 1);
+    std::strncpy(m.self_ext, POC_SIP_EXT_SELF, sizeof(m.self_ext) - 1);
+    m.registered = s_uac && s_uac->registered();
+    m.wifi_up = wifi_is_connected();
+    m.muted = false;                 // no mute yet (#45)
+    m.volume = POC_SPK_VOLUME;       // fixed at init; no runtime volume yet (#45)
+    return m;
+}
+
+// Boot, failure and power-off screens: the band grid with supplied text.
+static ui_model_t ui_notice(const char *label, const char *sub,
+                            const char *hint1 = "", const char *hint2 = "")
+{
+    ui_model_t m = ui_model(UI_NOTICE, "");
+    std::strncpy(m.notice_label, label, sizeof(m.notice_label) - 1);
+    std::strncpy(m.notice_sub, sub, sizeof(m.notice_sub) - 1);
+    std::strncpy(m.notice_hint[0], hint1, sizeof(m.notice_hint[0]) - 1);
+    std::strncpy(m.notice_hint[1], hint2, sizeof(m.notice_hint[1]) - 1);
+    return m;
+}
+
+// What audio_task should be doing when no call is up (#36). Set by the main
+// loop, read by audio_task every frame; see "ringer and ringback" below.
+enum AudioMode : uint8_t { AUDIO_IDLE, AUDIO_RING, AUDIO_RINGBACK, AUDIO_CALL };
+static std::atomic<uint8_t> s_audio_mode{AUDIO_IDLE};
+
+static void audio_set_mode(AudioMode m)
+{
+    s_audio_mode.store(m);
 }
 
 // Real power off, the way the board is built to do it.
@@ -175,7 +245,7 @@ static void ui_render(const char *caller, const char *status, bool active)
 // ── Dial buffer + last-number redial ────────────────────────────────────────
 
 // Characters the dial buffer accepts. Must stay in sync with s_keymap
-// (tca8418_keypad.cpp) on the input side and glyph_index() (epaper_display.cpp)
+// (tca8418_keypad.cpp) on the input side and ui_num_has_glyph() (ui_render.cpp)
 // on the output side -- a character the keypad can produce but the display
 // can't draw looks like a dropped keypress.
 static bool is_dial_char(char c)
@@ -228,6 +298,7 @@ static void power_off(TincanUac &uac)
         uac.hangup();
         vTaskDelay(pdMS_TO_TICKS(150));   // let the BYE actually get out
     }
+    audio_set_mode(AUDIO_IDLE);
     audio_hardware_set_amp(false);
 
     bool onUsb = false;
@@ -236,11 +307,17 @@ static void power_off(TincanUac &uac)
         onUsb = false;
     }
 
-    // Posted through the queue, not rendered inline: epaper_task owns the SPI
-    // bus and driving it from here would race a refresh already in flight.
-    // The panel needs roughly two seconds for a full refresh.
-    ui_render("", onUsb ? "Sleeping (USB)" : "Powered Off", false);
-    vTaskDelay(pdMS_TO_TICKS(2500));
+    // Posted, not rendered inline: epaper_task owns the SPI bus and driving
+    // it from here would race a refresh already in flight. Wait for THIS
+    // screen to be on the glass rather than guessing a delay -- it may have to
+    // queue behind a refresh that is already running. Bounded, so a dead panel
+    // cannot stop the phone from switching off.
+    uint32_t seq = ui_post(onUsb ? ui_notice("SLEEPING", "on USB: asleep, not off",
+                                             "BOOT button wakes it")
+                                 : ui_notice("POWERED OFF", "",
+                                             "PWR button turns it on"),
+                           B_ALL);
+    for (int i = 0; i < 100 && !ui_drawn(seq); i++) vTaskDelay(pdMS_TO_TICKS(50));
 
     // Touch controller into reset before the rails move. The vendor does this
     // with the comment that it can otherwise come up in an undefined state.
@@ -274,12 +351,48 @@ static void power_off(TincanUac &uac)
     // through app_main() and re-registers from scratch.
 }
 
+// Render coalescing (#41, UI_DESIGN 5.6): after the first post, keep
+// absorbing posts until POC_UI_SETTLE_MS passes with none, newest model wins.
+// A burst of typing becomes one render instead of one per key -- before this,
+// three '7' presses inside 550 ms cost two full refreshes. Capped at
+// POC_UI_SETTLE_MAX_MS so a user who never pauses still sees the screen move.
 static void epaper_task(void *)
 {
-    RenderRequest r;
+    RenderJob job;
     for (;;) {
-        if (xQueueReceive(s_render_q, &r, portMAX_DELAY) == pdTRUE) {
-            epaper_render_call_status(r.caller, r.status, r.active);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        const int64_t t_first = esp_timer_get_time();
+        while (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POC_UI_SETTLE_MS)) > 0) {
+            if ((esp_timer_get_time() - t_first) / 1000 >= POC_UI_SETTLE_MAX_MS) break;
+        }
+
+        taskENTER_CRITICAL(&s_render_mux);
+        bool have = s_render_pending;
+        uint32_t absorbed = s_render_absorbed;
+        if (have) {
+            job = s_render_job;
+            s_render_pending = false;
+            s_render_absorbed = 0;
+        }
+        taskEXIT_CRITICAL(&s_render_mux);
+        if (!have) continue;
+
+        if (absorbed) {
+            ESP_LOGI(TAG, "render coalesced %lu post(s) into 1 (settled %lld ms)",
+                     (unsigned long)absorbed + 1,
+                     (long long)((esp_timer_get_time() - t_first) / 1000));
+        }
+        epaper_render(&job.model, job.band);
+        s_render_drawn = job.seq;
+
+        // Stack is sized by measurement, not guesswork: report the
+        // high-water mark once the deepest path (compose + refresh) has run.
+        static bool s_stack_logged = false;
+        if (!s_stack_logged) {
+            s_stack_logged = true;
+            ESP_LOGI(TAG, "epaper task stack: %u bytes never used of 4096",
+                     (unsigned)uxTaskGetStackHighWaterMark(nullptr));
         }
     }
 }
@@ -290,7 +403,44 @@ static void epaper_task(void *)
 // effectively did) directly reduces packet rate and grows one-way latency for
 // the whole call.
 
-static TincanUac *s_uac = nullptr;
+// ── ringer and ringback (#36, UI_DESIGN 6) ──────────────────────────────────
+// The phone used to ring silently: audio_task only pumped while inCall(), so
+// no code path could make a sound while a call was merely ringing, and the
+// main task must not do it (audio_hardware_write_spk() blocks on I2S and
+// would stall SIP). The main loop now sets s_audio_mode; audio_task
+// synthesises the tone. The main loop also owns the amplifier -- it is an
+// XL9555 pin with a shadow register, so exactly one task writes it.
+// One 20 ms frame of ring or ringback at the codec's ACTUAL rate. t0 is the
+// sample count since the tone started, which drives the cadence; the phase
+// accumulators keep the waveform continuous across frames.
+//   RING:     1000/1250 Hz warble at 20 Hz -- the classic electronic ringer --
+//             in a double-ring cadence, 0.4 on, 0.2 off, 0.4 on, 2.0 off.
+//   RINGBACK: North American 440 + 480 Hz, 2 s on, 4 s off.
+static void synth_tone_frame(int16_t *out, uint8_t mode, uint32_t t0, uint32_t sr,
+                             float *ph1, float *ph2)
+{
+    const float twopi = 6.28318531f;
+    for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
+        const uint32_t ms = (uint32_t)(((uint64_t)(t0 + i) * 1000u) / sr);
+        float v = 0.0f;
+        if (mode == AUDIO_RING) {
+            const uint32_t c = ms % 3000u;
+            const bool on = c < 400u || (c >= 600u && c < 1000u);
+            const float f = ((ms / 25u) & 1u) ? 1250.0f : 1000.0f;
+            *ph1 += twopi * f / (float)sr;
+            if (*ph1 > twopi) *ph1 -= twopi;
+            if (on) v = POC_RING_AMPL * sinf(*ph1);
+        } else {
+            const bool on = (ms % 6000u) < 2000u;
+            *ph1 += twopi * 440.0f / (float)sr;
+            *ph2 += twopi * 480.0f / (float)sr;
+            if (*ph1 > twopi) *ph1 -= twopi;
+            if (*ph2 > twopi) *ph2 -= twopi;
+            if (on) v = POC_RINGBACK_AMPL * 0.5f * (sinf(*ph1) + sinf(*ph2));
+        }
+        out[i] = (int16_t)v;
+    }
+}
 
 static void audio_task(void *)
 {
@@ -315,14 +465,50 @@ static void audio_task(void *)
     int32_t statMicN = 0, statRxN = 0;
     int16_t statMicPeak = 0, statRxPeak = 0;
 
+    // Synthesise at the rate the codec was really opened at, not
+    // POC_SAMPLE_RATE_HZ: a tone built for one rate and played at another
+    // skews pitch and duration (the trap #36 warns about).
+    const uint32_t toneRate = audio_hardware_sample_rate();
+    uint8_t toneMode = AUDIO_IDLE;
+    uint32_t toneT = 0;
+    float tonePh1 = 0.0f, tonePh2 = 0.0f;
+
     for (;;) {
         if (!s_uac || !s_uac->inCall()) {
-            // Not in a call: nothing to pace against, so idle politely.
             pumping = false;
             duckFrames = 0;
+
+            const uint8_t mode = s_audio_mode.load();
+            if ((mode == AUDIO_RING || mode == AUDIO_RINGBACK) && toneRate > 0) {
+                if (mode != toneMode) {
+                    toneMode = mode;
+                    toneT = 0;
+                    tonePh1 = tonePh2 = 0.0f;
+                    ESP_LOGI(TAG, "%s tone on @ %lu Hz",
+                             mode == AUDIO_RING ? "ring" : "ringback", (unsigned long)toneRate);
+                }
+                synth_tone_frame(pcm, mode, toneT, toneRate, &tonePh1, &tonePh2);
+                toneT += POC_FRAME_SAMPLES;
+                // The blocking write paces this loop, exactly as the call path
+                // is paced by the blocking read. If it fails (or there is no
+                // codec, as under QEMU) fall back to a delay instead of spinning.
+                size_t wrote = audio_hardware_write_spk(pcm, POC_FRAME_SAMPLES);
+#if CONFIG_TDECK_MAX_SIM_MODE
+                wrote = 0;
+#endif
+                if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            if (toneMode != AUDIO_IDLE) {
+                ESP_LOGI(TAG, "tone off after %lu ms",
+                         (unsigned long)((uint64_t)toneT * 1000u / toneRate));
+                toneMode = AUDIO_IDLE;
+            }
+            // Not in a call: nothing to pace against, so idle politely.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        toneMode = AUDIO_IDLE;   // answered mid-ring: the call owns the speaker now
 
         if (!pumping) {
             // Entering a call -- drop anything the far end queued before we
@@ -421,6 +607,80 @@ static void audio_task(void *)
     }
 }
 
+#if CONFIG_TDECK_MAX_EPD_BENCH
+// UI half of the e-paper bench: drives the real render path (mailbox, settle
+// window, band diff, ghost budget) with scripted posts, because nobody can
+// press keys on a board that is only reachable over serial. Every decision is
+// in the log as "render #N ... -> FULL/PARTIAL/SKIP (why)".
+static void ui_wait(uint32_t seq)
+{
+    for (int i = 0; i < 200 && !ui_drawn(seq); i++) vTaskDelay(pdMS_TO_TICKS(25));
+}
+
+static void ui_bench(void)
+{
+    ESP_LOGW(TAG, "=== UI RENDER BENCH ===");
+    ui_wait(ui_post(ui_model(UI_IDLE, "777"), B_ALL));
+
+    // A transition, then a fast burst: four edits 120 ms apart must coalesce
+    // into ONE partial of B_NUMBER (#41 + #42).
+    ui_wait(ui_post(ui_model(UI_DIALLING, "9"), B_ALL));
+    ESP_LOGW(TAG, "ui bench: burst of 4 edits, 120 ms apart -> expect 1 PARTIAL");
+    uint32_t seq = 0;
+    for (const char *n : {"9*", "9*7", "9*77", "9*777"}) {
+        seq = ui_post(ui_model(UI_DIALLING, n), B_NUMBER);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    ui_wait(seq);
+
+    // Slow typing up to 13 digits: every edit is its own partial until the
+    // ghost cap promotes one to a full refresh (#43). That is also 8
+    // consecutive partials on the glass -- what the ghosting threshold has
+    // to be judged on by eye.
+    ESP_LOGW(TAG, "ui bench: 8 slow edits -> expect partials until the ghost cap, then FULL");
+    std::string num = "9*777";
+    for (int i = 1; i <= 8; i++) {
+        num += (char)('0' + i % 10);
+        ui_wait(ui_post(ui_model(UI_DIALLING, num), B_NUMBER));
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    // 13 -> 14 digits changes B_SUB too ("14 DIGITS - SHOWING LAST 13").
+    ESP_LOGW(TAG, "ui bench: 14th digit -> B_NUMBER request, expect FULL (spans bands)");
+    num += '9';
+    ui_wait(ui_post(ui_model(UI_DIALLING, num), B_NUMBER));
+
+    // A band request whose frame changes two bands must be promoted to FULL.
+    ESP_LOGW(TAG, "ui bench: B_NUMBER request that also changes the label -> expect FULL");
+    ui_wait(ui_post(ui_model(UI_CALLING, num), B_NUMBER));
+
+    // Nothing changed: must not touch the panel at all.
+    ESP_LOGW(TAG, "ui bench: identical frame -> expect SKIP");
+    ui_wait(ui_post(ui_model(UI_CALLING, num), B_ALL));
+
+    // Gallery of the UI_DESIGN 4 screens, 3 s each, for whoever is watching.
+    ESP_LOGW(TAG, "ui bench: screen gallery");
+    ui_model_t g = ui_model(UI_CALLING, "777");
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g = ui_model(UI_INCOMING, "1001");
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g = ui_model(UI_INCALL, "1001");
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g = ui_model(UI_ENDED, "777");
+    g.last_call_secs = 151;
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    g.last_call_failed = true;
+    ui_wait(ui_post(g, B_ALL));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    ESP_LOGW(TAG, "=== UI RENDER BENCH COMPLETE ===");
+}
+#endif // CONFIG_TDECK_MAX_EPD_BENCH
+
 #if CONFIG_TDECK_MAX_AUDIO_SELFTEST
 // Speaker and microphone failures are indistinguishable during a call --
 // both yield silence. This separates them: an audible tone proves the
@@ -511,6 +771,40 @@ static int32_t audio_pass(const char *label)
     return peak;
 }
 
+// Ringer check (#36): run the real tone generator for a fixed span and time
+// it. The I2S write is what paces the ring loop in audio_task, so if the
+// synthesis rate and the codec rate disagree this is where it shows -- the
+// same trap that once made a "2 second" self-test tone finish in 428 ms.
+static void ring_pass(uint8_t mode, int ms)
+{
+    const uint32_t sr = audio_hardware_sample_rate();
+    const int frames = (int)((sr * (uint32_t)ms / 1000u) / POC_FRAME_SAMPLES);
+    int16_t pcm[POC_FRAME_SAMPLES];
+    float ph1 = 0.0f, ph2 = 0.0f;
+    int16_t peak = 0;
+    size_t written = 0;
+
+    audio_hardware_set_amp(true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    int64_t t0 = esp_timer_get_time();
+    for (int f = 0; f < frames; f++) {
+        synth_tone_frame(pcm, mode, (uint32_t)(f * POC_FRAME_SAMPLES), sr, &ph1, &ph2);
+        for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
+            int16_t a = pcm[i] < 0 ? (int16_t)-pcm[i] : pcm[i];
+            if (a > peak) peak = a;
+        }
+        written += audio_hardware_write_spk(pcm, POC_FRAME_SAMPLES);
+    }
+    int elapsed = (int)((esp_timer_get_time() - t0) / 1000);
+    audio_hardware_set_amp(false);
+    ESP_LOGW(TAG, "[%s] %u samples @ %lu Hz, peak %d, took %d ms (expected ~%d)",
+             mode == AUDIO_RING ? "ring" : "ringback", (unsigned)written, (unsigned long)sr,
+             (int)peak, elapsed, ms);
+    if (elapsed < ms * 3 / 4 || elapsed > ms * 5 / 4) {
+        ESP_LOGE(TAG, "ring tone ran at the wrong rate -- check audio_hardware_sample_rate()");
+    }
+}
+
 static void audio_selftest(void)
 {
     ESP_LOGW(TAG, "=== AUDIO SELF-TEST ===");
@@ -528,6 +822,8 @@ static void audio_selftest(void)
     }
 
     audio_pass("audio");
+    ring_pass(AUDIO_RING, 3000);       // one full double-ring cadence
+    ring_pass(AUDIO_RINGBACK, 2000);   // the "on" part of one ringback cycle
 
     ESP_LOGW(TAG, "=== SELF-TEST COMPLETE ===");
 }
@@ -577,17 +873,23 @@ extern "C" void app_main(void)
 #if CONFIG_TDECK_MAX_AUDIO_SELFTEST
     audio_selftest();   // before Wi-Fi, so nothing else competes for the bus
 #endif
+#if CONFIG_TDECK_MAX_EPD_BENCH
+    epaper_bench_run(); // before the render task exists: it owns SPI here
+#endif
 
     // 3. Display task first, so failures after this point can be shown.
-    s_render_q = xQueueCreate(1, sizeof(RenderRequest));
-    xTaskCreate(epaper_task, "epaper", 4096, nullptr, 3, nullptr);
-    ui_render(POC_SIP_EXT_SELF, "Booting", false);
+    xTaskCreate(epaper_task, "epaper", 4096, nullptr, 3, &s_epaper_task);
+#if CONFIG_TDECK_MAX_EPD_BENCH
+    ui_bench();
+#endif
+    ui_post(ui_notice("BOOTING", "joining Wi-Fi"), B_ALL);
 
     // 4. Wi-Fi (bounded; won't hang forever on a bad SSID).
     esp_err_t wifi_err = wifi_sta_connect(POC_WIFI_SSID, POC_WIFI_PASS);
     if (wifi_err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi did not come up; phone cannot register");
-        ui_render(POC_SIP_EXT_SELF, "No WiFi", false);
+        ui_post(ui_notice("NO WIFI", "no IP address after 30 s",
+                          "check the access point,", "then power-cycle"), B_ALL);
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
     ESP_LOGI(TAG, "Wi-Fi up, local IP %s", wifi_local_ip());
@@ -597,11 +899,12 @@ extern "C" void app_main(void)
     if (!uac.init(wifi_local_ip(), POC_SIP_LOCAL_PORT, POC_RTP_LOCAL_PORT,
                   POC_SIP_SERVER_IP, POC_SIP_SERVER_PORT, POC_SIP_EXT_SELF)) {
         ESP_LOGE(TAG, "UAC init failed (socket bind?)");
-        ui_render(POC_SIP_EXT_SELF, "SIP init fail", false);
+        ui_post(ui_notice("SIP FAILED", "could not open SIP socket",
+                          "power-cycle to retry"), B_ALL);
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
     bool registered = uac.registerExt();
-    s_uac = &uac;
+    s_uac = &uac;   // before the next ui_model(): it reads uac.registered()
 
     // 6. Audio pump. Priority above the main loop: starving it is audible,
     //    starving the UI is not. Pinned to core 1 to keep it away from the
@@ -611,7 +914,54 @@ extern "C" void app_main(void)
     UiState ui = UiState::Idle;
     std::string dialBuffer;
     std::string lastDialled = load_last_dialled();
-    ui_render(POC_SIP_EXT_SELF, registered ? "Idle" : "Register failed", false);
+
+    // ENDED is the IDLE screen with the result of the call that just ended
+    // (UI_DESIGN 2.4): no timer, it stays until a key moves the phone on.
+    // Its B_NUMBER is always what ENT will dial. After a FAILED call that is
+    // the number that failed (3.3: "the single most likely next action"),
+    // held here only while the ENDED screen is up -- it is never written to
+    // NVS, so a typo is still never persisted as the redial target.
+    bool showEnded = false;
+    bool lastCallFailed = false;
+    uint32_t lastCallSecs = 0;          // last CONNECTED call; IDLE shows it as LAST CALL
+    std::string failedTarget;
+    int64_t callStartUs = 0;
+
+    auto redialTarget = [&]() -> const std::string & {
+        return (showEnded && lastCallFailed && !failedTarget.empty()) ? failedTarget
+                                                                      : lastDialled;
+    };
+    auto idleModel = [&]() {
+        ui_model_t m = ui_model(showEnded ? UI_ENDED : UI_IDLE, redialTarget());
+        m.last_call_secs = lastCallSecs;
+        m.last_call_failed = showEnded && lastCallFailed;
+        return m;
+    };
+    auto leaveEnded = [&]() {
+        showEnded = false;
+        failedTarget.clear();
+    };
+
+    // Input grace window (#40, UI_DESIGN 2.5). On a transition that changes
+    // what ENT and DEL mean, keys are ignored until the new screen is
+    // actually on the glass (or 3 s, whichever is first), then anything
+    // pressed blind is drained rather than replayed. Without it, a user
+    // mid-dial with a finger on ENT answers a call they cannot see yet, and
+    // a double-tapped ENT answers and then hangs up.
+    int64_t ringBlinkUs = 0;
+    bool ringBlinkOn = true;
+
+    uint32_t graceSeq = 0;
+    int64_t graceStartUs = 0;
+    int graceSwallowed = 0;
+    auto startGrace = [&](uint32_t seq) {
+        graceSeq = seq;
+        graceStartUs = esp_timer_get_time();
+        graceSwallowed = 0;
+    };
+
+    ui_post(idleModel(), B_ALL);
+    bool shownRegistered = uac.registered(), shownWifi = wifi_is_connected();
     ESP_LOGI(TAG, "System operational (registered=%d).", registered);
     if (!lastDialled.empty()) {
         ESP_LOGI(TAG, "ENT from idle will redial %s", lastDialled.c_str());
@@ -621,10 +971,25 @@ extern "C" void app_main(void)
     // and dial-from-buffer so the two can't drift apart -- they had already
     // grown slightly different logging and teardown before this was factored.
     auto placeCallTo = [&](const std::string &target) {
-        ui_render(target.c_str(), "Calling...", false);
+        leaveEnded();
+        ui_post(ui_model(UI_CALLING, target), B_ALL);
         ESP_LOGI(TAG, "dialing %s", target.c_str());
 
-        if (uac.placeCall(target)) {
+        // Ringback for the whole wait, so an outgoing call is not silent
+        // either. placeCall() blocks this task; audio_task plays it.
+        audio_hardware_set_amp(true);
+        audio_set_mode(AUDIO_RINGBACK);
+        bool connected = uac.placeCall(target);
+        audio_set_mode(connected ? AUDIO_CALL : AUDIO_IDLE);
+
+        // placeCall() blocks the loop for as long as it rings (#18), so the
+        // keypad was never read meanwhile: whatever a frustrated user mashed
+        // during the wait is in the FIFO. Drop it rather than replay it into
+        // the call that just connected (UI_DESIGN 2.3, "cheap and required").
+        int dropped = tca8418_flush();
+        if (dropped) ESP_LOGI(TAG, "dropped %d key event(s) pressed while calling", dropped);
+
+        if (connected) {
             // Only remember numbers that actually connected. Persisting a
             // failed attempt would make redial replay a typo.
             if (target != lastDialled) {
@@ -633,10 +998,15 @@ extern "C" void app_main(void)
             }
             ui = UiState::InCall;
             audio_hardware_set_amp(true);
-            ui_render(target.c_str(), "In Call", true);
+            callStartUs = esp_timer_get_time();
+            startGrace(ui_post(ui_model(UI_INCALL, target), B_ALL));
         } else {
             ui = UiState::Idle;
-            ui_render(target.c_str(), "Call Failed", false);
+            audio_hardware_set_amp(false);
+            showEnded = true;
+            lastCallFailed = true;
+            failedTarget = target;
+            ui_post(idleModel(), B_ALL);
             ESP_LOGW(TAG, "call to %s failed", target.c_str());
         }
     };
@@ -646,17 +1016,51 @@ extern "C" void app_main(void)
 
         // Keep the registration alive; without this the binding lapses at
         // POC_SIP_REG_EXPIRES and the phone silently stops taking calls.
-        if (uac.maintainRegistration() && ui == UiState::Idle) {
-            ui_render(POC_SIP_EXT_SELF, "Reg failed", false);
+        uac.maintainRegistration();
+
+        // Link state is drawn in B_STATUS (UI_DESIGN 4.6). A change while
+        // idle repaints that band alone (5.2); in any other state the next
+        // transition picks it up. If the change also moves another band (the
+        // IDLE label says NO SERVICE when unregistered), the driver sees the
+        // frame differ in two bands and takes a full refresh instead.
+        const bool regNow = uac.registered(), wifiNow = wifi_is_connected();
+        if (regNow != shownRegistered || wifiNow != shownWifi) {
+            shownRegistered = regNow;
+            shownWifi = wifiNow;
+            ESP_LOGI(TAG, "link state: %s, %s", regNow ? "registered" : "NOT registered",
+                     wifiNow ? "Wi-Fi up" : "Wi-Fi DOWN");
+            if (ui == UiState::Idle) ui_post(idleModel(), B_STATUS);
         }
 
         // Single GPIO read unless the controller actually has events.
         char key = tca8418_key_pending() ? tca8418_get_key() : 0;
 
+        if (graceStartUs) {
+            const int64_t heldMs = (esp_timer_get_time() - graceStartUs) / 1000;
+            if (ui_drawn(graceSeq) || heldMs >= 3000) {
+                graceSwallowed += tca8418_flush();
+                ESP_LOGI(TAG, "input grace over after %lld ms (%s), %d key event(s) discarded",
+                         (long long)heldMs, ui_drawn(graceSeq) ? "screen visible" : "timeout",
+                         graceSwallowed);
+                graceStartUs = 0;
+            } else if (key) {
+                graceSwallowed++;
+            }
+            key = 0;
+        }
+
         if (uac.hasIncomingCall() && ui != UiState::InCall && ui != UiState::Incoming) {
             ui = UiState::Incoming;
+            leaveEnded();
             ESP_LOGI(TAG, "incoming call from %s", uac.incomingCallerId().c_str());
-            ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
+            audio_hardware_set_amp(true);
+            audio_set_mode(AUDIO_RING);
+            ringBlinkUs = esp_timer_get_time();
+            startGrace(ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL));
+            // The key read above came off the FIFO BEFORE grace started. Left
+            // alone it would reach case Incoming below in this same tick, so
+            // an ENT meant for dialling would answer a call nobody has seen.
+            key = 0;
         }
 
         switch (ui) {
@@ -668,24 +1072,30 @@ extern "C" void app_main(void)
             // step also stops a stray DEL from switching the phone off
             // mid-shift.
             if (key == '\b') {
+                leaveEnded();
                 ui = UiState::ConfirmOff;
-                ui_render("Power off?", "ENT=yes DEL=no", false);
+                ui_post(ui_notice("POWER OFF?", "",
+                                  "ENT  power off",
+                                  "any other key cancels"), B_ALL);
                 break;
             }
-            // ENT on an empty buffer redials the last number that connected.
-            // Inert when there is nothing stored -- a phone that dials
-            // something unpredictable on an idle keypress is worse than one
-            // that does nothing.
+            // ENT on an empty buffer redials the number on the screen: the
+            // last number that connected, or on the CALL FAILED screen the
+            // one that just failed. Inert when there is nothing -- a phone
+            // that dials something unpredictable on an idle keypress is worse
+            // than one that does nothing.
             if (key == '\r') {
-                if (!lastDialled.empty()) placeCallTo(lastDialled);
+                const std::string target = redialTarget();   // copy: placeCallTo clears it
+                if (!target.empty()) placeCallTo(target);
                 else ESP_LOGI(TAG, "ENT from idle: nothing to redial yet");
                 break;
             }
             if (is_dial_char(key)) {
+                leaveEnded();
                 dialBuffer.clear();
                 dialBuffer += key;
                 ui = UiState::Dialing;
-                ui_render(dialBuffer.c_str(), "Dialing", false);
+                ui_post(ui_model(UI_DIALLING, dialBuffer), B_ALL);
             }
             break;
 
@@ -693,14 +1103,15 @@ extern "C" void app_main(void)
             if (key == '\b') {
                 if (!dialBuffer.empty()) dialBuffer.pop_back();
                 else ui = UiState::Idle;
-                ui_render(dialBuffer.c_str(), ui == UiState::Idle ? "Idle" : "Dialing", false);
+                if (ui == UiState::Idle) ui_post(idleModel(), B_ALL);
+                else ui_post(ui_model(UI_DIALLING, dialBuffer), B_NUMBER);
             } else if (is_dial_char(key)) {
                 // Silently stop growing at the cap rather than wrapping or
                 // truncating on dial -- the user can see the number isn't
                 // getting longer.
                 if (dialBuffer.size() < DIAL_BUFFER_MAX) {
                     dialBuffer += key;
-                    ui_render(dialBuffer.c_str(), "Dialing", false);
+                    ui_post(ui_model(UI_DIALLING, dialBuffer), B_NUMBER);
                 }
             } else if (key == '\r' && !dialBuffer.empty()) {
                 std::string target = dialBuffer;
@@ -710,19 +1121,36 @@ extern "C" void app_main(void)
             break;
 
         case UiState::Incoming:
+            // Keyboard backlight blinks at 2 Hz while ringing (UI_DESIGN 6):
+            // the one alert channel that costs no panel time.
+            if (esp_timer_get_time() - ringBlinkUs >= 250000) {
+                ringBlinkUs = esp_timer_get_time();
+                ringBlinkOn = !ringBlinkOn;
+                tca8418_set_backlight(ringBlinkOn);
+            }
+            if (key == '\r' || key == '\b' || !uac.hasIncomingCall()) {
+                tca8418_set_backlight(true);
+                ringBlinkOn = true;
+            }
             if (key == '\r') {
                 uac.answer();
                 ui = UiState::InCall;
+                audio_set_mode(AUDIO_CALL);
                 audio_hardware_set_amp(true);
-                ui_render(uac.incomingCallerId().c_str(), "In Call", true);
+                callStartUs = esp_timer_get_time();
+                startGrace(ui_post(ui_model(UI_INCALL, uac.incomingCallerId()), B_ALL));
             } else if (key == '\b') {
                 uac.reject();
                 ui = UiState::Idle;
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                audio_set_mode(AUDIO_IDLE);
+                audio_hardware_set_amp(false);
+                ui_post(idleModel(), B_ALL);
             } else if (!uac.hasIncomingCall()) {
                 // Caller gave up (CANCEL) before we answered/rejected.
                 ui = UiState::Idle;
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                audio_set_mode(AUDIO_IDLE);
+                audio_hardware_set_amp(false);
+                ui_post(idleModel(), B_ALL);
             }
             break;
 
@@ -734,12 +1162,12 @@ extern "C" void app_main(void)
                 // enough to press something random, you did not mean to shut
                 // the phone down.
                 ui = UiState::Idle;
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                ui_post(idleModel(), B_ALL);
             } else if (uac.hasIncomingCall()) {
                 // An incoming call outranks a pending power-off prompt; the
                 // hasIncomingCall() check above the switch has already moved
                 // us on, this just avoids leaving the prompt on screen.
-                ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
+                ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL);
             }
             break;
 
@@ -749,8 +1177,19 @@ extern "C" void app_main(void)
             if (key == '\b' || key == '\r') uac.hangup();
             if (uac.callEnded() || !uac.inCall()) {
                 ui = UiState::Idle;
+                audio_set_mode(AUDIO_IDLE);
                 audio_hardware_set_amp(false);
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                // Duration is shown once, on the ENDED screen -- a full
+                // refresh that was happening anyway -- never as a live timer
+                // (UI_DESIGN 5.5). Nearest second, but never 00:00 for a call
+                // that did connect.
+                lastCallSecs = (uint32_t)((esp_timer_get_time() - callStartUs + 500000) / 1000000);
+                if (lastCallSecs == 0) lastCallSecs = 1;
+                lastCallFailed = false;
+                failedTarget.clear();
+                showEnded = true;
+                ESP_LOGI(TAG, "call ended after %lu s", (unsigned long)lastCallSecs);
+                ui_post(idleModel(), B_ALL);
             }
             break;
         }

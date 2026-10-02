@@ -450,11 +450,17 @@ bool TincanUac::registerExt()
             // actually lapses.
             _nextRegisterUs = esp_timer_get_time() +
                               (int64_t)(POC_SIP_REG_EXPIRES / 2) * 1000000LL;
+            _registered = true;
             return true;
         }
-        if (code >= 400) { ESP_LOGE(TAG, "REGISTER rejected (%d)", code); return false; }
+        if (code >= 400) {
+            ESP_LOGE(TAG, "REGISTER rejected (%d)", code);
+            _registered = false;
+            return false;
+        }
     }
     ESP_LOGW(TAG, "no REGISTER response from %s:%d", _serverIp.c_str(), _serverPort);
+    _registered = false;
     return false;
 }
 

@@ -30,7 +30,7 @@ number it wasn't compiled with, and it rings silently.
 | Keypad dialpad (`0`-`9` `*` `#` `+`), NVS redial | Working on hardware |
 | Inbound from a desktop softphone | Working on hardware |
 | Inbound from a **3CX DN** (RING-ALL fork) | **Never exercised** |
-| Ringer / ringback | **Does not exist — the phone rings silently** |
+| Ringer / ringback | Implemented (#36): ring on INCOMING with a 2 Hz backlight blink, ringback while CALLING; tone timing checked by the audio self-test, levels not yet tuned by ear |
 
 ---
 

@@ -41,7 +41,7 @@ Three tasks (`main/src/app_main.cpp`):
 |---|---|---|---|
 | `main_task` | any | 1 | SIP control (`uac.poll()`), registration refresh, keypad, UI state machine |
 | `audio` | 1 (pinned) | 6 | RTP ↔ I2S pump, paced **solely** by the blocking `i2s_channel_read()` |
-| `epaper` | any | 3 | The **3.3 s** panel refresh (measured 3277 ms), fed by a depth-1 `xQueueOverwrite` |
+| `epaper` | any | 3 | The panel refresh (measured 1253 ms full, 862 ms one-band partial; was 3277 ms), fed by a depth-1 mailbox with a 250 ms settle window |
 
 Audio and display each originally ran inline on the main loop. That was
 wrong in both cases and the symptoms were distinct:
@@ -120,6 +120,6 @@ pre-answer backlog isn't played out as latency that never recovers.
 - No acoustic echo cancellation -- mic ducking only (see §3).
 - Full alpha entry. The keypad binds the dialpad only (`0`-`9` `*` `#` `+`, as the default layer -- see `UI_DESIGN.md` §0.2/§3.3); `ALT` and `SYM` are reserved and inert. Nothing downstream consumes letters, since `placeCall()` builds `sip:<ext>@server` and drawbridge extensions are numeric.
 - Long-press and hold-to-clear. `tca8418_get_key()` returns a `char` and discards the release edge, so no gesture needing both edges is representable (`UI_DESIGN.md` §9.2). Hence power-off is two taps and a confirm rather than a hold.
-- Full alphabet font, real status icons, and e-paper partial refresh are deferred UI polish (#16). The phone also rings **silently**: no ringer or ringback tone is generated.
+- The e-paper UI (font, band grid, partial refresh, the UI_DESIGN §4 screens) and the ringer/ringback landed in the UI PR for #16 / #36-#43. Still not built: battery and signal indicators, mute, runtime volume, hold-DEL (#45, #46).
 - No SIP authentication (#28). There is no `Authorization`/`WWW-Authenticate` handling anywhere in `main/`, and `registerExt()` treats any 4xx (including a `401 Unauthorized` challenge) as a flat rejection. This works only because drawbridge's registrar is **open by default**; pointing this firmware at drawbridge's secure/digest mode, or at any conventional PBX, will fail to register rather than retry with credentials.
 - No DTMF (RFC 2833 / `telephone-event`) -- inbound SDP advertising payload 101 is parsed but not acted on, so in-call menu navigation on the far end won't work.

@@ -20,6 +20,8 @@ idf_component_register(
         "src/es8311_audio.c"
         "src/tca8418_keypad.cpp"
         "src/epaper_display.cpp"
+        "src/ui_render.cpp"
+        "src/font_ui_8x16.c"
         "src/tincan_uac.cpp"
         "src/g711.c"
     INCLUDE_DIRS

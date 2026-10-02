@@ -10,7 +10,7 @@
 #   cmake --build build
 #   ctest --test-dir build --output-on-failure
 cmake_minimum_required(VERSION 3.16)
-project(tdeck_max_phone_host_tests CXX)
+project(tdeck_max_phone_host_tests C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,5 +29,17 @@ if(WIN32)
     target_link_libraries(sip_wire_test PRIVATE ws2_32)
 endif()
 
+# The e-paper renderer is pure C++ with no ESP-IDF headers, so the real
+# drawing code (not a copy) is tested here. Set UI_DUMP_DIR to also get each
+# test frame as a PBM image.
+set(MAIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../main)
+add_executable(ui_render_test
+    ui_render_test.cpp
+    ${MAIN_DIR}/src/ui_render.cpp
+    ${MAIN_DIR}/src/font_ui_8x16.c
+)
+target_include_directories(ui_render_test PRIVATE ${MAIN_DIR}/include)
+
 enable_testing()
 add_test(NAME sip_wire_format COMMAND sip_wire_test)
+add_test(NAME ui_render COMMAND ui_render_test)

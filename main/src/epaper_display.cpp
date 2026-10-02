@@ -54,6 +54,7 @@
 // the render task.
 #include "epaper_display.h"
 #include "board_tdeck_max.h"
+#include "ui_render.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
@@ -65,10 +66,10 @@
 
 static const char *TAG = "EPAPER_DISPLAY";
 
-#define EPD_WIDTH        240
-#define EPD_HEIGHT       320
-#define EPD_BYTES_PER_ROW (EPD_WIDTH / 8)             // 30
-#define EPD_BUF_SIZE      (EPD_BYTES_PER_ROW * EPD_HEIGHT) // 9600, matches vendor's EPD_ARRAY
+#define EPD_WIDTH         UI_W        // 240
+#define EPD_HEIGHT        UI_H        // 320
+#define EPD_BYTES_PER_ROW UI_STRIDE   // 30
+#define EPD_BUF_SIZE      UI_FB_SIZE  // 9600, matches vendor's EPD_ARRAY
 
 #define EPD_SPI_HZ          (4 * 1000 * 1000) // Meshtastic: SPISettings(4000000, MSBFIRST, SPI_MODE0)
 #define EPD_RESET_LOW_MS    2                 // Meshtastic: init(..., reset_duration = 2, ...)
@@ -120,96 +121,6 @@ static bool s_glass_valid = false;
 
 // Waveform time of the most recent refresh (REFRESH command to BUSY release).
 static int s_last_waveform_ms = 0;
-
-static void set_pixel(int x, int y, bool black)
-{
-    if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT) return;
-    uint8_t *byte = &s_fb[y * EPD_BYTES_PER_ROW + (x / 8)];
-    uint8_t mask = 0x80 >> (x % 8);
-    if (black) *byte &= ~mask;
-    else *byte |= mask;
-}
-
-static void fill_rect(int x, int y, int w, int h, bool black)
-{
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++)
-            set_pixel(x + i, y + j, black);
-}
-
-// Compact 5x7 dialpad font, MSB of each row byte = leftmost column. Covers
-// exactly the characters a dial buffer can contain: 0-9 plus * # +. Indexed
-// through glyph_index() rather than `c - '0'`, because the set is no longer
-// contiguous. Status is drawn as a fixed pictogram per state (see
-// epaper_render_call_status) rather than a full alphabet font; a real
-// character set is UI-polish scope beyond this PoC (#16).
-//
-// * and # matter because they are dialable: *777 is the echo test, and star
-// codes are how most PBXes expose features. Before this they rendered as
-// blank gaps, so "*777" displayed as " 777". + is here only because it is the
-// printed legend on the O key and costs one glyph; neither drawbridge nor the
-// 3CX anchor consumes it today.
-#define GLYPH_COUNT 13
-static const uint8_t s_dial_font[GLYPH_COUNT][7] = {
-    {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70}, // 0
-    {0x20, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70}, // 1
-    {0x70, 0x88, 0x08, 0x10, 0x20, 0x40, 0xF8}, // 2
-    {0xF8, 0x10, 0x20, 0x10, 0x08, 0x88, 0x70}, // 3
-    {0x10, 0x30, 0x50, 0x90, 0xF8, 0x10, 0x10}, // 4
-    {0xF8, 0x80, 0xF0, 0x08, 0x08, 0x88, 0x70}, // 5
-    {0x30, 0x40, 0x80, 0xF0, 0x88, 0x88, 0x70}, // 6
-    {0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x40}, // 7
-    {0x70, 0x88, 0x88, 0x70, 0x88, 0x88, 0x70}, // 8
-    {0x70, 0x88, 0x88, 0x78, 0x08, 0x10, 0x60}, // 9
-    // '*' -- a six-point asterisk sitting high in the cell, the way a
-    // typographic asterisk does. Rows 5-6 blank so it never reads as a plus.
-    {0x20, 0xA8, 0x70, 0xF8, 0x70, 0xA8, 0x20}, // *
-    // '#' -- two verticals crossed by two horizontals, full cell width.
-    {0x50, 0x50, 0xF8, 0x50, 0xF8, 0x50, 0x50}, // #
-    // '+' -- centred, deliberately shorter than '#' so the two don't confuse.
-    {0x00, 0x20, 0x20, 0xF8, 0x20, 0x20, 0x00}, // +
-};
-
-// Map a dialable character to its row in s_dial_font, or -1 if we can't draw
-// it. Keep this in sync with s_keymap in tca8418_keypad.cpp: anything the
-// keypad can put in the dial buffer must be drawable here, or the user types
-// a character and sees nothing appear.
-static int glyph_index(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    switch (c) {
-        case '*': return 10;
-        case '#': return 11;
-        case '+': return 12;
-        default:  return -1;
-    }
-}
-
-static void draw_glyph(int x, int y, int idx, int scale)
-{
-    if (idx < 0 || idx >= GLYPH_COUNT) return;
-    for (int row = 0; row < 7; row++) {
-        uint8_t bits = s_dial_font[idx][row];
-        for (int col = 0; col < 5; col++) {
-            if (bits & (0x80 >> col)) {
-                fill_rect(x + col * scale, y + row * scale, scale, scale, true);
-            }
-        }
-    }
-}
-
-// Draws 0-9 * # +; anything else (letters in a caller name, spaces) still
-// renders as a blank gap, which is correct -- the gap preserves position so a
-// partially-drawable string doesn't silently shift left.
-static void draw_digit_string(int x, int y, const char *s, int scale, int spacing)
-{
-    int cx = x;
-    for (const char *p = s; p && *p; p++) {
-        draw_glyph(cx, y, glyph_index(*p), scale);
-        cx += 5 * scale + spacing;
-        if (cx > EPD_WIDTH - 5 * scale) break; // clip to panel width
-    }
-}
 
 #if !CONFIG_TDECK_MAX_SIM_MODE
 static void epd_write_byte(uint8_t val, bool is_data)
@@ -477,6 +388,13 @@ void epaper_set_backlight(bool enable)
     gpio_set_level(BOARD_EPD_BACKLIGHT, enable ? 1 : 0);
 }
 
+static bool all_num_glyphs(const char *s)
+{
+    for (const char *p = s; *p; p++)
+        if (!ui_num_has_glyph(*p)) return false;
+    return true;
+}
+
 void epaper_render_call_status(const char *caller_id, const char *status, bool ptt_active)
 {
     ESP_LOGI(TAG, "[EPD RENDER] Caller: %s | Status: %s | PTT: %s",
@@ -484,25 +402,33 @@ void epaper_render_call_status(const char *caller_id, const char *status, bool p
              status ? status : "Idle",
              ptt_active ? "TALKING" : "LISTENING");
 
-    memset(s_fb, 0xFF, sizeof(s_fb));
+    ui_clear(s_fb);
 
-    // Caller ID / extension, large digits centered near the top.
+    // Caller ID / extension. A dialable string keeps the large F_NUM digits;
+    // anything else (an alphanumeric caller ID, "Power off?") used to render
+    // as blank gaps and is now F_UI text at 2x.
     if (caller_id && caller_id[0]) {
-        draw_digit_string(20, 40, caller_id, 6, 10);
+        if (all_num_glyphs(caller_id)) ui_draw_num(s_fb, 20, 40, caller_id, 6, 10);
+        else ui_draw_text_centred(s_fb, 48, caller_id, 2);
     }
 
-    // Status pictogram: a placeholder visual state indicator (filled =
-    // active/ringing, outline = idle) rather than rendered status text --
-    // a real icon set / font is UI-polish scope beyond this PoC.
+    // The status string itself, F_UI at 2x (#37). Until now it was only ever
+    // string-matched into the pictogram below, so "Incoming Call", "Dialing"
+    // and "Call Failed" were indistinguishable on the glass.
+    if (status && status[0]) ui_draw_text_centred(s_fb, 104, status, 2);
+
+    // Status pictogram: filled = active/ringing, outline = idle. Still the
+    // string-matching placeholder; the band API (#38) replaces it with an
+    // explicit screen enum.
     bool active = ptt_active || (status && strstr(status, "Call") != NULL) ||
                   (status && strstr(status, "Ring") != NULL);
     if (active) {
-        fill_rect(EPD_WIDTH / 2 - 30, 140, 60, 60, true);
+        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 168, 60, 60, true);
     } else {
-        fill_rect(EPD_WIDTH / 2 - 30, 140, 60, 4, true);
-        fill_rect(EPD_WIDTH / 2 - 30, 196, 60, 4, true);
-        fill_rect(EPD_WIDTH / 2 - 30, 140, 4, 60, true);
-        fill_rect(EPD_WIDTH / 2 + 26, 140, 4, 60, true);
+        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 168, 60, 4, true);
+        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 224, 60, 4, true);
+        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 168, 4, 60, true);
+        ui_fill_rect(s_fb, EPD_WIDTH / 2 + 26, 168, 4, 60, true);
     }
 
     epd_full_refresh(s_fb);
@@ -522,16 +448,16 @@ void epaper_render_call_status(const char *caller_id, const char *status, bool p
 // Ghosting, smearing or a shifted band during 2-3 is the thing to look for.
 static void bench_frame(int counter, int block)
 {
-    memset(s_fb, 0xFF, sizeof(s_fb));
-    fill_rect(0, 0, EPD_WIDTH, 3, true);
-    fill_rect(0, EPD_HEIGHT - 3, EPD_WIDTH, 3, true);
-    fill_rect(0, 0, 3, EPD_HEIGHT, true);
-    fill_rect(EPD_WIDTH - 3, 0, 3, EPD_HEIGHT, true);
-    fill_rect(20, 280, EPD_WIDTH - 40, 20, true);
-    if (block >= 0) fill_rect(24 + block * 40, 284, 32, 12, false);
+    ui_clear(s_fb);
+    ui_fill_rect(s_fb, 0, 0, EPD_WIDTH, 3, true);
+    ui_fill_rect(s_fb, 0, EPD_HEIGHT - 3, EPD_WIDTH, 3, true);
+    ui_fill_rect(s_fb, 0, 0, 3, EPD_HEIGHT, true);
+    ui_fill_rect(s_fb, EPD_WIDTH - 3, 0, 3, EPD_HEIGHT, true);
+    ui_fill_rect(s_fb, 20, 280, EPD_WIDTH - 40, 20, true);
+    if (block >= 0) ui_fill_rect(s_fb, 24 + block * 40, 284, 32, 12, false);
     char num[8];
     snprintf(num, sizeof(num), "%d", counter);
-    draw_digit_string(60, 100, num, 7, 8);   // inside rows 88-159
+    ui_draw_num(s_fb, 60, 100, num, 7, 8);   // inside rows 88-159
 }
 
 static void bench_report(const char *what, const int *ms, int n)

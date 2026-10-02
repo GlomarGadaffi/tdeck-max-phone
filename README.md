@@ -154,6 +154,12 @@ exactly one of each required header, response re-parses cleanly, BYE Call-ID
 matching works. This is what caught the malformed-response bug that compiled
 perfectly and would only ever have surfaced as "drawbridge ignores us".
 
+`test/ui_render_test.cpp` compiles the real e-paper renderer
+(`main/src/ui_render.cpp`, no ESP-IDF headers) and checks the font table, text
+placement and clipping. Set `UI_DUMP_DIR=<dir>` before running
+`build-host/ui_render_test` to also get every test frame as a PBM image -- the
+cheapest way to look at a screen without flashing the board.
+
 ### Build & flash (real hardware)
 ```bash
 idf.py set-target esp32s3
@@ -209,3 +215,5 @@ Full plan, including what is deliberately out of scope: **[docs/ROADMAP.md](docs
 ## License
 
 MIT. See [LICENSE](LICENSE) -- this project combines original work with a vendored SIP parser (`components/sip_core`, ported via the sibling `tincan` project from `pocket-dial`, also MIT).
+
+Third-party: the e-paper UI font (`main/src/font_ui_8x16.c`) is generated from **Spleen 8x16** by Frederic Cambus, Copyright (c) 2018-2026, under the **BSD 2-Clause** license; the full license text is reproduced at the top of that file and must accompany binary redistributions. The e-paper register sequence follows GxEPD2 / the Meshtastic t-deck-max build (hardware facts only; no GPL code is included).

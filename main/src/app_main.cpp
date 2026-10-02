@@ -175,7 +175,7 @@ static void ui_render(const char *caller, const char *status, bool active)
 // ── Dial buffer + last-number redial ────────────────────────────────────────
 
 // Characters the dial buffer accepts. Must stay in sync with s_keymap
-// (tca8418_keypad.cpp) on the input side and glyph_index() (epaper_display.cpp)
+// (tca8418_keypad.cpp) on the input side and ui_num_has_glyph() (ui_render.cpp)
 // on the output side -- a character the keypad can produce but the display
 // can't draw looks like a dropped keypress.
 static bool is_dial_char(char c)

@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "driver/i2c.h"
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <cmath>
@@ -214,6 +215,16 @@ static ui_model_t ui_notice(const char *label, const char *sub,
     return m;
 }
 
+// What audio_task should be doing when no call is up (#36). Set by the main
+// loop, read by audio_task every frame; see "ringer and ringback" below.
+enum AudioMode : uint8_t { AUDIO_IDLE, AUDIO_RING, AUDIO_RINGBACK, AUDIO_CALL };
+static std::atomic<uint8_t> s_audio_mode{AUDIO_IDLE};
+
+static void audio_set_mode(AudioMode m)
+{
+    s_audio_mode.store(m);
+}
+
 // Real power off, the way the board is built to do it.
 //
 // This mirrors LilyGO's factory ui_shutdown_on(): put the touch controller in
@@ -287,6 +298,7 @@ static void power_off(TincanUac &uac)
         uac.hangup();
         vTaskDelay(pdMS_TO_TICKS(150));   // let the BYE actually get out
     }
+    audio_set_mode(AUDIO_IDLE);
     audio_hardware_set_amp(false);
 
     bool onUsb = false;
@@ -391,6 +403,45 @@ static void epaper_task(void *)
 // effectively did) directly reduces packet rate and grows one-way latency for
 // the whole call.
 
+// ── ringer and ringback (#36, UI_DESIGN 6) ──────────────────────────────────
+// The phone used to ring silently: audio_task only pumped while inCall(), so
+// no code path could make a sound while a call was merely ringing, and the
+// main task must not do it (audio_hardware_write_spk() blocks on I2S and
+// would stall SIP). The main loop now sets s_audio_mode; audio_task
+// synthesises the tone. The main loop also owns the amplifier -- it is an
+// XL9555 pin with a shadow register, so exactly one task writes it.
+// One 20 ms frame of ring or ringback at the codec's ACTUAL rate. t0 is the
+// sample count since the tone started, which drives the cadence; the phase
+// accumulators keep the waveform continuous across frames.
+//   RING:     1000/1250 Hz warble at 20 Hz -- the classic electronic ringer --
+//             in a double-ring cadence, 0.4 on, 0.2 off, 0.4 on, 2.0 off.
+//   RINGBACK: North American 440 + 480 Hz, 2 s on, 4 s off.
+static void synth_tone_frame(int16_t *out, uint8_t mode, uint32_t t0, uint32_t sr,
+                             float *ph1, float *ph2)
+{
+    const float twopi = 6.28318531f;
+    for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
+        const uint32_t ms = (uint32_t)(((uint64_t)(t0 + i) * 1000u) / sr);
+        float v = 0.0f;
+        if (mode == AUDIO_RING) {
+            const uint32_t c = ms % 3000u;
+            const bool on = c < 400u || (c >= 600u && c < 1000u);
+            const float f = ((ms / 25u) & 1u) ? 1250.0f : 1000.0f;
+            *ph1 += twopi * f / (float)sr;
+            if (*ph1 > twopi) *ph1 -= twopi;
+            if (on) v = POC_RING_AMPL * sinf(*ph1);
+        } else {
+            const bool on = (ms % 6000u) < 2000u;
+            *ph1 += twopi * 440.0f / (float)sr;
+            *ph2 += twopi * 480.0f / (float)sr;
+            if (*ph1 > twopi) *ph1 -= twopi;
+            if (*ph2 > twopi) *ph2 -= twopi;
+            if (on) v = POC_RINGBACK_AMPL * 0.5f * (sinf(*ph1) + sinf(*ph2));
+        }
+        out[i] = (int16_t)v;
+    }
+}
+
 static void audio_task(void *)
 {
     int16_t pcm[POC_FRAME_SAMPLES];
@@ -414,14 +465,50 @@ static void audio_task(void *)
     int32_t statMicN = 0, statRxN = 0;
     int16_t statMicPeak = 0, statRxPeak = 0;
 
+    // Synthesise at the rate the codec was really opened at, not
+    // POC_SAMPLE_RATE_HZ: a tone built for one rate and played at another
+    // skews pitch and duration (the trap #36 warns about).
+    const uint32_t toneRate = audio_hardware_sample_rate();
+    uint8_t toneMode = AUDIO_IDLE;
+    uint32_t toneT = 0;
+    float tonePh1 = 0.0f, tonePh2 = 0.0f;
+
     for (;;) {
         if (!s_uac || !s_uac->inCall()) {
-            // Not in a call: nothing to pace against, so idle politely.
             pumping = false;
             duckFrames = 0;
+
+            const uint8_t mode = s_audio_mode.load();
+            if ((mode == AUDIO_RING || mode == AUDIO_RINGBACK) && toneRate > 0) {
+                if (mode != toneMode) {
+                    toneMode = mode;
+                    toneT = 0;
+                    tonePh1 = tonePh2 = 0.0f;
+                    ESP_LOGI(TAG, "%s tone on @ %lu Hz",
+                             mode == AUDIO_RING ? "ring" : "ringback", (unsigned long)toneRate);
+                }
+                synth_tone_frame(pcm, mode, toneT, toneRate, &tonePh1, &tonePh2);
+                toneT += POC_FRAME_SAMPLES;
+                // The blocking write paces this loop, exactly as the call path
+                // is paced by the blocking read. If it fails (or there is no
+                // codec, as under QEMU) fall back to a delay instead of spinning.
+                size_t wrote = audio_hardware_write_spk(pcm, POC_FRAME_SAMPLES);
+#if CONFIG_TDECK_MAX_SIM_MODE
+                wrote = 0;
+#endif
+                if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            if (toneMode != AUDIO_IDLE) {
+                ESP_LOGI(TAG, "tone off after %lu ms",
+                         (unsigned long)((uint64_t)toneT * 1000u / toneRate));
+                toneMode = AUDIO_IDLE;
+            }
+            // Not in a call: nothing to pace against, so idle politely.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        toneMode = AUDIO_IDLE;   // answered mid-ring: the call owns the speaker now
 
         if (!pumping) {
             // Entering a call -- drop anything the far end queued before we
@@ -684,6 +771,40 @@ static int32_t audio_pass(const char *label)
     return peak;
 }
 
+// Ringer check (#36): run the real tone generator for a fixed span and time
+// it. The I2S write is what paces the ring loop in audio_task, so if the
+// synthesis rate and the codec rate disagree this is where it shows -- the
+// same trap that once made a "2 second" self-test tone finish in 428 ms.
+static void ring_pass(uint8_t mode, int ms)
+{
+    const uint32_t sr = audio_hardware_sample_rate();
+    const int frames = (int)((sr * (uint32_t)ms / 1000u) / POC_FRAME_SAMPLES);
+    int16_t pcm[POC_FRAME_SAMPLES];
+    float ph1 = 0.0f, ph2 = 0.0f;
+    int16_t peak = 0;
+    size_t written = 0;
+
+    audio_hardware_set_amp(true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    int64_t t0 = esp_timer_get_time();
+    for (int f = 0; f < frames; f++) {
+        synth_tone_frame(pcm, mode, (uint32_t)(f * POC_FRAME_SAMPLES), sr, &ph1, &ph2);
+        for (int i = 0; i < POC_FRAME_SAMPLES; i++) {
+            int16_t a = pcm[i] < 0 ? (int16_t)-pcm[i] : pcm[i];
+            if (a > peak) peak = a;
+        }
+        written += audio_hardware_write_spk(pcm, POC_FRAME_SAMPLES);
+    }
+    int elapsed = (int)((esp_timer_get_time() - t0) / 1000);
+    audio_hardware_set_amp(false);
+    ESP_LOGW(TAG, "[%s] %u samples @ %lu Hz, peak %d, took %d ms (expected ~%d)",
+             mode == AUDIO_RING ? "ring" : "ringback", (unsigned)written, (unsigned long)sr,
+             (int)peak, elapsed, ms);
+    if (elapsed < ms * 3 / 4 || elapsed > ms * 5 / 4) {
+        ESP_LOGE(TAG, "ring tone ran at the wrong rate -- check audio_hardware_sample_rate()");
+    }
+}
+
 static void audio_selftest(void)
 {
     ESP_LOGW(TAG, "=== AUDIO SELF-TEST ===");
@@ -701,6 +822,8 @@ static void audio_selftest(void)
     }
 
     audio_pass("audio");
+    ring_pass(AUDIO_RING, 3000);       // one full double-ring cadence
+    ring_pass(AUDIO_RINGBACK, 2000);   // the "on" part of one ringback cycle
 
     ESP_LOGW(TAG, "=== SELF-TEST COMPLETE ===");
 }
@@ -825,6 +948,9 @@ extern "C" void app_main(void)
     // pressed blind is drained rather than replayed. Without it, a user
     // mid-dial with a finger on ENT answers a call they cannot see yet, and
     // a double-tapped ENT answers and then hangs up.
+    int64_t ringBlinkUs = 0;
+    bool ringBlinkOn = true;
+
     uint32_t graceSeq = 0;
     int64_t graceStartUs = 0;
     int graceSwallowed = 0;
@@ -849,7 +975,12 @@ extern "C" void app_main(void)
         ui_post(ui_model(UI_CALLING, target), B_ALL);
         ESP_LOGI(TAG, "dialing %s", target.c_str());
 
+        // Ringback for the whole wait, so an outgoing call is not silent
+        // either. placeCall() blocks this task; audio_task plays it.
+        audio_hardware_set_amp(true);
+        audio_set_mode(AUDIO_RINGBACK);
         bool connected = uac.placeCall(target);
+        audio_set_mode(connected ? AUDIO_CALL : AUDIO_IDLE);
 
         // placeCall() blocks the loop for as long as it rings (#18), so the
         // keypad was never read meanwhile: whatever a frustrated user mashed
@@ -871,6 +1002,7 @@ extern "C" void app_main(void)
             startGrace(ui_post(ui_model(UI_INCALL, target), B_ALL));
         } else {
             ui = UiState::Idle;
+            audio_hardware_set_amp(false);
             showEnded = true;
             lastCallFailed = true;
             failedTarget = target;
@@ -921,6 +1053,9 @@ extern "C" void app_main(void)
             ui = UiState::Incoming;
             leaveEnded();
             ESP_LOGI(TAG, "incoming call from %s", uac.incomingCallerId().c_str());
+            audio_hardware_set_amp(true);
+            audio_set_mode(AUDIO_RING);
+            ringBlinkUs = esp_timer_get_time();
             startGrace(ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL));
         }
 
@@ -982,19 +1117,35 @@ extern "C" void app_main(void)
             break;
 
         case UiState::Incoming:
+            // Keyboard backlight blinks at 2 Hz while ringing (UI_DESIGN 6):
+            // the one alert channel that costs no panel time.
+            if (esp_timer_get_time() - ringBlinkUs >= 250000) {
+                ringBlinkUs = esp_timer_get_time();
+                ringBlinkOn = !ringBlinkOn;
+                tca8418_set_backlight(ringBlinkOn);
+            }
+            if (key == '\r' || key == '\b' || !uac.hasIncomingCall()) {
+                tca8418_set_backlight(true);
+                ringBlinkOn = true;
+            }
             if (key == '\r') {
                 uac.answer();
                 ui = UiState::InCall;
+                audio_set_mode(AUDIO_CALL);
                 audio_hardware_set_amp(true);
                 callStartUs = esp_timer_get_time();
                 startGrace(ui_post(ui_model(UI_INCALL, uac.incomingCallerId()), B_ALL));
             } else if (key == '\b') {
                 uac.reject();
                 ui = UiState::Idle;
+                audio_set_mode(AUDIO_IDLE);
+                audio_hardware_set_amp(false);
                 ui_post(idleModel(), B_ALL);
             } else if (!uac.hasIncomingCall()) {
                 // Caller gave up (CANCEL) before we answered/rejected.
                 ui = UiState::Idle;
+                audio_set_mode(AUDIO_IDLE);
+                audio_hardware_set_amp(false);
                 ui_post(idleModel(), B_ALL);
             }
             break;
@@ -1022,6 +1173,7 @@ extern "C" void app_main(void)
             if (key == '\b' || key == '\r') uac.hangup();
             if (uac.callEnded() || !uac.inCall()) {
                 ui = UiState::Idle;
+                audio_set_mode(AUDIO_IDLE);
                 audio_hardware_set_amp(false);
                 // Duration is shown once, on the ENDED screen -- a full
                 // refresh that was happening anyway -- never as a live timer

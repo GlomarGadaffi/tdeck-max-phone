@@ -45,7 +45,7 @@ Dialing `9<number>` routes a call out through drawbridge's 3CX anchor; an incomi
 > - No SIP digest authentication ([#28](../../issues/28)) -- a `401` challenge is treated as a flat rejection, so this works only against drawbridge's open registrar.
 > - No jitter buffer, no RTP sequence/reordering handling, and no packet-loss concealment -- one datagram in, one frame out. Fine on a clean LAN, will audibly suffer on a lossy or bursty link.
 > - No DTMF (RFC 2833 or SIP INFO), so far-end IVR menus cannot be navigated.
-> - The e-paper shows the six UI_DESIGN §4 screens (status bar, state, number, result, keypad cheat-sheet, key hints), but no battery or signal indicator: neither the fuel gauge nor RSSI is read. State changes are still a full-screen flash, which is normal for this panel type. The phone also **rings silently** -- no ringer tone is generated, which is the single worst remaining gap.
+> - The e-paper shows the six UI_DESIGN §4 screens (status bar, state, number, result, keypad cheat-sheet, key hints), but no battery or signal indicator: neither the fuel gauge nor RSSI is read. State changes are still a full-screen flash, which is normal for this panel type. Incoming calls ring (a warbled double ring, with the keyboard backlight blinking) and outgoing calls play ringback, at amplitudes chosen by arithmetic rather than by ear (`POC_RING_AMPL`, `POC_RINGBACK_AMPL`).
 > - LoRa, GPS, 4G/cellular, touch, IMU, and battery-gauge hardware exist on the board and have pin definitions in `board_tdeck_max.h`, but none of it is driven by this firmware (beyond parking the LoRa/SD chip-selects high so they can't corrupt the shared SPI bus). This PoC is Wi-Fi only.
 
 ---

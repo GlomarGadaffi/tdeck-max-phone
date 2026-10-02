@@ -774,6 +774,14 @@ currently wired up in this firmware.
 | **Keyboard backlight** (GPIO42) | working — `tca8418_set_backlight()` | Blink at ~2 Hz while INCOMING; dark while muted; 120 ms blink as volume feedback |
 | **DRV2605 haptics** (I2C 0x5A) | power enable exists (`xl9555_set_motor_enable()`), **no driver** | Buzz on INCOMING. Requires a new driver — out of scope, flagged |
 
+> **Implemented 2026-10-01 (#36).** `s_audio_mode` (`AUDIO_IDLE / RING / RINGBACK / CALL`) is
+> set by the main loop and read by `audio_task` every frame. RING is a 1000/1250 Hz warble at
+> 20 Hz in a double-ring cadence (0.4 on, 0.2 off, 0.4 on, 2.0 off); RINGBACK is North
+> American 440 + 480 Hz, 2 s on, 4 s off; both synthesised at `audio_hardware_sample_rate()`.
+> The main loop owns the amplifier and blinks the keyboard backlight at 2 Hz while INCOMING.
+> The tone choices and `POC_RING_AMPL` / `POC_RINGBACK_AMPL` are first guesses, not tuned by
+> ear. The audio self-test now times both tones through the real generator.
+
 **The ring path needs an audio-task change.** `audio_task` only pumps when
 `s_uac->inCall()` is true (`app_main.cpp:180-185`), so there is currently no code path
 that can make a sound while a call is *ringing*. The main task must not do it either —

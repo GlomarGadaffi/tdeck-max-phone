@@ -163,6 +163,19 @@
 #define POC_SELFTEST_TONE_AMPL 500.0f
 #endif
 
+// Ringer and ringback amplitude (#36), same scale as the self-test tone.
+// The ringer has to be heard across a room, so it sits 6 dB above the
+// self-test beep; ringback plays while you are holding the phone, so it sits
+// below it. Both are first guesses by arithmetic, not by ear -- tune them on
+// the bench, and remember POC_SPK_MAX_DB lifts both.
+//   peak 1000 ~= -30 dBFS,  400 ~= -38 dBFS
+#ifndef POC_RING_AMPL
+#define POC_RING_AMPL        1000.0f
+#endif
+#ifndef POC_RINGBACK_AMPL
+#define POC_RINGBACK_AMPL    400.0f
+#endif
+
 // ── Half-duplex ducking (poor man's echo control) ────────────────────────
 //
 // Speaker and mic are centimetres apart on the same PCB with no acoustic

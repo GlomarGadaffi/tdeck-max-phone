@@ -687,6 +687,21 @@ The depth-1 `xQueueOverwrite` queue already discards superseded frames
 typing into 2–4 partials instead of 11. This is the single highest-value change in the
 whole refresh strategy, and it is about six lines.
 
+> **Implemented 2026-10-01 (#41, #42, #43), measured on hardware** with the scripted UI
+> bench in `CONFIG_TDECK_MAX_EPD_BENCH`:
+>
+> - Four dial-buffer edits posted 120 ms apart coalesced into **one** render ("coalesced
+>   4 post(s) into 1, settled 609 ms"), which was a **partial of `B_NUMBER`, 862 ms**.
+> - The settle is capped at `POC_UI_SETTLE_MAX_MS` (1000 ms) so a user who never pauses
+>   still sees the screen move; the pseudo-code above had no bound.
+> - The driver composes the whole frame and diffs it against `s_old_fb`. A band request
+>   whose frame changes rows outside that band is promoted to FULL ("change spans
+>   bands"), and a frame identical to the glass is skipped without touching the panel.
+>   So §5.2's "a change touching two bands is a transition" holds whatever the caller asked.
+> - Ghost budget as specified: `GHOST_SOFT_LIMIT 5` (logged), `GHOST_HARD_CAP 8`
+>   (promotes to FULL). **Untuned**: the Meshtastic build is no reference here, it runs
+>   partials indefinitely on this board.
+
 ### 5.7 Refresh timing — MEASURED
 
 **2026-10-01, after aligning with the Meshtastic driver (§5.1)** — `CONFIG_TDECK_MAX_EPD_BENCH`,

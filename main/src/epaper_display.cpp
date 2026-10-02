@@ -284,29 +284,20 @@ static int epd_refresh_rows(const uint8_t *new_fb, int y0, int y1, bool partial)
 // Full-screen refresh. Re-initializes the panel every call (LilyGO: "Re-
 // initialization is required for every full screen update") and powers it
 // down afterwards. Also the only thing that makes s_glass_valid true.
-static void epd_full_refresh(const uint8_t *new_fb)
+// Returns wall time in ms, or -1.
+static int epd_full_refresh(const uint8_t *new_fb)
 {
     int ms = epd_refresh_rows(new_fb, 0, EPD_HEIGHT - 1, false);
-    if (ms < 0) return;
-    s_glass_valid = true;
-    ESP_LOGI(TAG, "full refresh: %d ms (waveform %d ms)", ms, s_last_waveform_ms);
+    if (ms >= 0) s_glass_valid = true;
+    return ms;
 }
 
-// Partial refresh of rows y0..y1 (full width). Not reachable from the render
-// path yet -- that is #42, which needs the band API (#38) first. Until then
-// its only caller is the CONFIG_TDECK_MAX_EPD_BENCH measurement below.
-[[maybe_unused]] static bool epd_partial_refresh(const uint8_t *new_fb, int y0, int y1)
+// Partial refresh of rows y0..y1, full width (#42). Only legal while the
+// glass matches s_old_fb; the caller checks s_glass_valid. Returns wall time
+// in ms, or -1.
+static int epd_partial_refresh(const uint8_t *new_fb, int y0, int y1)
 {
-    if (!s_glass_valid) {
-        // Nothing to diff against: the glass is unknown, so lay a base down.
-        epd_full_refresh(new_fb);
-        return false;
-    }
-    int ms = epd_refresh_rows(new_fb, y0, y1, true);
-    if (ms < 0) return false;
-    ESP_LOGI(TAG, "partial refresh rows %d-%d: %d ms (waveform %d ms)", y0, y1, ms,
-             s_last_waveform_ms);
-    return true;
+    return epd_refresh_rows(new_fb, y0, y1, true);
 }
 
 esp_err_t epaper_display_init(void)
@@ -395,18 +386,98 @@ uint32_t epaper_render_generation(void)
     return __atomic_load_n(&s_generation, __ATOMIC_ACQUIRE);
 }
 
+// ── Ghost budget (#43, UI_DESIGN 5.6) ──
+// Every partial adds one unit of ghost debt; every full refresh pays it off.
+// Since every state transition is a full refresh, debt normally clears within
+// seconds. At the hard cap a requested partial is promoted to a full refresh.
+//
+// UNTUNED: 5/8 are UI_DESIGN's starting values. The reference gives nothing
+// better -- the Meshtastic build does not enable its dynamic-refresh policy
+// on this board, so its EINK_LIMIT_FASTREFRESH=10 is inert and it runs
+// partials indefinitely. Tune both against what this panel looks like after
+// N consecutive partials (UI_DESIGN U8), not against LilyGO's FAQ.
+#define GHOST_SOFT_LIMIT 5   // advisory: logged; the next transition pays the debt
+#define GHOST_HARD_CAP   8   // a partial requested at this debt becomes a full refresh
+static uint8_t s_partial_debt = 0;
+
+// First and last row where s_fb differs from the glass, or false if none.
+static bool changed_rows(int *y0, int *y1)
+{
+    *y0 = -1;
+    *y1 = -1;
+    for (int y = 0; y < EPD_HEIGHT; y++) {
+        if (memcmp(&s_fb[y * EPD_BYTES_PER_ROW], &s_old_fb[y * EPD_BYTES_PER_ROW],
+                   EPD_BYTES_PER_ROW) != 0) {
+            if (*y0 < 0) *y0 = y;
+            *y1 = y;
+        }
+    }
+    return *y0 >= 0;
+}
+
 void epaper_render(const ui_model_t *m, ui_band_t band)
 {
     ui_compose(s_fb, m);
 
-    // B_ALL is the only path for now: every render is a full refresh. The
-    // band is logged so the partial-refresh change (#42) can be checked
-    // against what the UI asked for.
-    epd_full_refresh(s_fb);
+    // The band is a request, not a promise: the frame is always composed
+    // whole, and only the rows that really differ from the glass decide what
+    // reaches it. That makes UI_DESIGN 5.2's rule -- "transitions are full,
+    // in-place edits are one band, a change touching two bands is a
+    // transition" -- hold by construction, whatever the caller claimed.
+    int dy0, dy1;
+    bool changed = changed_rows(&dy0, &dy1);
+    const char *mode = "FULL";
+    const char *why = "";
+    int y0 = 0, y1 = EPD_HEIGHT - 1;
+    int ms;
+
+    if (s_glass_valid && !changed) {
+        mode = "SKIP";
+        why = "frame already on the glass";
+        ms = 0;
+    } else {
+        bool partial = false;
+        if (band == B_ALL) {
+            why = "transition";
+        } else if (!s_glass_valid) {
+            why = "no base image yet";
+        } else {
+            int by0, by1;
+            ui_band_rows(band, &by0, &by1);
+            if (dy0 < by0 || dy1 > by1) {
+                why = "change spans bands";
+            } else if (s_partial_debt >= GHOST_HARD_CAP) {
+                why = "ghost cap";
+            } else {
+                partial = true;
+                y0 = by0;
+                y1 = by1;
+            }
+        }
+        if (partial) {
+            mode = "PARTIAL";
+            ms = epd_partial_refresh(s_fb, y0, y1);
+            if (ms >= 0 && ++s_partial_debt == GHOST_SOFT_LIMIT) {
+                ESP_LOGW(TAG, "ghost debt at soft limit (%d); next transition pays it",
+                         GHOST_SOFT_LIMIT);
+            }
+        } else {
+            ms = epd_full_refresh(s_fb);
+            if (ms >= 0) s_partial_debt = 0;
+        }
+    }
 
     uint32_t gen = __atomic_add_fetch(&s_generation, 1, __ATOMIC_RELEASE);
-    ESP_LOGI(TAG, "render #%lu screen=%s band=%s number='%s'",
-             (unsigned long)gen, ui_screen_name(m->screen), ui_band_name(band), m->number);
+    if (ms < 0) {
+        ESP_LOGE(TAG, "render #%lu screen=%s band=%s -> %s FAILED (panel did not respond)",
+                 (unsigned long)gen, ui_screen_name(m->screen), ui_band_name(band), mode);
+        return;
+    }
+    ESP_LOGI(TAG, "render #%lu screen=%s band=%s -> %s rows %d-%d%s%s%s: %d ms "
+                  "(waveform %d) debt=%u",
+             (unsigned long)gen, ui_screen_name(m->screen), ui_band_name(band), mode, y0, y1,
+             *why ? " (" : "", why, *why ? ")" : "", ms,
+             ms ? s_last_waveform_ms : 0, (unsigned)s_partial_debt);
 }
 
 #if CONFIG_TDECK_MAX_EPD_BENCH

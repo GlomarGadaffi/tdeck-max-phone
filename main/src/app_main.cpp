@@ -151,6 +151,7 @@ struct RenderJob {
 static portMUX_TYPE      s_render_mux = portMUX_INITIALIZER_UNLOCKED;
 static RenderJob         s_render_job;
 static bool              s_render_pending = false;
+static uint32_t          s_render_absorbed = 0; // posts merged into the pending job
 static uint32_t          s_render_posted = 0;   // last seq handed out
 static volatile uint32_t s_render_drawn = 0;    // last seq on the glass
 static TaskHandle_t      s_epaper_task = nullptr;
@@ -164,7 +165,10 @@ static ui_band_t merge_band(ui_band_t a, ui_band_t b)
 static uint32_t ui_post(const ui_model_t &m, ui_band_t band)
 {
     taskENTER_CRITICAL(&s_render_mux);
-    if (s_render_pending) band = merge_band(s_render_job.band, band);
+    if (s_render_pending) {
+        band = merge_band(s_render_job.band, band);
+        s_render_absorbed++;
+    }
     s_render_job.model = m;
     s_render_job.band = band;
     s_render_job.seq = ++s_render_posted;
@@ -335,21 +339,38 @@ static void power_off(TincanUac &uac)
     // through app_main() and re-registers from scratch.
 }
 
+// Render coalescing (#41, UI_DESIGN 5.6): after the first post, keep
+// absorbing posts until POC_UI_SETTLE_MS passes with none, newest model wins.
+// A burst of typing becomes one render instead of one per key -- before this,
+// three '7' presses inside 550 ms cost two full refreshes. Capped at
+// POC_UI_SETTLE_MAX_MS so a user who never pauses still sees the screen move.
 static void epaper_task(void *)
 {
     RenderJob job;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+        const int64_t t_first = esp_timer_get_time();
+        while (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POC_UI_SETTLE_MS)) > 0) {
+            if ((esp_timer_get_time() - t_first) / 1000 >= POC_UI_SETTLE_MAX_MS) break;
+        }
+
         taskENTER_CRITICAL(&s_render_mux);
         bool have = s_render_pending;
+        uint32_t absorbed = s_render_absorbed;
         if (have) {
             job = s_render_job;
             s_render_pending = false;
+            s_render_absorbed = 0;
         }
         taskEXIT_CRITICAL(&s_render_mux);
         if (!have) continue;
 
+        if (absorbed) {
+            ESP_LOGI(TAG, "render coalesced %lu post(s) into 1 (settled %lld ms)",
+                     (unsigned long)absorbed + 1,
+                     (long long)((esp_timer_get_time() - t_first) / 1000));
+        }
         epaper_render(&job.model, job.band);
         s_render_drawn = job.seq;
     }
@@ -489,6 +510,55 @@ static void audio_task(void *)
         }
     }
 }
+
+#if CONFIG_TDECK_MAX_EPD_BENCH
+// UI half of the e-paper bench: drives the real render path (mailbox, settle
+// window, band diff, ghost budget) with scripted posts, because nobody can
+// press keys on a board that is only reachable over serial. Every decision is
+// in the log as "render #N ... -> FULL/PARTIAL/SKIP (why)".
+static void ui_wait(uint32_t seq)
+{
+    for (int i = 0; i < 200 && !ui_drawn(seq); i++) vTaskDelay(pdMS_TO_TICKS(25));
+}
+
+static void ui_bench(void)
+{
+    ESP_LOGW(TAG, "=== UI RENDER BENCH ===");
+    ui_wait(ui_post(ui_model(UI_IDLE, "777"), B_ALL));
+
+    // A transition, then a fast burst: four edits 120 ms apart must coalesce
+    // into ONE partial of B_NUMBER (#41 + #42).
+    ui_wait(ui_post(ui_model(UI_DIALLING, "9"), B_ALL));
+    ESP_LOGW(TAG, "ui bench: burst of 4 edits, 120 ms apart -> expect 1 PARTIAL");
+    uint32_t seq = 0;
+    for (const char *n : {"9*", "9*7", "9*77", "9*777"}) {
+        seq = ui_post(ui_model(UI_DIALLING, n), B_NUMBER);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    ui_wait(seq);
+
+    // Slow typing: every edit is its own partial until the ghost cap
+    // promotes one to a full refresh (#43). Also 8 consecutive partials on
+    // the glass, which is what the ghosting threshold has to be judged on.
+    ESP_LOGW(TAG, "ui bench: 9 slow edits -> expect partials until the ghost cap, then FULL");
+    std::string num = "9*777";
+    for (int i = 1; i <= 9; i++) {
+        num += (char)('0' + i % 10);
+        ui_wait(ui_post(ui_model(UI_DIALLING, num), B_NUMBER));
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    // A band request whose frame changes two bands must be promoted to FULL.
+    ESP_LOGW(TAG, "ui bench: B_NUMBER request that also changes the label -> expect FULL");
+    ui_wait(ui_post(ui_model(UI_CALLING, num), B_NUMBER));
+
+    // Nothing changed: must not touch the panel at all.
+    ESP_LOGW(TAG, "ui bench: identical frame -> expect SKIP");
+    ui_wait(ui_post(ui_model(UI_CALLING, num), B_ALL));
+
+    ESP_LOGW(TAG, "=== UI RENDER BENCH COMPLETE ===");
+}
+#endif // CONFIG_TDECK_MAX_EPD_BENCH
 
 #if CONFIG_TDECK_MAX_AUDIO_SELFTEST
 // Speaker and microphone failures are indistinguishable during a call --
@@ -652,6 +722,9 @@ extern "C" void app_main(void)
 
     // 3. Display task first, so failures after this point can be shown.
     xTaskCreate(epaper_task, "epaper", 4096, nullptr, 3, &s_epaper_task);
+#if CONFIG_TDECK_MAX_EPD_BENCH
+    ui_bench();
+#endif
     ui_post(ui_notice("BOOTING", "joining Wi-Fi"), B_ALL);
 
     // 4. Wi-Fi (bounded; won't hang forever on a bad SSID).
@@ -685,6 +758,7 @@ extern "C" void app_main(void)
     std::string dialBuffer;
     std::string lastDialled = load_last_dialled();
     ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+    bool shownRegistered = uac.registered(), shownWifi = wifi_is_connected();
     ESP_LOGI(TAG, "System operational (registered=%d).", registered);
     if (!lastDialled.empty()) {
         ESP_LOGI(TAG, "ENT from idle will redial %s", lastDialled.c_str());
@@ -721,8 +795,20 @@ extern "C" void app_main(void)
 
         // Keep the registration alive; without this the binding lapses at
         // POC_SIP_REG_EXPIRES and the phone silently stops taking calls.
-        if (uac.maintainRegistration() && ui == UiState::Idle) {
-            ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);   // now NOREG
+        uac.maintainRegistration();
+
+        // Link state is drawn in B_STATUS (UI_DESIGN 4.6). A change while
+        // idle repaints that band alone (5.2); in any other state the next
+        // transition picks it up. If the change also moves another band (the
+        // IDLE label says NO SERVICE when unregistered), the driver sees the
+        // frame differ in two bands and takes a full refresh instead.
+        const bool regNow = uac.registered(), wifiNow = wifi_is_connected();
+        if (regNow != shownRegistered || wifiNow != shownWifi) {
+            shownRegistered = regNow;
+            shownWifi = wifiNow;
+            ESP_LOGI(TAG, "link state: %s, %s", regNow ? "registered" : "NOT registered",
+                     wifiNow ? "Wi-Fi up" : "Wi-Fi DOWN");
+            if (ui == UiState::Idle) ui_post(ui_model(UI_IDLE, lastDialled), B_STATUS);
         }
 
         // Single GPIO read unless the controller actually has events.
@@ -770,16 +856,15 @@ extern "C" void app_main(void)
             if (key == '\b') {
                 if (!dialBuffer.empty()) dialBuffer.pop_back();
                 else ui = UiState::Idle;
-                ui_post(ui == UiState::Idle ? ui_model(UI_IDLE, lastDialled)
-                                            : ui_model(UI_DIALLING, dialBuffer),
-                        B_ALL);
+                if (ui == UiState::Idle) ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
+                else ui_post(ui_model(UI_DIALLING, dialBuffer), B_NUMBER);
             } else if (is_dial_char(key)) {
                 // Silently stop growing at the cap rather than wrapping or
                 // truncating on dial -- the user can see the number isn't
                 // getting longer.
                 if (dialBuffer.size() < DIAL_BUFFER_MAX) {
                     dialBuffer += key;
-                    ui_post(ui_model(UI_DIALLING, dialBuffer), B_ALL);
+                    ui_post(ui_model(UI_DIALLING, dialBuffer), B_NUMBER);
                 }
             } else if (key == '\r' && !dialBuffer.empty()) {
                 std::string target = dialBuffer;

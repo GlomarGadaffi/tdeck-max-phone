@@ -189,3 +189,15 @@
 #ifndef POC_DUCK_HANGOVER_MS
 #define POC_DUCK_HANGOVER_MS 200              // keep ducking this long after they stop
 #endif
+
+// ── E-paper render coalescing (#41, UI_DESIGN 5.6) ───────────────────────
+// The render task waits until no new screen has been posted for
+// POC_UI_SETTLE_MS before drawing, so a burst of keypresses costs one panel
+// refresh instead of one each. POC_UI_SETTLE_MAX_MS bounds the wait for a
+// user who never pauses, so the screen still moves while they type.
+#ifndef POC_UI_SETTLE_MS
+#define POC_UI_SETTLE_MS     250
+#endif
+#ifndef POC_UI_SETTLE_MAX_MS
+#define POC_UI_SETTLE_MAX_MS 1000
+#endif

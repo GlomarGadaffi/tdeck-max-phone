@@ -27,6 +27,10 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "disconnected; retrying");
+        // The lease is gone with the link: without this, wifi_is_connected()
+        // stayed true forever after the first IP and the status bar's WIFI
+        // field could never show the link dropping.
+        xEventGroupClearBits(s_wifi_evt, WIFI_GOT_IP_BIT);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;

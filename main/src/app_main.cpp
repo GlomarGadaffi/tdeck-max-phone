@@ -1177,8 +1177,10 @@ extern "C" void app_main(void)
                 audio_hardware_set_amp(false);
                 // Duration is shown once, on the ENDED screen -- a full
                 // refresh that was happening anyway -- never as a live timer
-                // (UI_DESIGN 5.5). Rounded up so a short call never reads 00:00.
-                lastCallSecs = (uint32_t)((esp_timer_get_time() - callStartUs + 999999) / 1000000);
+                // (UI_DESIGN 5.5). Nearest second, but never 00:00 for a call
+                // that did connect.
+                lastCallSecs = (uint32_t)((esp_timer_get_time() - callStartUs + 500000) / 1000000);
+                if (lastCallSecs == 0) lastCallSecs = 1;
                 lastCallFailed = false;
                 failedTarget.clear();
                 showEnded = true;

@@ -6,7 +6,7 @@
 //  Task layout (three tasks, deliberately):
 //    main       - SIP control, keypad, UI state machine. Never does slow I/O.
 //    audio pump - RTP<->I2S, paced ONLY by the blocking i2s_channel_read().
-//    e-paper    - the 2-3 s panel refresh, off the control path entirely.
+//    e-paper    - the ~1 s panel refresh, off the control path entirely.
 //
 //  Audio and display each used to run inline on the main loop, which made a
 //  call sound choppy (~20 pkt/s instead of 50, with latency that grew for the
@@ -576,6 +576,9 @@ extern "C" void app_main(void)
 
 #if CONFIG_TDECK_MAX_AUDIO_SELFTEST
     audio_selftest();   // before Wi-Fi, so nothing else competes for the bus
+#endif
+#if CONFIG_TDECK_MAX_EPD_BENCH
+    epaper_bench_run(); // before the render task exists: it owns SPI here
 #endif
 
     // 3. Display task first, so failures after this point can be shown.

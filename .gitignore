@@ -9,6 +9,9 @@ build-host/
 #   idf.py -B build-qemu -D SDKCONFIG="build-qemu/sdkconfig" \
 #          -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.qemu" build
 build-qemu/
+# Out-of-tree e-paper bench build (sdkconfig.epdbench), same pattern:
+#   idf.py -B build-epdbench -D SDKCONFIG="build-epdbench/sdkconfig" \n#          -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.epdbench" build
+build-epdbench/
 sdkconfig
 sdkconfig.old
 managed_components/

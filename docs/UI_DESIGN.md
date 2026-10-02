@@ -549,32 +549,49 @@ is not exposed by `net_wifi.h`.
 
 ## 5. Refresh strategy
 
-### 5.1 What the current driver does, and what is missing
+### 5.1 What the driver does now (aligned with the Meshtastic build, 2026-10-01)
 
-`epd_full_refresh()` (`epaper_display.cpp:184-200`) does: reset → `PSR 0x1F` →
-`POWER_ON 0x04` → `0x10` old framebuffer → `0x13` new framebuffer → `REFRESH 0x12` →
-busy-wait → `POWER_OFF` + `DEEP_SLEEP`. It is a correct full refresh and it maintains
-`s_old_fb`, which is exactly the "old data" a partial refresh needs.
+> **Corrected 2026-10-01.** This section used to read the panel registers out of LilyGO's
+> demo, and got two things wrong: `EPD_Init()` writes **neither** `0xE0` nor `0xE5` (the
+> `0xE5 = 0x6E` it quoted is `EPD_init_Fast2()`), and `0xE5` is **not** the only register
+> that differs between full and partial — `0x50` (CDI) does too. The driver is now aligned
+> with the one the Meshtastic t-deck-max build runs on this board, which is the
+> hardware-verified reference: GxEPD2 1.6.9's `GxEPD2_310_GDEQ031T10`.
 
-Partial refresh is **supported by this panel** — LilyGO's vendor driver implements it
-(`Display_EPD_W21.cpp:207-253`, `EPD_Dis_Part`) — but is not implemented here. Two
-things are missing from the current init:
+Every refresh, full or partial (`epd_refresh_rows()` in `epaper_display.cpp`):
 
-1. `EPD_Init()` writes `0xE0 = 0x02` and `0xE5 = 0x6E`; `EPD_Init_Part()` writes
-   `0xE0 = 0x02` and **`0xE5 = 0x79`**. The current `epd_panel_init()` writes neither.
-   `0xE5` is the *only* register whose value differs between the vendor's full and partial
-   init, so it is what distinguishes the two modes. The vendor's source is undocumented on
-   this point and no datasheet was consulted — treat the *reason* as inference and the
-   *values* as copied verbatim from working code.
-2. The window sequence: `0x91` (enter partial mode) → `0x90` (window: `x_start`,
-   `x_end`, `y_start` hi/lo, `y_end` hi/lo, `0x01`) → `0x10` window-old → `0x13`
-   window-new → `0x12` → power off.
+1. hard reset (RST low 2 ms, Meshtastic's `reset_duration`) → `PSR 0x1F 0x0D`
+2. `0x91` → `0x90` window → `0x10` old rows from `s_old_fb` → `0x13` new rows → `0x92`
+3. waveform select, verbatim from GxEPD2:
+
+   | | `0xE0` CCSET | `0xE5` TSSET | `0x50` CDI | waveform time |
+   | :-- | :-- | :-- | :-- | :-- |
+   | full (`_Update_Full`, fast) | `0x02` | `0x5A` | `0x97` | GxEPD2: 1015 ms; **measured 1006 ms** |
+   | partial (`_Update_Part`) | `0x02` | `0x79` | `0xD7` | GxEPD2: ~650 ms; **measured 645 ms** |
+
+4. `POWER_ON` → `REFRESH 0x12` → busy-wait (bounded, 10 s) → (`0x92` if partial)
+5. `POWER_OFF` + `DEEP_SLEEP`
+
+The old driver wrote no waveform registers at all, so the controller fell back to its
+temperature-sensed OTP waveform — 3082 ms by GxEPD2's own figure, which is the 3277 ms in
+§5.7 once reset and SPI are added. `CCSET = 0x02` makes the forced `TSSET` value pick the
+waveform; GxEPD2's stated cost is the extended low-temperature range.
+
+Two places this deliberately differs from the Meshtastic build:
+
+- **Both planes are written on every refresh.** GxEPD2 writes only the new plane before a
+  refresh and copies it to the old plane afterwards, so it needs controller RAM to survive
+  until the next update — which is why Meshtastic sets `EINK_NOT_HIBERNATE` on this board.
+  This driver keeps `s_old_fb` on the MCU and never depends on controller RAM, so it keeps
+  the reset → refresh → power off → deep sleep cycle (`EPD_DEEP_SLEEP_BETWEEN`).
+- **4 MHz SPI** is Meshtastic's; LilyGO's demo used 10 MHz. Aligned to the reference.
 
 Also required by the vendor, verbatim from their source: *"Partial refresh of background
 display, this function is necessary, please do not delete it!!!"* — a full-screen base
 map must be laid down before any partial refresh. In our terms: **a partial refresh is
 only legal when `s_old_fb` genuinely matches what is on the glass**, which it does after
-any `epd_full_refresh()`.
+any full refresh. The driver tracks this as `s_glass_valid` and promotes a partial
+requested before the first full refresh (or after a failed one) to a full refresh.
 
 ### 5.2 The rules
 
@@ -595,21 +612,16 @@ the ghost debt.
 
 ### 5.3 Partial windows are full-width Y-bands only — deliberately
 
-The vendor's `0x90` command writes `x_start`/`x_end` as raw single bytes after
-`x_start -= x_start % 8`, and transfers `PART_COLUMN * PART_LINE / 8` bytes. Whether
-those X parameters are **pixels or byte-columns** is not settled by reading the code, and
-getting it wrong shifts or corrupts the window.
+The `0x90` X parameters are **pixels**, byte-aligned, with an inclusive end rounded up to
+the last pixel of its byte: GxEPD2's `_setPartialRamArea()` writes `x & 0xFFF8` and
+`(x + w - 1) | 7` (U9, resolved from the reference). Full-width bands are kept anyway: a
+band is then a contiguous `30 * rows` slice of `s_fb` / `s_old_fb` with no per-row masking,
+and the partial waveform takes the same 645 ms for a 72-row band as for the whole panel
+(§5.7), so a narrower window would buy nothing.
 
-Restricting every window to the full panel width (x = 0..239, and 240 is a multiple of 8)
-makes the design correct under *either* interpretation, keeps the byte count a clean
-`30 * rows`, and lets a band be sliced straight out of `s_fb` / `s_old_fb` with no
-per-row masking. The cost is repainting some blank pixels, which on e-paper is nearly
-free. **Do not add X-windowing without first settling the units on the bench.**
-
-One vendor detail to carry over: on the first partial after a full refresh, `EPD_Dis_Part`
-sends `0xFF` for the window's old data rather than the real old bytes (`partFlag`).
-We have accurate old bytes in `s_old_fb` and could send those, but the vendor's sequence
-is the one known to work on this panel — follow it, and treat it as bench-tunable.
+The vendor demo's first partial after a full refresh sends `0xFF` as the window's old data
+(`partFlag`). GxEPD2 — the reference — sends the real previous image, and so does this
+driver (`s_old_fb`).
 
 ### 5.4 Volume never touches the panel
 
@@ -675,30 +687,42 @@ The depth-1 `xQueueOverwrite` queue already discards superseded frames
 typing into 2–4 partials instead of 11. This is the single highest-value change in the
 whole refresh strategy, and it is about six lines.
 
-### 5.7 Full-refresh timing — MEASURED 2026-08-13
+### 5.7 Refresh timing — MEASURED
 
-**A full refresh takes 3277 ms.** Measured inside `epd_full_refresh()` with
-`esp_timer_get_time()` over a live dialling session; the spread was 3274–3277 ms, so treat it
-as a hard 3.3 s constant, not a range. The README's "2–3 s" was optimistic and is corrected.
+**2026-10-01, after aligning with the Meshtastic driver (§5.1)** — `CONFIG_TDECK_MAX_EPD_BENCH`,
+same unit, every refresh logged:
 
-Worse than this design assumed, which sharpens three of its conclusions:
+| Refresh | wall time (reset → deep sleep) | waveform only (`0x12` → BUSY high) | n |
+| :-- | :-- | :-- | :-- |
+| full, fast waveform | **1253 ms** (1252–1255) | 1006 ms | 2 + every boot render |
+| partial, 72-row band (`B_NUMBER`) | **862 ms** (no spread) | 645 ms | 10 |
+| partial, whole panel | **892 ms** (no spread) | 645 ms | 5 |
 
-- **§5.5's "no live call timer" verdict is now emphatic rather than cautious.** A 1 Hz counter
-  is not a 30 % duty cycle, it is impossible — the panel cannot finish one refresh inside a
-  second.
-- **§2.5's render-lag hazard is real and observed.** Typing `*777` produced renders at
-  t=157863 (`*`), t=161148 (`*77`), t=164425 (`*777`). The `*7` frame never reached the glass —
-  the depth-1 `xQueueOverwrite` discarded it, which is the queue working as designed. The panel
-  trails the fingers by ~3.3 s, so **the input grace window on entering INCOMING is not
-  optional.**
-- **§5.6's 250 ms coalescing window is confirmed as the highest-value change here.** Three `7`
-  presses inside 550 ms cost two full refreshes — 6.5 s of panel time where a settle window
-  would have cost one.
+The waveform is the only part that matters for "is it on the glass yet": the remaining
+~220 ms is reset, SPI, power on/off and the 100 ms deep-sleep delay. A partial is therefore
+not dramatically faster than a fast full refresh (645 vs 1006 ms of waveform); what it buys
+is **no black/white flash** and a band that settles in place. Every partial ran after a
+deep sleep and completed its BUSY handshake in the expected time, which is the electrical
+half of U10; whether the glass looked right is the visual half and still needs eyes.
 
-**Still unmeasured: partial-refresh wall time**, since no partial refresh has ever run on this
-hardware. That, plus **how many consecutive partials it takes before ghosting is objectionable
+**2026-08-13, the old driver** (no waveform registers): a full refresh took **3277 ms**,
+spread 3274–3277, measured over a live dialling session. That number drove three conclusions
+which still hold at 1.25 s, just less dramatically:
+
+- **§5.5's "no live call timer" verdict stands.** A 1 Hz counter would keep the panel
+  refreshing most of the time even at 862 ms per partial.
+- **§2.5's render-lag hazard is real and was observed.** Typing `*777` produced renders at
+  t=157863 (`*`), t=161148 (`*77`), t=164425 (`*777`); the `*7` frame never reached the glass
+  because the depth-1 queue discarded it, as designed. The panel still trails the fingers by
+  over a second, so **the input grace window on entering INCOMING is not optional.**
+- **§5.6's 250 ms coalescing window is still the highest-value change.** Three `7` presses
+  inside 550 ms cost two full refreshes; a settle window costs one.
+
+**Still unmeasured: how many consecutive partials it takes before ghosting is objectionable
 on this specific unit** (count by eye — LilyGO's "5" is generic advice, not a measurement of
-this panel), is what remains before §5.6's caps can be tuned honestly.
+this panel). The Meshtastic build is no help here: it does not enable its dynamic-refresh
+policy on this board (`USE_EINK_DYNAMICDISPLAY` is not defined, so `EINK_LIMIT_FASTREFRESH=10`
+is inert) and simply runs whole-panel partials indefinitely after one full refresh.
 
 ---
 
@@ -928,13 +952,13 @@ Everything this design rests on that I could not confirm from source or a named 
 | U1 | Row/column decode, specifically the `col = 9 - (n % 10)` reversal | **RESOLVED 2026-08-13 — correct.** Measured: `Q` → `key_num 9` → `r0c0`, `P` → `key_num 0` → `r0c9`. The controller numbers this matrix right-to-left (P=1 … Q=10), which the reversal exactly compensates. |
 | U2 | ~~Event bit 7 = release (not press)~~ | **RESOLVED 2026-08-13 — the opposite is true. Bit 7 set = PRESS**, so the existing code is correct and #35 is closed as invalid. Measured by holding one key 4.58 s: the first event carried `bit7=1`. See the corrected §9.1 for why two vendor sources say otherwise and are both wrong. |
 | U3 | Digit / `*` / `#` legends are physically printed on the keycaps | Inferred from the factory firmware's symbol map. **Cannot be verified from code — the user can check by looking at the keyboard.** |
-| U4 | Which of the two `UP` keys is physically left | **Unverified.** Decides which is vol-down. |
+| U4 | Which of the two `UP` keys is physically left | **RESOLVED from the reference, 2026-10-01** — Meshtastic's `TDeckProKeyboard.cpp` names key_num 34 (`r3c5`) `L_Shift` and key_num 30 (`r3c9`) `R_Shift`. Vol-down goes on `r3c5`. Not yet pressed on this unit. |
 | U5 | Whether `r3c0`–`r3c4` are physical keys | **RESOLVED from vendor source — they are not.** See the `KEYPAD_PRESS_VAL_MAX` argument below. Nothing is bound to them. |
 | U6 | `r3c6` is the `0` key | **RESOLVED from vendor source — yes.** `peri_keypad.cpp`'s `KEYPAD_PRESS_VAL_MAX 35` admits key indices 0–34 and rejects 35–39. Under `col = 9 - (idx % 10)` the five rejected indices are exactly `r3c4`…`r3c0`, the five `NONE` positions — 40 matrix positions minus 5 dead = 35 real keys, which *is* the constant. Index 33 = `r3c6` falls inside the accepted range, so the vendor's working firmware does treat it as `0`. |
 | U7 | Full-refresh wall time (README claimed 2–3 s) | **RESOLVED 2026-08-13 — 3277 ms**, spread 3274–3277. Slower than the README claimed; see §5.7. |
-| U8 | Partial-refresh wall time, and the real ghosting threshold on this unit | **Never run on this hardware.** All of §5.5–§5.6 is reasoning from an unmeasured baseline. |
-| U9 | Whether `0x90`'s X parameters are pixels or byte-columns | **Unresolved — and deliberately side-stepped** by using full-width bands only (§5.3). |
-| U10 | Whether the panel accepts the partial sequence after the driver's `DEEP_SLEEP` | The partial path begins with its own reset + power-on, so it should. **Unverified.** |
+| U8 | Partial-refresh wall time, and the real ghosting threshold on this unit | **Wall time MEASURED 2026-10-01: 862 ms** for a 72-row band (645 ms waveform), see §5.7. The ghosting threshold still needs counting by eye. |
+| U9 | Whether `0x90`'s X parameters are pixels or byte-columns | **RESOLVED from the reference — pixels**, byte-aligned, inclusive end `\| 7` (GxEPD2 `_setPartialRamArea()`). Full-width bands kept anyway (§5.3). |
+| U10 | Whether the panel accepts the partial sequence after the driver's `DEEP_SLEEP` | **Electrically yes, 2026-10-01**: 15/15 bench partials after a deep sleep completed with the expected 645 ms waveform. Visual result not yet confirmed. Fallback if it misbehaves: `EPD_DEEP_SLEEP_BETWEEN 0`. |
 | U11 | Touch IC is CST3530, not the CST328 the I2C scan prints (`app_main.cpp:92`) | Wiki-confirmed; the scan label and the LilyGO header it came from are stale. Cosmetic while touch is unused, but boot currently prints a wrong part name. |
 | U12 | DRV2605 haptics | Power enable exists, **no driver**. Ring buzz is aspirational. |
 | U13 | BQ27220 battery gauge | **No driver** — hence no battery indicator (§4.6). |

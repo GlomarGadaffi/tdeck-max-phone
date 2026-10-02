@@ -41,7 +41,7 @@ Three tasks (`main/src/app_main.cpp`):
 |---|---|---|---|
 | `main_task` | any | 1 | SIP control (`uac.poll()`), registration refresh, keypad, UI state machine |
 | `audio` | 1 (pinned) | 6 | RTP ↔ I2S pump, paced **solely** by the blocking `i2s_channel_read()` |
-| `epaper` | any | 3 | The **3.3 s** panel refresh (measured 3277 ms), fed by a depth-1 `xQueueOverwrite` |
+| `epaper` | any | 3 | The panel refresh (measured 1253 ms full, 862 ms partial; was 3277 ms), fed by a depth-1 `xQueueOverwrite` |
 
 Audio and display each originally ran inline on the main loop. That was
 wrong in both cases and the symptoms were distinct:

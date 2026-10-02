@@ -18,6 +18,11 @@ void epaper_set_backlight(bool enable);
 // Render basic call status screen (Caller ID, status text, PTT state)
 void epaper_render_call_status(const char *caller_id, const char *status, bool ptt_active);
 
+// CONFIG_TDECK_MAX_EPD_BENCH only: time full and partial refreshes at boot
+// and log min/avg/max (#43). Call before the render task starts -- it drives
+// the SPI bus directly.
+void epaper_bench_run(void);
+
 #ifdef __cplusplus
 }
 #endif

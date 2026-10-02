@@ -43,6 +43,21 @@ menu "T-Deck MAX Phone"
             the vendor header names. That is a stronger signal than a merely
             quiet mic: a live ADC dithers at any PGA gain.
 
+    config TDECK_MAX_EPD_BENCH
+        bool "Time e-paper full and partial refreshes at boot"
+        default n
+        help
+            Bench measurement for #43 (UI_DESIGN U8): partial-refresh wall
+            time had never been measured on this panel. At boot, before the
+            render task starts, runs 2 full refreshes, 10 partial refreshes
+            of the 72-row B_NUMBER band and 5 partial refreshes of the whole
+            panel, logging each one and a min/avg/max summary.
+
+            The panel visibly flashes through a counter while it runs --
+            that is the point: watch for ghosting, smearing or a shifted
+            band. Adds ~15 s to boot. Never leave it on in a normal build.
+            sdkconfig.epdbench is a ready-made fragment for it.
+
     config TDECK_MAX_HALT_ON_INIT_FAIL
         bool "Abort boot if a peripheral fails to initialize"
         default n

@@ -57,6 +57,28 @@ static const char *TAG = "TCA8418_KEYPAD";
 // Verified on hardware 2026-08-13: the column decode is correct (Q -> r0c0,
 // P -> r0c9), and r3c6 really is the '0' key -- see the U6 entry in
 // docs/UI_DESIGN.md for the argument from the vendor's own key-count constant.
+//
+// Cross-checked 2026-10-01 against the Meshtastic t-deck-max build, which is
+// hardware-verified on this board (tdeck-max-meshtastic
+// src/input/TDeckProKeyboard.cpp, TDeckProTapMap). It indexes the same
+// key_num (event & 0x7F, minus 1) straight into a 35-entry table, P first:
+//
+//   key_num  0-9   p o i u y t r e w q      -> r0c9 .. r0c0
+//   key_num 10-19  BSP l k j h g f d s a    -> r1c9 .. r1c0
+//   key_num 20-29  ENT $ m n b v c x z ALT  -> r2c9 .. r2c0
+//   key_num 30-34  R_Shift SYM SPACE MIC L_Shift -> r3c9 .. r3c5
+//
+// so it agrees with the decode below, with bit 7 = PRESS (its trigger()
+// calls pressed() when `k & 0x80`), and with every digit here: its symbol
+// layer puts # 1 2 3 on q w e r, + on o, * 4 5 6 on a s d f, 7 8 9 on z x c
+// and 0 on key_num 33. Two facts this repo did not have before:
+//   * key_num 33 (r3c6) is the MIC key; '0' is its symbol legend.
+//   * key_num 34 (r3c5) is the LEFT shift and key_num 30 (r3c9) the RIGHT
+//     one, which answers UI_DESIGN U4: VOL- belongs on r3c5.
+// It also caps key_num at 35 (_TCA8418_NUM_KEYS), matching U5: r3c0-r3c4
+// are not keys. Deliberately NOT ported: it emits characters on release and
+// runs multi-tap/modifier layers; this dialler emits on press and has no
+// layers (UI_DESIGN 1.1).
 static const char s_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
     //  c0    c1   c2   c3   c4   c5   c6   c7   c8   c9
     {  '#',  '1', '2', '3',  0,   0,   0,   0,  '+',  0   }, // Q W E R . . . . O P
@@ -131,9 +153,10 @@ esp_err_t tca8418_init(void)
 {
     ESP_LOGI(TAG, "Initializing TCA8418 keypad controller...");
 
-    // Reset TCA8418 via XL9555
+    // Reset TCA8418 via XL9555: 20 ms low, 60 ms settle, as the Meshtastic
+    // t-deck-max build does (see xl9555_reset_keyboard()).
     xl9555_reset_keyboard();
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(60));
 
     // Configure Keyboard Backlight LED Pin
     gpio_config_t io_conf = {};

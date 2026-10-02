@@ -1057,6 +1057,10 @@ extern "C" void app_main(void)
             audio_set_mode(AUDIO_RING);
             ringBlinkUs = esp_timer_get_time();
             startGrace(ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL));
+            // The key read above came off the FIFO BEFORE grace started. Left
+            // alone it would reach case Incoming below in this same tick, so
+            // an ENT meant for dialling would answer a call nobody has seen.
+            key = 0;
         }
 
         switch (ui) {

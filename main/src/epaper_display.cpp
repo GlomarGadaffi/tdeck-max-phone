@@ -388,50 +388,25 @@ void epaper_set_backlight(bool enable)
     gpio_set_level(BOARD_EPD_BACKLIGHT, enable ? 1 : 0);
 }
 
-static bool all_num_glyphs(const char *s)
+static uint32_t s_generation = 0;
+
+uint32_t epaper_render_generation(void)
 {
-    for (const char *p = s; *p; p++)
-        if (!ui_num_has_glyph(*p)) return false;
-    return true;
+    return __atomic_load_n(&s_generation, __ATOMIC_ACQUIRE);
 }
 
-void epaper_render_call_status(const char *caller_id, const char *status, bool ptt_active)
+void epaper_render(const ui_model_t *m, ui_band_t band)
 {
-    ESP_LOGI(TAG, "[EPD RENDER] Caller: %s | Status: %s | PTT: %s",
-             caller_id ? caller_id : "None",
-             status ? status : "Idle",
-             ptt_active ? "TALKING" : "LISTENING");
+    ui_compose(s_fb, m);
 
-    ui_clear(s_fb);
-
-    // Caller ID / extension. A dialable string keeps the large F_NUM digits;
-    // anything else (an alphanumeric caller ID, "Power off?") used to render
-    // as blank gaps and is now F_UI text at 2x.
-    if (caller_id && caller_id[0]) {
-        if (all_num_glyphs(caller_id)) ui_draw_num(s_fb, 20, 40, caller_id, 6, 10);
-        else ui_draw_text_centred(s_fb, 48, caller_id, 2);
-    }
-
-    // The status string itself, F_UI at 2x (#37). Until now it was only ever
-    // string-matched into the pictogram below, so "Incoming Call", "Dialing"
-    // and "Call Failed" were indistinguishable on the glass.
-    if (status && status[0]) ui_draw_text_centred(s_fb, 104, status, 2);
-
-    // Status pictogram: filled = active/ringing, outline = idle. Still the
-    // string-matching placeholder; the band API (#38) replaces it with an
-    // explicit screen enum.
-    bool active = ptt_active || (status && strstr(status, "Call") != NULL) ||
-                  (status && strstr(status, "Ring") != NULL);
-    if (active) {
-        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 168, 60, 60, true);
-    } else {
-        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 168, 60, 4, true);
-        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 224, 60, 4, true);
-        ui_fill_rect(s_fb, EPD_WIDTH / 2 - 30, 168, 4, 60, true);
-        ui_fill_rect(s_fb, EPD_WIDTH / 2 + 26, 168, 4, 60, true);
-    }
-
+    // B_ALL is the only path for now: every render is a full refresh. The
+    // band is logged so the partial-refresh change (#42) can be checked
+    // against what the UI asked for.
     epd_full_refresh(s_fb);
+
+    uint32_t gen = __atomic_add_fetch(&s_generation, 1, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG, "render #%lu screen=%s band=%s number='%s'",
+             (unsigned long)gen, ui_screen_name(m->screen), ui_band_name(band), m->number);
 }
 
 #if CONFIG_TDECK_MAX_EPD_BENCH

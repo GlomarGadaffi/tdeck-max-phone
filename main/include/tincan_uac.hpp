@@ -44,6 +44,10 @@ public:
     // caller can surface it on the UI.
     bool maintainRegistration();
 
+    // Outcome of the most recent REGISTER (initial or refresh). Display only:
+    // the status bar's REG/NOREG (UI_DESIGN 4.6) reads it.
+    bool registered() const { return _registered; }
+
     // Non-blocking: drain pending SIP messages and advance internal call
     // state (detects an inbound INVITE, matches ACK/BYE/CANCEL to the
     // active dialog). Call this every loop tick regardless of call state.
@@ -149,6 +153,7 @@ private:
     // Deadline (esp_timer microseconds) for the next REGISTER refresh; 0
     // until the first successful registration. See maintainRegistration().
     int64_t _nextRegisterUs = 0;
+    bool _registered = false;
 
     // Outbound-dialog fields (mirrors tincan's SipUac).
     std::string _callId, _fromTag, _remoteTag;

@@ -150,11 +150,78 @@ static void test_num()
     check(!ui_num_has_glyph('A') && !ui_num_has_glyph(' '), "letters and space do not");
 }
 
+static ui_model_t model(ui_screen_t screen, const char *number)
+{
+    ui_model_t m{};
+    m.screen = screen;
+    std::snprintf(m.number, sizeof(m.number), "%s", number);
+    std::snprintf(m.self_ext, sizeof(m.self_ext), "1002");
+    m.registered = true;
+    m.wifi_up = true;
+    m.volume = 100;
+    return m;
+}
+
+// Every screen, drawn whole, must leave the margins between bands blank:
+// that is what makes each band independently refreshable (UI_DESIGN 4.0).
+static void test_band_grid()
+{
+    std::cout << "band grid\n";
+    int y0, y1;
+    ui_band_rows(B_STATUS, &y0, &y1);
+    check(y0 == 0 && y1 == 29, "B_STATUS is rows 0-29");
+    ui_band_rows(B_NUMBER, &y0, &y1);
+    check(y0 == 88 && y1 == 159, "B_NUMBER is rows 88-159");
+    ui_band_rows(B_HINT, &y0, &y1);
+    check(y0 == 272 && y1 == 319, "B_HINT is rows 272-319");
+    ui_band_rows(B_ALL, &y0, &y1);
+    check(y0 == 0 && y1 == UI_H - 1, "B_ALL is the whole panel");
+
+    struct { ui_screen_t s; const char *num; const char *name; } screens[] = {
+        {UI_IDLE, "*777", "idle"},
+        {UI_DIALLING, "9*777", "dialling"},
+        {UI_CALLING, "777", "calling"},
+        {UI_INCOMING, "1001", "incoming"},
+        {UI_INCALL, "1001", "incall"},
+        {UI_ENDED, "777", "ended"},
+        {UI_INCOMING, "Alice", "incoming_alpha"},
+    };
+    std::vector<uint8_t> fb(UI_FB_SIZE);
+    for (auto &sc : screens) {
+        ui_model_t m = model(sc.s, sc.num);
+        ui_compose(fb.data(), &m);
+        bool margins_blank = ink_in_rows(fb.data(), 30, 39) == 0 &&
+                             ink_in_rows(fb.data(), 80, 87) == 0 &&
+                             ink_in_rows(fb.data(), 160, 167) == 0;
+        check(margins_blank, std::string(sc.name) + ": margins between bands stay blank");
+        check(ink_in_rows(fb.data(), 88, 159) > 0, std::string(sc.name) + ": number band has ink");
+        dump(fb.data(), sc.name);
+    }
+
+    ui_model_t m = model(UI_NOTICE, "");
+    std::snprintf(m.notice_label, sizeof(m.notice_label), "POWER OFF?");
+    std::snprintf(m.notice_hint[0], sizeof(m.notice_hint[0]), "ENT  power off");
+    std::snprintf(m.notice_hint[1], sizeof(m.notice_hint[1]), "any other key cancels");
+    ui_compose(fb.data(), &m);
+    check(ink_in_rows(fb.data(), 40, 79) > 0 && ink_in_rows(fb.data(), 280, 319) > 0,
+          "notice: label and hint lines are drawn");
+    dump(fb.data(), "notice_poweroff");
+
+    // The status bar is model data, not decoration: NOREG must look different.
+    ui_model_t a = model(UI_IDLE, ""), b = a;
+    b.registered = false;
+    std::vector<uint8_t> fa(UI_FB_SIZE), fbb(UI_FB_SIZE);
+    ui_compose(fa.data(), &a);
+    ui_compose(fbb.data(), &b);
+    check(std::memcmp(fa.data(), fbb.data(), 30 * UI_STRIDE) != 0, "REG vs NOREG changes B_STATUS");
+}
+
 int main()
 {
     test_font_table();
     test_text();
     test_num();
+    test_band_grid();
     std::cout << "\n" << (g_checks - g_failures) << "/" << g_checks << " checks passed\n";
     return g_failures ? 1 : 0;
 }

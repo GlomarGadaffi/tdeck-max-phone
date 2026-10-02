@@ -131,28 +131,83 @@ static void i2c_bus_scan(void)
 }
 
 // ── e-paper render task ─────────────────────────────────────────────────────
-// A full-screen refresh on this panel is ~2-3 s of panel time plus SPI. Doing
-// that inline meant every dialled digit and every call-state change stalled
-// SIP and audio for seconds. The main loop now just posts a request.
+// A refresh is ~1.25 s of panel time (UI_DESIGN 5.7). Doing that inline meant
+// every dialled digit and every call-state change stalled SIP and audio for
+// the whole refresh. The main loop now just posts the UI model (#38).
+//
+// Depth-1 mailbox: only the newest model matters, and posting must never
+// block the control path even while the panel is mid-refresh. It replaces
+// the old xQueueOverwrite queue because coalescing has to MERGE the band as
+// well as replace the model: if a transition (B_ALL) is still waiting when a
+// one-band edit arrives, the edit must not downgrade it to a partial of a
+// screen that was never drawn. Different bands merge to B_ALL.
 
-struct RenderRequest {
-    char caller[24];
-    char status[24];
-    bool active;
+struct RenderJob {
+    ui_model_t model;
+    ui_band_t  band;
+    uint32_t   seq;     // ui_post() sequence number of this model
 };
 
-static QueueHandle_t s_render_q = nullptr;
+static portMUX_TYPE      s_render_mux = portMUX_INITIALIZER_UNLOCKED;
+static RenderJob         s_render_job;
+static bool              s_render_pending = false;
+static uint32_t          s_render_posted = 0;   // last seq handed out
+static volatile uint32_t s_render_drawn = 0;    // last seq on the glass
+static TaskHandle_t      s_epaper_task = nullptr;
 
-static void ui_render(const char *caller, const char *status, bool active)
+static ui_band_t merge_band(ui_band_t a, ui_band_t b)
 {
-    if (!s_render_q) return;
-    RenderRequest r{};
-    std::strncpy(r.caller, caller ? caller : "", sizeof(r.caller) - 1);
-    std::strncpy(r.status, status ? status : "", sizeof(r.status) - 1);
-    r.active = active;
-    // Depth-1 queue with overwrite: only the newest screen matters, and this
-    // must never block the control path even if the panel is mid-refresh.
-    xQueueOverwrite(s_render_q, &r);
+    return (a == b) ? a : B_ALL;
+}
+
+// Returns the sequence number of this model, for ui_drawn().
+static uint32_t ui_post(const ui_model_t &m, ui_band_t band)
+{
+    taskENTER_CRITICAL(&s_render_mux);
+    if (s_render_pending) band = merge_band(s_render_job.band, band);
+    s_render_job.model = m;
+    s_render_job.band = band;
+    s_render_job.seq = ++s_render_posted;
+    s_render_pending = true;
+    uint32_t seq = s_render_posted;
+    taskEXIT_CRITICAL(&s_render_mux);
+    if (s_epaper_task) xTaskNotifyGive(s_epaper_task);
+    return seq;
+}
+
+// True once the model posted as `seq` (or a newer one) is on the glass.
+static bool ui_drawn(uint32_t seq)
+{
+    return (int32_t)(s_render_drawn - seq) >= 0;
+}
+
+// ── UI model ────────────────────────────────────────────────────────────────
+
+static TincanUac *s_uac = nullptr;
+
+static ui_model_t ui_model(ui_screen_t screen, const std::string &number)
+{
+    ui_model_t m{};
+    m.screen = screen;
+    std::strncpy(m.number, number.c_str(), sizeof(m.number) - 1);
+    std::strncpy(m.self_ext, POC_SIP_EXT_SELF, sizeof(m.self_ext) - 1);
+    m.registered = s_uac && s_uac->registered();
+    m.wifi_up = wifi_is_connected();
+    m.muted = false;                 // no mute yet (#45)
+    m.volume = POC_SPK_VOLUME;       // fixed at init; no runtime volume yet (#45)
+    return m;
+}
+
+// Boot, failure and power-off screens: the band grid with supplied text.
+static ui_model_t ui_notice(const char *label, const char *sub,
+                            const char *hint1 = "", const char *hint2 = "")
+{
+    ui_model_t m = ui_model(UI_NOTICE, "");
+    std::strncpy(m.notice_label, label, sizeof(m.notice_label) - 1);
+    std::strncpy(m.notice_sub, sub, sizeof(m.notice_sub) - 1);
+    std::strncpy(m.notice_hint[0], hint1, sizeof(m.notice_hint[0]) - 1);
+    std::strncpy(m.notice_hint[1], hint2, sizeof(m.notice_hint[1]) - 1);
+    return m;
 }
 
 // Real power off, the way the board is built to do it.
@@ -236,11 +291,17 @@ static void power_off(TincanUac &uac)
         onUsb = false;
     }
 
-    // Posted through the queue, not rendered inline: epaper_task owns the SPI
-    // bus and driving it from here would race a refresh already in flight.
-    // The panel needs roughly two seconds for a full refresh.
-    ui_render("", onUsb ? "Sleeping (USB)" : "Powered Off", false);
-    vTaskDelay(pdMS_TO_TICKS(2500));
+    // Posted, not rendered inline: epaper_task owns the SPI bus and driving
+    // it from here would race a refresh already in flight. Wait for THIS
+    // screen to be on the glass rather than guessing a delay -- it may have to
+    // queue behind a refresh that is already running. Bounded, so a dead panel
+    // cannot stop the phone from switching off.
+    uint32_t seq = ui_post(onUsb ? ui_notice("SLEEPING", "on USB: asleep, not off",
+                                             "BOOT button wakes it")
+                                 : ui_notice("POWERED OFF", "",
+                                             "PWR button turns it on"),
+                           B_ALL);
+    for (int i = 0; i < 100 && !ui_drawn(seq); i++) vTaskDelay(pdMS_TO_TICKS(50));
 
     // Touch controller into reset before the rails move. The vendor does this
     // with the comment that it can otherwise come up in an undefined state.
@@ -276,11 +337,21 @@ static void power_off(TincanUac &uac)
 
 static void epaper_task(void *)
 {
-    RenderRequest r;
+    RenderJob job;
     for (;;) {
-        if (xQueueReceive(s_render_q, &r, portMAX_DELAY) == pdTRUE) {
-            epaper_render_call_status(r.caller, r.status, r.active);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        taskENTER_CRITICAL(&s_render_mux);
+        bool have = s_render_pending;
+        if (have) {
+            job = s_render_job;
+            s_render_pending = false;
         }
+        taskEXIT_CRITICAL(&s_render_mux);
+        if (!have) continue;
+
+        epaper_render(&job.model, job.band);
+        s_render_drawn = job.seq;
     }
 }
 
@@ -289,8 +360,6 @@ static void epaper_task(void *)
 // out, 50 frames/sec. Adding any vTaskDelay here (as the old inline version
 // effectively did) directly reduces packet rate and grows one-way latency for
 // the whole call.
-
-static TincanUac *s_uac = nullptr;
 
 static void audio_task(void *)
 {
@@ -582,15 +651,15 @@ extern "C" void app_main(void)
 #endif
 
     // 3. Display task first, so failures after this point can be shown.
-    s_render_q = xQueueCreate(1, sizeof(RenderRequest));
-    xTaskCreate(epaper_task, "epaper", 4096, nullptr, 3, nullptr);
-    ui_render(POC_SIP_EXT_SELF, "Booting", false);
+    xTaskCreate(epaper_task, "epaper", 4096, nullptr, 3, &s_epaper_task);
+    ui_post(ui_notice("BOOTING", "joining Wi-Fi"), B_ALL);
 
     // 4. Wi-Fi (bounded; won't hang forever on a bad SSID).
     esp_err_t wifi_err = wifi_sta_connect(POC_WIFI_SSID, POC_WIFI_PASS);
     if (wifi_err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi did not come up; phone cannot register");
-        ui_render(POC_SIP_EXT_SELF, "No WiFi", false);
+        ui_post(ui_notice("NO WIFI", "no IP address after 30 s",
+                          "check the access point,", "then power-cycle"), B_ALL);
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
     ESP_LOGI(TAG, "Wi-Fi up, local IP %s", wifi_local_ip());
@@ -600,11 +669,12 @@ extern "C" void app_main(void)
     if (!uac.init(wifi_local_ip(), POC_SIP_LOCAL_PORT, POC_RTP_LOCAL_PORT,
                   POC_SIP_SERVER_IP, POC_SIP_SERVER_PORT, POC_SIP_EXT_SELF)) {
         ESP_LOGE(TAG, "UAC init failed (socket bind?)");
-        ui_render(POC_SIP_EXT_SELF, "SIP init fail", false);
+        ui_post(ui_notice("SIP FAILED", "could not open SIP socket",
+                          "power-cycle to retry"), B_ALL);
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
     bool registered = uac.registerExt();
-    s_uac = &uac;
+    s_uac = &uac;   // before the next ui_model(): it reads uac.registered()
 
     // 6. Audio pump. Priority above the main loop: starving it is audible,
     //    starving the UI is not. Pinned to core 1 to keep it away from the
@@ -614,7 +684,7 @@ extern "C" void app_main(void)
     UiState ui = UiState::Idle;
     std::string dialBuffer;
     std::string lastDialled = load_last_dialled();
-    ui_render(POC_SIP_EXT_SELF, registered ? "Idle" : "Register failed", false);
+    ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
     ESP_LOGI(TAG, "System operational (registered=%d).", registered);
     if (!lastDialled.empty()) {
         ESP_LOGI(TAG, "ENT from idle will redial %s", lastDialled.c_str());
@@ -624,7 +694,7 @@ extern "C" void app_main(void)
     // and dial-from-buffer so the two can't drift apart -- they had already
     // grown slightly different logging and teardown before this was factored.
     auto placeCallTo = [&](const std::string &target) {
-        ui_render(target.c_str(), "Calling...", false);
+        ui_post(ui_model(UI_CALLING, target), B_ALL);
         ESP_LOGI(TAG, "dialing %s", target.c_str());
 
         if (uac.placeCall(target)) {
@@ -636,10 +706,12 @@ extern "C" void app_main(void)
             }
             ui = UiState::InCall;
             audio_hardware_set_amp(true);
-            ui_render(target.c_str(), "In Call", true);
+            ui_post(ui_model(UI_INCALL, target), B_ALL);
         } else {
             ui = UiState::Idle;
-            ui_render(target.c_str(), "Call Failed", false);
+            ui_model_t m = ui_model(UI_ENDED, target);
+            m.last_call_failed = true;
+            ui_post(m, B_ALL);
             ESP_LOGW(TAG, "call to %s failed", target.c_str());
         }
     };
@@ -650,7 +722,7 @@ extern "C" void app_main(void)
         // Keep the registration alive; without this the binding lapses at
         // POC_SIP_REG_EXPIRES and the phone silently stops taking calls.
         if (uac.maintainRegistration() && ui == UiState::Idle) {
-            ui_render(POC_SIP_EXT_SELF, "Reg failed", false);
+            ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);   // now NOREG
         }
 
         // Single GPIO read unless the controller actually has events.
@@ -659,7 +731,7 @@ extern "C" void app_main(void)
         if (uac.hasIncomingCall() && ui != UiState::InCall && ui != UiState::Incoming) {
             ui = UiState::Incoming;
             ESP_LOGI(TAG, "incoming call from %s", uac.incomingCallerId().c_str());
-            ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
+            ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL);
         }
 
         switch (ui) {
@@ -672,7 +744,9 @@ extern "C" void app_main(void)
             // mid-shift.
             if (key == '\b') {
                 ui = UiState::ConfirmOff;
-                ui_render("Power off?", "ENT=yes DEL=no", false);
+                ui_post(ui_notice("POWER OFF?", "",
+                                  "ENT  power off",
+                                  "any other key cancels"), B_ALL);
                 break;
             }
             // ENT on an empty buffer redials the last number that connected.
@@ -688,7 +762,7 @@ extern "C" void app_main(void)
                 dialBuffer.clear();
                 dialBuffer += key;
                 ui = UiState::Dialing;
-                ui_render(dialBuffer.c_str(), "Dialing", false);
+                ui_post(ui_model(UI_DIALLING, dialBuffer), B_ALL);
             }
             break;
 
@@ -696,14 +770,16 @@ extern "C" void app_main(void)
             if (key == '\b') {
                 if (!dialBuffer.empty()) dialBuffer.pop_back();
                 else ui = UiState::Idle;
-                ui_render(dialBuffer.c_str(), ui == UiState::Idle ? "Idle" : "Dialing", false);
+                ui_post(ui == UiState::Idle ? ui_model(UI_IDLE, lastDialled)
+                                            : ui_model(UI_DIALLING, dialBuffer),
+                        B_ALL);
             } else if (is_dial_char(key)) {
                 // Silently stop growing at the cap rather than wrapping or
                 // truncating on dial -- the user can see the number isn't
                 // getting longer.
                 if (dialBuffer.size() < DIAL_BUFFER_MAX) {
                     dialBuffer += key;
-                    ui_render(dialBuffer.c_str(), "Dialing", false);
+                    ui_post(ui_model(UI_DIALLING, dialBuffer), B_ALL);
                 }
             } else if (key == '\r' && !dialBuffer.empty()) {
                 std::string target = dialBuffer;
@@ -717,15 +793,15 @@ extern "C" void app_main(void)
                 uac.answer();
                 ui = UiState::InCall;
                 audio_hardware_set_amp(true);
-                ui_render(uac.incomingCallerId().c_str(), "In Call", true);
+                ui_post(ui_model(UI_INCALL, uac.incomingCallerId()), B_ALL);
             } else if (key == '\b') {
                 uac.reject();
                 ui = UiState::Idle;
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
             } else if (!uac.hasIncomingCall()) {
                 // Caller gave up (CANCEL) before we answered/rejected.
                 ui = UiState::Idle;
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
             }
             break;
 
@@ -737,12 +813,12 @@ extern "C" void app_main(void)
                 // enough to press something random, you did not mean to shut
                 // the phone down.
                 ui = UiState::Idle;
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
             } else if (uac.hasIncomingCall()) {
                 // An incoming call outranks a pending power-off prompt; the
                 // hasIncomingCall() check above the switch has already moved
                 // us on, this just avoids leaving the prompt on screen.
-                ui_render(uac.incomingCallerId().c_str(), "Incoming Call", false);
+                ui_post(ui_model(UI_INCOMING, uac.incomingCallerId()), B_ALL);
             }
             break;
 
@@ -753,7 +829,7 @@ extern "C" void app_main(void)
             if (uac.callEnded() || !uac.inCall()) {
                 ui = UiState::Idle;
                 audio_hardware_set_amp(false);
-                ui_render(POC_SIP_EXT_SELF, "Idle", false);
+                ui_post(ui_model(UI_IDLE, lastDialled), B_ALL);
             }
             break;
         }

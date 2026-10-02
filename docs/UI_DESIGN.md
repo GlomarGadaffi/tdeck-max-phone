@@ -796,6 +796,15 @@ uint32_t epaper_render_generation(void);                     /* see §9.8       
 
 The render task keeps its depth-1 coalescing queue; only the payload type changes.
 
+> **Implemented 2026-10-01 (#38)** in `main/include/ui_render.h`, with two additions:
+> `UI_NOTICE` (with `notice_label` / `notice_sub` / `notice_hint`) carries the screens that
+> are not among the six — boot, no Wi-Fi, SIP failure, the power-off prompt and the
+> powered-off screen — on the same band grid; and the depth-1 "queue" is a mailbox that
+> **merges bands** when it coalesces (two different bands become `B_ALL`), so a pending
+> transition can never be downgraded to a one-band partial of a screen that was never
+> drawn. `epaper_render_generation()` is P8. Drawing lives in `ui_render.cpp`, which has no
+> ESP-IDF headers, so `test/ui_render_test.cpp` renders every screen on the host.
+
 ---
 
 ## 8. Touch verdict: **not used**
